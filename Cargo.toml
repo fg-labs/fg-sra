@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fg-sra-vdb-sys",
+    "crates/fg-sra-vdb",
+    "crates/fg-sratosam",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"

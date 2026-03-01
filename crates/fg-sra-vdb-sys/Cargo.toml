@@ -1,0 +1,11 @@
+[package]
+name = "fg-sra-vdb-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw FFI bindings to NCBI's libncbi-vdb C library"
+links = "ncbi-vdb"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"

@@ -1,0 +1,3 @@
+[submodule "vendor/ncbi-vdb"]
+	path = vendor/ncbi-vdb
+	url = https://github.com/ncbi/ncbi-vdb.git
