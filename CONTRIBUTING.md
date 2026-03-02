@@ -1,4 +1,4 @@
-# Contributing to fg-sratosam
+# Contributing to fg-sra
 
 ## Development Setup
 
@@ -10,8 +10,8 @@
 ### Building
 
 ```bash
-git clone --recurse-submodules https://github.com/fulcrumgenomics/fg-sratosam
-cd fg-sratosam
+git clone --recurse-submodules https://github.com/fulcrumgenomics/fg-sra
+cd fg-sra
 cargo build --release
 ```
 

@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
-repository = "https://github.com/fulcrumgenomics/fg-sratosam"
+repository = "https://github.com/fulcrumgenomics/fg-sra"
 license = "MIT"
 
 [workspace.dependencies]
