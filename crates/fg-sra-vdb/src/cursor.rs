@@ -138,6 +138,30 @@ impl VCursor {
         Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 
+    /// Read a string cell into an existing `String`, reusing its allocation.
+    ///
+    /// Clears `buf` and appends the cell data. The existing heap allocation
+    /// is reused, avoiding a new allocation per call once `buf` has grown to
+    /// the typical cell size.
+    pub fn read_str_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut String,
+    ) -> Result<(), VdbError> {
+        buf.clear();
+        let data = self.cell_data_direct(row_id, col_idx)?;
+        if data.row_len == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(data.elem_bits, 8);
+        let bytes = unsafe { slice::from_raw_parts(data.base as *const u8, data.row_len as usize) };
+        // VDB ASCII columns are always valid UTF-8; from_utf8_lossy borrows
+        // without allocation in the common (valid) case.
+        buf.push_str(&String::from_utf8_lossy(bytes));
+        Ok(())
+    }
+
     /// Read a slice of `u8` values (e.g., quality scores, read data).
     pub fn read_u8_slice(&self, row_id: i64, col_idx: u32) -> Result<Vec<u8>, VdbError> {
         self.read_slice(row_id, col_idx, 8)

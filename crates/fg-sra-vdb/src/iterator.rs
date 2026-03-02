@@ -31,6 +31,17 @@ pub enum AlignIdSrc {
     Evidence = 2,
 }
 
+impl AlignIdSrc {
+    /// The VDB table name for this alignment source.
+    pub fn table_name(self) -> &'static str {
+        match self {
+            Self::Primary => "PRIMARY_ALIGNMENT",
+            Self::Secondary => "SECONDARY_ALIGNMENT",
+            Self::Evidence => "EVIDENCE_ALIGNMENT",
+        }
+    }
+}
+
 /// Safe wrapper around `AlignMgr`.
 ///
 /// Used to create `PlacementSetIterator` instances.

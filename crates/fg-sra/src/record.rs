@@ -3,8 +3,6 @@
 //! Builds complete SAM lines in a per-record `Vec<u8>` buffer, writing
 //! all fields in a single pass rather than multiple formatted-print calls.
 
-use std::io::Write;
-
 use crate::matecache::MateInfo;
 
 /// Column data read from VDB for an aligned record.
@@ -40,6 +38,45 @@ pub struct AlignedColumns {
 }
 
 impl AlignedColumns {
+    /// Create a new `AlignedColumns` with empty/default values.
+    ///
+    /// String fields start empty and grow to needed capacity on first use,
+    /// reusing their heap allocation across subsequent records.
+    pub fn new() -> Self {
+        Self {
+            seq_name: String::new(),
+            sam_flags: 0,
+            cigar: String::new(),
+            mate_align_id: 0,
+            mate_ref_name: String::new(),
+            mate_ref_pos: 0,
+            template_len: 0,
+            read: String::new(),
+            quality: String::new(),
+            edit_distance: 0,
+            spot_group: String::new(),
+            alignment_count: 0,
+            read_filter: None,
+        }
+    }
+
+    /// Clear all fields without deallocating String buffers.
+    pub fn clear(&mut self) {
+        self.seq_name.clear();
+        self.sam_flags = 0;
+        self.cigar.clear();
+        self.mate_align_id = 0;
+        self.mate_ref_name.clear();
+        self.mate_ref_pos = 0;
+        self.template_len = 0;
+        self.read.clear();
+        self.quality.clear();
+        self.edit_distance = 0;
+        self.spot_group.clear();
+        self.alignment_count = 0;
+        self.read_filter = None;
+    }
+
     /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
     ///
     /// Matches sam-dump behavior: reads without a mate alignment are output as
@@ -160,32 +197,36 @@ pub fn format_aligned_record(
     }
 
     // RNEXT, PNEXT, TLEN — use mate cache if available, else column data.
-    let (rnext, pnext, tlen) = if let Some(mate) = mate_info {
-        (mate.ref_name.as_str(), mate.ref_pos, mate.tlen)
+    // Mate cache is cleared between references, so cached mates are always
+    // on the same reference → RNEXT is always "=".
+    if let Some(mate) = mate_info {
+        buf.extend_from_slice(b"\t=\t");
+        write_i32(buf, mate.ref_pos + 1);
+        buf.push(b'\t');
+        write_i32(buf, mate.tlen);
     } else {
-        (cols.mate_ref_name.as_str(), cols.mate_ref_pos, cols.template_len)
-    };
+        let rnext = cols.mate_ref_name.as_str();
+        buf.push(b'\t');
+        if rnext.is_empty() || rnext == "*" {
+            buf.push(b'*');
+        } else if rnext == ref_name {
+            buf.push(b'=');
+        } else {
+            buf.extend_from_slice(rnext.as_bytes());
+        }
 
-    buf.push(b'\t');
-    if rnext.is_empty() || rnext == "*" {
-        buf.push(b'*');
-    } else if rnext == ref_name {
-        buf.push(b'=');
-    } else {
-        buf.extend_from_slice(rnext.as_bytes());
+        // PNEXT (1-based, 0 if unavailable)
+        buf.push(b'\t');
+        if rnext.is_empty() || rnext == "*" {
+            buf.push(b'0');
+        } else {
+            write_i32(buf, cols.mate_ref_pos + 1);
+        }
+
+        // TLEN
+        buf.push(b'\t');
+        write_i32(buf, cols.template_len);
     }
-
-    // PNEXT (1-based, 0 if unavailable)
-    buf.push(b'\t');
-    if rnext.is_empty() || rnext == "*" {
-        buf.push(b'0');
-    } else {
-        write_i32(buf, pnext + 1);
-    }
-
-    // TLEN
-    buf.push(b'\t');
-    write_i32(buf, tlen);
 
     // SEQ
     buf.push(b'\t');
@@ -237,11 +278,7 @@ pub fn format_unaligned_record(
     if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
         flags |= sam_flags::REVERSE;
     }
-    if cols.read_filter == READ_FILTER_REJECT {
-        flags |= sam_flags::QC_FAIL;
-    } else if cols.read_filter == READ_FILTER_CRITERIA {
-        flags |= sam_flags::SUPPLEMENTARY_FILTER;
-    }
+    flags = apply_read_filter(flags, Some(cols.read_filter));
     // Paired-end flags.
     if cols.num_bio_reads > 1 {
         flags |= sam_flags::PAIRED | sam_flags::MATE_UNMAPPED;
@@ -333,7 +370,7 @@ fn write_qname(
 }
 
 /// Apply read filter to SAM flags.
-fn apply_read_filter(mut flags: u32, read_filter: Option<u8>) -> u32 {
+pub(crate) fn apply_read_filter(mut flags: u32, read_filter: Option<u8>) -> u32 {
     if let Some(filt) = read_filter {
         flags &= !sam_flags::QC_FAIL;
         if filt == READ_FILTER_REJECT {
@@ -368,12 +405,12 @@ fn complement(base: u8) -> u8 {
 
 /// Write a u32 as decimal ASCII.
 fn write_u32(buf: &mut Vec<u8>, val: u32) {
-    let _ = write!(buf, "{val}");
+    buf.extend_from_slice(itoa::Buffer::new().format(val).as_bytes());
 }
 
 /// Write an i32 as decimal ASCII.
 fn write_i32(buf: &mut Vec<u8>, val: i32) {
-    let _ = write!(buf, "{val}");
+    buf.extend_from_slice(itoa::Buffer::new().format(val).as_bytes());
 }
 
 /// Write a SAM tag with integer value: `\tXX:i:val`
@@ -389,7 +426,7 @@ fn write_tag_i64(buf: &mut Vec<u8>, tag: &[u8; 2], val: i64) {
     buf.push(b'\t');
     buf.extend_from_slice(tag);
     buf.extend_from_slice(b":i:");
-    let _ = write!(buf, "{val}");
+    buf.extend_from_slice(itoa::Buffer::new().format(val).as_bytes());
 }
 
 /// Write a SAM tag with string value: `\tXX:Z:val`
@@ -477,14 +514,14 @@ mod tests {
     fn test_aligned_record_with_mate_cache() {
         let cols = default_aligned_cols();
         let opts = default_opts();
-        let mate = MateInfo { ref_name: "chr2".to_string(), ref_pos: 200, flags: 147, tlen: -300 };
+        let mate = MateInfo { ref_pos: 200, tlen: -300 };
         let mut buf = Vec::new();
 
         format_aligned_record(&mut buf, &cols, "chr1", 100, 60, 42, Some(&mate), &opts);
 
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
-        assert_eq!(fields[6], "chr2"); // RNEXT from mate cache
+        assert_eq!(fields[6], "="); // RNEXT from mate cache (same ref)
         assert_eq!(fields[7], "201"); // PNEXT from mate cache (1-based)
         assert_eq!(fields[8], "-300"); // TLEN from mate cache
     }

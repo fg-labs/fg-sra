@@ -13,10 +13,10 @@ fg-sra-vdb = { path = "../fg-sra-vdb" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
+itoa = "1"
 flate2 = "1"
 bzip2 = "0.6"
 noodles-bam = "0.86"
 noodles-bgzf = "0.46"
 noodles-sam = "0.82"
-rayon = "1"
 rustc-hash = "2"

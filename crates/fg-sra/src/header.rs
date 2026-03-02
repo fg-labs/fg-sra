@@ -73,21 +73,17 @@ fn build_header_from_references(db: &VDatabase, use_seqid: bool) -> Result<Strin
     let reflist =
         ReferenceList::make_database(db, 0, 0).context("failed to create ReferenceList")?;
 
-    let count = reflist.count().context("failed to get reference count")?;
+    let mut header = String::from("@HD\tVN:1.3\n");
 
-    // Pre-allocate: @HD line (~12 bytes) + ~40 bytes per @SQ line.
-    let mut header = String::with_capacity(12 + (count as usize) * 40);
-    header.push_str("@HD\tVN:1.3\n");
-
-    for i in 0..count {
-        let ref_obj = reflist.get(i).context("failed to get reference")?;
+    for ref_obj in reflist.iter().context("failed to iterate references")? {
+        let ref_obj = ref_obj.context("failed to get reference")?;
         let name = if use_seqid { ref_obj.seq_id() } else { ref_obj.name() }
             .context("failed to get reference name")?;
         let len = ref_obj.seq_length().context("failed to get reference length")?;
         header.push_str("@SQ\tSN:");
         header.push_str(&name);
         header.push_str("\tLN:");
-        header.push_str(&len.to_string());
+        header.push_str(itoa::Buffer::new().format(len));
         header.push('\n');
     }
 

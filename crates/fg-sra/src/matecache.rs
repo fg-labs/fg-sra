@@ -7,15 +7,13 @@
 use rustc_hash::FxHashMap;
 
 /// Information stored about an alignment for its mate to look up.
+///
+/// The mate cache is cleared between references, so all cached mates are
+/// on the same reference as the current read — `ref_name` is not stored.
 #[derive(Debug, Clone)]
 pub struct MateInfo {
-    /// Reference name of this alignment (for mate's RNEXT field).
-    pub ref_name: String,
     /// 0-based reference position of this alignment.
     pub ref_pos: i32,
-    /// SAM flags for this alignment (used for RNEXT resolution in parallel mode).
-    #[allow(dead_code)]
-    pub flags: u32,
     /// Template length.
     pub tlen: i32,
 }
@@ -54,7 +52,7 @@ impl MateCache {
     }
 
     /// Number of entries in the cache.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -67,13 +65,11 @@ mod tests {
     #[test]
     fn test_insert_and_take() {
         let mut cache = MateCache::new();
-        let info = MateInfo { ref_name: "chr1".to_string(), ref_pos: 1000, flags: 99, tlen: 300 };
+        let info = MateInfo { ref_pos: 1000, tlen: 300 };
         cache.insert(42, info);
 
         let mate = cache.take(42).expect("should find mate");
-        assert_eq!(mate.ref_name, "chr1");
         assert_eq!(mate.ref_pos, 1000);
-        assert_eq!(mate.flags, 99);
         assert_eq!(mate.tlen, 300);
 
         // Second take should return None (removed).
@@ -89,8 +85,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut cache = MateCache::new();
-        cache.insert(1, MateInfo { ref_name: "chr1".into(), ref_pos: 0, flags: 0, tlen: 0 });
-        cache.insert(2, MateInfo { ref_name: "chr2".into(), ref_pos: 0, flags: 0, tlen: 0 });
+        cache.insert(1, MateInfo { ref_pos: 0, tlen: 0 });
+        cache.insert(2, MateInfo { ref_pos: 0, tlen: 0 });
         assert_eq!(cache.len(), 2);
 
         cache.clear();
