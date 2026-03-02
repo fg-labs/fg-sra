@@ -1,17 +1,30 @@
-//! Command-line argument definitions for fg-sratosam.
+//! Command-line argument definitions for fg-sra.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-/// High-performance SRA-to-SAM/BAM converter.
-///
-/// Converts NCBI SRA archives to SAM or BAM format, replacing `sam-dump`
+/// High-performance SRA toolkit.
+#[derive(Debug, Parser)]
+#[command(name = "fg-sra", version, about)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Available subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Convert SRA archives to SAM or BAM format.
+    #[command(name = "tosam")]
+    ToSam(ToSam),
+}
+
+/// Convert NCBI SRA archives to SAM or BAM format, replacing `sam-dump`
 /// with multi-threaded processing for significantly higher throughput.
 #[derive(Debug, Parser)]
-#[command(name = "fg-sratosam", version, about)]
-pub struct Cli {
+pub struct ToSam {
     /// SRA accession(s) or file path(s) to convert.
     #[arg(required = true)]
     pub accessions: Vec<String>,
@@ -145,6 +158,15 @@ pub enum OutputFormat {
 }
 
 impl Cli {
+    /// Dispatch to the appropriate subcommand.
+    pub fn execute(&self) -> Result<()> {
+        match &self.command {
+            Command::ToSam(cmd) => cmd.execute(),
+        }
+    }
+}
+
+impl ToSam {
     /// Run the conversion with the parsed CLI options.
     pub fn execute(&self) -> Result<()> {
         for accession in &self.accessions {
@@ -217,61 +239,64 @@ mod tests {
 
     use super::*;
 
-    /// Parse a CLI from a slice of arguments (program name auto-prepended).
-    fn parse(args: &[&str]) -> Cli {
-        let mut full = vec!["fg-sratosam"];
+    /// Parse a ToSam subcommand from a slice of arguments (program name auto-prepended).
+    fn parse(args: &[&str]) -> ToSam {
+        let mut full = vec!["fg-sra", "tosam"];
         full.extend_from_slice(args);
-        Cli::parse_from(full)
+        let cli = Cli::parse_from(full);
+        match cli.command {
+            Command::ToSam(cmd) => cmd,
+        }
     }
 
     #[test]
     fn test_minimal_args() {
-        let cli = parse(&["SRR123456"]);
-        assert_eq!(cli.accessions, vec!["SRR123456"]);
-        assert!(!cli.unaligned);
-        assert!(!cli.primary);
-        assert_eq!(cli.output_format, OutputFormat::Sam);
+        let cmd = parse(&["SRR123456"]);
+        assert_eq!(cmd.accessions, vec!["SRR123456"]);
+        assert!(!cmd.unaligned);
+        assert!(!cmd.primary);
+        assert_eq!(cmd.output_format, OutputFormat::Sam);
     }
 
     #[test]
     fn test_multiple_accessions() {
-        let cli = parse(&["SRR111", "SRR222", "SRR333"]);
-        assert_eq!(cli.accessions, vec!["SRR111", "SRR222", "SRR333"]);
+        let cmd = parse(&["SRR111", "SRR222", "SRR333"]);
+        assert_eq!(cmd.accessions, vec!["SRR111", "SRR222", "SRR333"]);
     }
 
     #[test]
     fn test_primary_and_unaligned() {
-        let cli = parse(&["-1", "-u", "SRR123456"]);
-        assert!(cli.primary);
-        assert!(cli.unaligned);
+        let cmd = parse(&["-1", "-u", "SRR123456"]);
+        assert!(cmd.primary);
+        assert!(cmd.unaligned);
     }
 
     #[test]
     fn test_bam_output_format() {
-        let cli = parse(&["--output-format", "bam", "SRR123456"]);
-        assert_eq!(cli.output_format, OutputFormat::Bam);
+        let cmd = parse(&["--output-format", "bam", "SRR123456"]);
+        assert_eq!(cmd.output_format, OutputFormat::Bam);
     }
 
     #[test]
     fn test_output_file() {
-        let cli = parse(&["--output-file", "/tmp/out.sam", "SRR123456"]);
-        assert_eq!(cli.output_file.as_deref(), Some(std::path::Path::new("/tmp/out.sam")));
+        let cmd = parse(&["--output-file", "/tmp/out.sam", "SRR123456"]);
+        assert_eq!(cmd.output_file.as_deref(), Some(std::path::Path::new("/tmp/out.sam")));
     }
 
     #[test]
     fn test_compression_flags() {
-        let cli = parse(&["--gzip", "SRR123456"]);
-        assert!(cli.gzip);
-        assert!(!cli.bzip2);
+        let cmd = parse(&["--gzip", "SRR123456"]);
+        assert!(cmd.gzip);
+        assert!(!cmd.bzip2);
 
-        let cli = parse(&["--bzip2", "SRR123456"]);
-        assert!(!cli.gzip);
-        assert!(cli.bzip2);
+        let cmd = parse(&["--bzip2", "SRR123456"]);
+        assert!(!cmd.gzip);
+        assert!(cmd.bzip2);
     }
 
     #[test]
     fn test_cigar_and_formatting() {
-        let cli = parse(&[
+        let cmd = parse(&[
             "--cigar-long",
             "--hide-identical",
             "--spot-group",
@@ -279,15 +304,15 @@ mod tests {
             "PRE",
             "SRR123456",
         ]);
-        assert!(cli.cigar_long);
-        assert!(cli.hide_identical);
-        assert!(cli.spot_group);
-        assert_eq!(cli.prefix.as_deref(), Some("PRE"));
+        assert!(cmd.cigar_long);
+        assert!(cmd.hide_identical);
+        assert!(cmd.spot_group);
+        assert_eq!(cmd.prefix.as_deref(), Some("PRE"));
     }
 
     #[test]
     fn test_header_options() {
-        let cli = parse(&[
+        let cmd = parse(&[
             "--no-header",
             "--header-comment",
             "line one",
@@ -295,26 +320,26 @@ mod tests {
             "line two",
             "SRR123456",
         ]);
-        assert!(cli.no_header);
-        assert_eq!(cli.header_comment, vec!["line one", "line two"]);
+        assert!(cmd.no_header);
+        assert_eq!(cmd.header_comment, vec!["line one", "line two"]);
     }
 
     #[test]
     fn test_aligned_region() {
-        let cli =
+        let cmd =
             parse(&["--aligned-region", "chr1:1000-2000", "--aligned-region", "chr2", "SRR123456"]);
-        assert_eq!(cli.aligned_region, vec!["chr1:1000-2000", "chr2"]);
+        assert_eq!(cmd.aligned_region, vec!["chr1:1000-2000", "chr2"]);
     }
 
     #[test]
     fn test_min_mapq() {
-        let cli = parse(&["--min-mapq", "30", "SRR123456"]);
-        assert_eq!(cli.min_mapq, Some(30));
+        let cmd = parse(&["--min-mapq", "30", "SRR123456"]);
+        assert_eq!(cmd.min_mapq, Some(30));
     }
 
     #[test]
     fn test_rna_splicing() {
-        let cli = parse(&[
+        let cmd = parse(&[
             "--rna-splicing",
             "--rna-splice-level",
             "2",
@@ -322,55 +347,61 @@ mod tests {
             "/tmp/splice.log",
             "SRR123456",
         ]);
-        assert!(cli.rna_splicing);
-        assert_eq!(cli.rna_splice_level, 2);
-        assert_eq!(cli.rna_splice_log.as_deref(), Some(std::path::Path::new("/tmp/splice.log")));
+        assert!(cmd.rna_splicing);
+        assert_eq!(cmd.rna_splice_level, 2);
+        assert_eq!(cmd.rna_splice_log.as_deref(), Some(std::path::Path::new("/tmp/splice.log")));
     }
 
     #[test]
     fn test_qual_quant() {
-        let cli = parse(&["--qual-quant", "1:10,10:20,20:30,30:40", "SRR123456"]);
-        assert_eq!(cli.qual_quant.as_deref(), Some("1:10,10:20,20:30,30:40"));
+        let cmd = parse(&["--qual-quant", "1:10,10:20,20:30,30:40", "SRR123456"]);
+        assert_eq!(cmd.qual_quant.as_deref(), Some("1:10,10:20,20:30,30:40"));
     }
 
     #[test]
     fn test_threads() {
-        let cli = parse(&["-t", "8", "SRR123456"]);
-        assert_eq!(cli.threads, Some(8));
+        let cmd = parse(&["-t", "8", "SRR123456"]);
+        assert_eq!(cmd.threads, Some(8));
     }
 
     #[test]
     fn test_fasta_fastq() {
-        let cli = parse(&["--fasta", "SRR123456"]);
-        assert!(cli.fasta);
-        assert!(!cli.fastq);
+        let cmd = parse(&["--fasta", "SRR123456"]);
+        assert!(cmd.fasta);
+        assert!(!cmd.fastq);
 
-        let cli = parse(&["--fastq", "SRR123456"]);
-        assert!(!cli.fasta);
-        assert!(cli.fastq);
+        let cmd = parse(&["--fastq", "SRR123456"]);
+        assert!(!cmd.fasta);
+        assert!(cmd.fastq);
     }
 
     #[test]
     fn test_short_flags() {
-        let cli = parse(&["-n", "-r", "-s", "-c", "-g", "-o", "-t", "4", "SRR123456"]);
-        assert!(cli.no_header);
-        assert!(cli.header);
-        assert!(cli.seqid);
-        assert!(cli.cigar_long);
-        assert!(cli.spot_group);
-        assert!(cli.omit_quality);
-        assert_eq!(cli.threads, Some(4));
+        let cmd = parse(&["-n", "-r", "-s", "-c", "-g", "-o", "-t", "4", "SRR123456"]);
+        assert!(cmd.no_header);
+        assert!(cmd.header);
+        assert!(cmd.seqid);
+        assert!(cmd.cigar_long);
+        assert!(cmd.spot_group);
+        assert!(cmd.omit_quality);
+        assert_eq!(cmd.threads, Some(4));
+    }
+
+    #[test]
+    fn test_missing_subcommand_fails() {
+        let result = Cli::try_parse_from(["fg-sra"]);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_missing_accession_fails() {
-        let result = Cli::try_parse_from(["fg-sratosam"]);
+        let result = Cli::try_parse_from(["fg-sra", "tosam"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_default_rna_splice_level() {
-        let cli = parse(&["SRR123456"]);
-        assert_eq!(cli.rna_splice_level, 0);
+        let cmd = parse(&["SRR123456"]);
+        assert_eq!(cmd.rna_splice_level, 0);
     }
 }

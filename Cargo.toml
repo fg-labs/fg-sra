@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/fg-sra-vdb-sys",
     "crates/fg-sra-vdb",
-    "crates/fg-sratosam",
+    "crates/fg-sra",
 ]
 
 [workspace.package]

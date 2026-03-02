@@ -8,6 +8,18 @@ use std::ptr;
 use crate::database::VDatabase;
 use crate::error::{VdbError, check_rc, to_cstring};
 
+/// Option flags for [`ReferenceList::make_database`].
+///
+/// These control which alignment ID columns are read from the REFERENCE table.
+pub mod reflist_options {
+    /// Include `PRIMARY_ALIGNMENT_IDS` column (required for primary alignment iteration).
+    pub const USE_PRIMARY_IDS: u32 = 0x02;
+    /// Include `SECONDARY_ALIGNMENT_IDS` column (required for secondary alignment iteration).
+    pub const USE_SECONDARY_IDS: u32 = 0x04;
+    /// Include `EVIDENCE_INTERVAL_IDS` column (required for evidence interval iteration).
+    pub const USE_EVIDENCE_IDS: u32 = 0x08;
+}
+
 /// Safe wrapper around the VDB `ReferenceList` opaque type.
 ///
 /// Created from a database, provides access to reference sequences.

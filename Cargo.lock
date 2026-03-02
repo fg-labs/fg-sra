@@ -277,23 +277,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "fg-sra-vdb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fg-sra-vdb-sys",
-]
-
-[[package]]
-name = "fg-sra-vdb-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "cmake",
-]
-
-[[package]]
-name = "fg-sratosam"
+name = "fg-sra"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -307,6 +291,22 @@ dependencies = [
  "noodles-sam",
  "rayon",
  "rustc-hash",
+]
+
+[[package]]
+name = "fg-sra-vdb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fg-sra-vdb-sys",
+]
+
+[[package]]
+name = "fg-sra-vdb-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cmake",
 ]
 
 [[package]]

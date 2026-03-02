@@ -1,4 +1,4 @@
-//! fg-sratosam: High-performance SRA-to-SAM/BAM converter.
+//! fg-sra: High-performance SRA toolkit.
 
 mod aligned;
 mod cigar;

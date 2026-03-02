@@ -39,6 +39,17 @@ pub struct AlignedColumns {
     pub read_filter: Option<u8>,
 }
 
+impl AlignedColumns {
+    /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
+    ///
+    /// Matches sam-dump behavior: reads without a mate alignment are output as
+    /// unpaired by clearing PAIRED, PROPER_PAIR, MATE_UNMAPPED, MATE_REVERSE,
+    /// FIRST_IN_PAIR, and LAST_IN_PAIR flag bits.
+    pub fn strip_paired_flags(&mut self) {
+        self.sam_flags &= !sam_flags::PAIRED_MASK;
+    }
+}
+
 /// Column data for an unaligned record from the SEQUENCE table.
 ///
 /// Uses borrowed slices to avoid per-record allocations in the hot loop.
@@ -77,13 +88,19 @@ pub const READ_TYPE_REVERSE: u8 = 2;
 /// SAM flag bit constants.
 mod sam_flags {
     pub const PAIRED: u32 = 0x1;
+    pub const PROPER_PAIR: u32 = 0x2;
     pub const UNMAPPED: u32 = 0x4;
     pub const MATE_UNMAPPED: u32 = 0x8;
     pub const REVERSE: u32 = 0x10;
+    pub const MATE_REVERSE: u32 = 0x20;
     pub const FIRST_IN_PAIR: u32 = 0x40;
     pub const LAST_IN_PAIR: u32 = 0x80;
     pub const QC_FAIL: u32 = 0x200;
     pub const SUPPLEMENTARY_FILTER: u32 = 0x400;
+
+    /// Mask of all paired-end related flags, cleared when mate has no alignment.
+    pub const PAIRED_MASK: u32 =
+        PAIRED | PROPER_PAIR | MATE_UNMAPPED | MATE_REVERSE | FIRST_IN_PAIR | LAST_IN_PAIR;
 }
 
 /// Options controlling SAM record formatting.
@@ -631,6 +648,31 @@ mod tests {
             apply_read_filter(99, Some(READ_FILTER_CRITERIA)),
             99 | sam_flags::SUPPLEMENTARY_FILTER
         );
+    }
+
+    #[test]
+    fn test_strip_paired_flags() {
+        let mut cols = default_aligned_cols();
+
+        // FLAG=73 (paired + mate_unmapped + first_in_pair) → 0
+        cols.sam_flags = 0x49;
+        cols.strip_paired_flags();
+        assert_eq!(cols.sam_flags, 0);
+
+        // FLAG=89 (paired + mate_unmapped + reverse + first_in_pair) → 16 (reverse only)
+        cols.sam_flags = 0x59;
+        cols.strip_paired_flags();
+        assert_eq!(cols.sam_flags, 0x10);
+
+        // FLAG=585 (paired + mate_unmapped + first_in_pair + QC_FAIL) → 512 (QC_FAIL only)
+        cols.sam_flags = 0x249;
+        cols.strip_paired_flags();
+        assert_eq!(cols.sam_flags, 0x200);
+
+        // FLAG=99 (paired + proper_pair + mate_reverse + first_in_pair) → should strip
+        cols.sam_flags = 99;
+        cols.strip_paired_flags();
+        assert_eq!(cols.sam_flags, 99 & !(0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80));
     }
 
     #[test]

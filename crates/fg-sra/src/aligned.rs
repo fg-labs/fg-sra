@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use fg_sra_vdb::cursor::VCursor;
 use fg_sra_vdb::database::VDatabase;
 use fg_sra_vdb::iterator::{AlignIdSrc, AlignMgr, PlacementIterator, PlacementSetIterator};
-use fg_sra_vdb::reference::ReferenceList;
+use fg_sra_vdb::reference::{ReferenceList, reflist_options};
 
 use crate::matecache::{MateCache, MateInfo};
 use crate::output::OutputWriter;
@@ -49,6 +49,11 @@ struct AlignColumnIndices {
 }
 
 /// Set up a VDB cursor with all alignment columns.
+///
+/// The cursor is NOT opened here — the `PlacementIterator` creation code
+/// adds its own columns (`REF_POS`, `REF_LEN`, `MAPQ`, `SPOT_GROUP`) via
+/// `TableReader_MakeCursor` and then opens the cursor.  Since columns cannot
+/// be added to an already-open cursor, we must defer the open.
 fn setup_align_cursor(
     db: &VDatabase,
     table_name: &str,
@@ -75,8 +80,7 @@ fn setup_align_cursor(
         read_filter: cursor.add_column_optional(col::READ_FILTER),
     };
 
-    cursor.open().context("failed to open alignment cursor")?;
-
+    // Do NOT call cursor.open() here — PlacementIterator::make will open it.
     Ok((cursor, indices))
 }
 
@@ -123,8 +127,12 @@ pub fn process_aligned_table(
     min_mapq: Option<u32>,
     opts: &FormatOptions<'_>,
 ) -> Result<()> {
-    let reflist =
-        ReferenceList::make_database(db, 0, 0).context("failed to create ReferenceList")?;
+    let mut reflist_opts = reflist_options::USE_PRIMARY_IDS;
+    if !primary_only {
+        reflist_opts |= reflist_options::USE_SECONDARY_IDS;
+    }
+    let reflist = ReferenceList::make_database(db, reflist_opts, 0)
+        .context("failed to create ReferenceList")?;
     let ref_count = reflist.count().context("failed to get reference count")?;
     if ref_count == 0 {
         return Ok(());
@@ -189,9 +197,25 @@ fn process_alignment_table_with_id_src(
         let ref_obj = reflist.get(i).context("failed to get reference")?;
         let ref_len = ref_obj.seq_length().context("failed to get reference length")?;
 
-        let pi = PlacementIterator::make(&ref_obj, 0, ref_len, min_mapq_val, &cursor, id_src)
-            .context("failed to create PlacementIterator")?;
-        psi.add_placement_iterator(pi).context("failed to add PlacementIterator")?;
+        // Skip zero-length references (the VDB API requires ref_window_len >= 1).
+        if ref_len == 0 {
+            continue;
+        }
+
+        // PlacementIterator::make returns rcDone for references with no alignments
+        // in this table (e.g. unplaced contigs). Skip those gracefully.
+        let pi = match PlacementIterator::make(&ref_obj, 0, ref_len, min_mapq_val, &cursor, id_src)
+        {
+            Ok(pi) => pi,
+            Err(e) if e.is_done() => continue,
+            Err(e) => return Err(e).context("failed to create PlacementIterator"),
+        };
+        // add_placement_iterator returns Ok(false) when the iterator has no
+        // placements (rcDone), matching sam-dump's behavior of continuing.
+        match psi.add_placement_iterator(pi) {
+            Ok(_) => {}
+            Err(e) => return Err(e).context("failed to add PlacementIterator"),
+        }
     }
 
     process_placement_set(&mut psi, &cursor, &col_idx, writer, use_seqid, opts)
@@ -221,9 +245,11 @@ fn process_placement_set(
                     let ref_pos = rec.pos();
                     let mapq = rec.mapq();
 
-                    let cols = read_aligned_columns(cursor, col_idx, align_id)?;
+                    let mut cols = read_aligned_columns(cursor, col_idx, align_id)?;
 
                     // Resolve mate: look up cached mate info and store ours.
+                    // When mate has no alignment, strip paired-end flags to match
+                    // sam-dump's behavior (the read is output as unpaired).
                     let mate_info = if cols.mate_align_id != 0 {
                         let info = mate_cache.take(cols.mate_align_id);
                         mate_cache.insert(
@@ -237,6 +263,7 @@ fn process_placement_set(
                         );
                         info
                     } else {
+                        cols.strip_paired_flags();
                         None
                     };
 

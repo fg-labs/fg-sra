@@ -1,11 +1,11 @@
 [package]
-name = "fg-sratosam"
+name = "fg-sra"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "High-performance SRA-to-SAM/BAM converter"
+description = "High-performance SRA toolkit"
 readme = "../../README.md"
 
 [dependencies]

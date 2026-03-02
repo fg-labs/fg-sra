@@ -79,13 +79,30 @@ unsafe impl Send for PlacementSetIterator {}
 impl PlacementSetIterator {
     /// Add a placement iterator (for one alignment table on one reference).
     ///
-    /// Takes ownership of the `PlacementIterator`.
-    pub fn add_placement_iterator(&mut self, iter: PlacementIterator) -> Result<(), VdbError> {
+    /// Takes ownership of the `PlacementIterator` on success.  On error the
+    /// iterator is released (matching the C API's ownership semantics — the PSI
+    /// only takes ownership when it returns `rc == 0`).
+    ///
+    /// Returns `Ok(true)` when the iterator was accepted, `Ok(false)` when the
+    /// iterator had no placements (`rcDone`) and was released, or `Err` for
+    /// real errors.
+    pub fn add_placement_iterator(&mut self, iter: PlacementIterator) -> Result<bool, VdbError> {
         let rc =
             unsafe { fg_sra_vdb_sys::PlacementSetIteratorAddPlacementIterator(self.ptr, iter.ptr) };
-        // Don't drop the iterator - ownership transferred to the set iterator.
-        std::mem::forget(iter);
-        check_rc(rc)
+        if rc == 0 {
+            // Ownership transferred to the set iterator — don't drop.
+            std::mem::forget(iter);
+            Ok(true)
+        } else {
+            let err = VdbError::new(rc);
+            if err.is_done() {
+                // No placements for this reference — iterator is released by Drop.
+                Ok(false)
+            } else {
+                // Real error — iterator is released by Drop.
+                Err(err)
+            }
+        }
     }
 
     /// Advance to the next reference.
