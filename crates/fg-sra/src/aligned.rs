@@ -91,19 +91,24 @@ struct AlignColumnIndices {
     read_filter: Option<u32>,
 }
 
-/// Set up a VDB cursor with all alignment columns.
+/// Cache capacity for the data cursor (32 MB). Bounds VDB's MRU blob cache
+/// per cursor, preventing unbounded memory growth across references.
+const DATA_CURSOR_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Set up a VDB cursor with all data columns for aligned records.
 ///
-/// The cursor is NOT opened here — the `PlacementIterator` creation code
-/// adds its own columns (`REF_POS`, `REF_LEN`, `MAPQ`, `SPOT_GROUP`) via
-/// `TableReader_MakeCursor` and then opens the cursor.  Since columns cannot
-/// be added to an already-open cursor, we must defer the open.
-fn setup_align_cursor(
+/// Creates a cached cursor (bounded at `DATA_CURSOR_CACHE_BYTES`) and opens
+/// it immediately. This cursor is independent of the PlacementIterator's
+/// internal cursor — PI receives NULL and creates its own lightweight cursor.
+fn setup_data_cursor(
     db: &VDatabase,
     table_name: &str,
     use_long_cigar: bool,
 ) -> Result<(VCursor, AlignColumnIndices)> {
     let table = db.open_table_read(table_name).context("failed to open alignment table")?;
-    let cursor = table.create_cursor_read().context("failed to create alignment cursor")?;
+    let cursor = table
+        .create_cached_cursor_read(DATA_CURSOR_CACHE_BYTES)
+        .context("failed to create data cursor")?;
 
     let cigar_col = if use_long_cigar { col::CIGAR_LONG } else { col::CIGAR_SHORT };
 
@@ -123,7 +128,9 @@ fn setup_align_cursor(
         read_filter: cursor.add_column_optional(col::READ_FILTER),
     };
 
-    // Do NOT call cursor.open() here — PlacementIterator::make will open it.
+    // Open immediately — PI will NOT open this cursor (it gets NULL).
+    cursor.open().context("failed to open data cursor")?;
+
     Ok((cursor, indices))
 }
 
@@ -241,7 +248,7 @@ fn process_alignment_table_sequential(
     id_src: AlignIdSrc,
     progress: &ProgressLogger,
 ) -> Result<()> {
-    let (cursor, col_idx) = setup_align_cursor(db, table_name, config.use_long_cigar)?;
+    let (cursor, col_idx) = setup_data_cursor(db, table_name, config.use_long_cigar)?;
     let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
         .context("failed to create ReferenceList")?;
     let min_mapq = config.min_mapq_i32();
@@ -260,8 +267,7 @@ fn process_alignment_table_sequential(
     for item in work_items {
         let ref_obj = reflist.get(item.ref_idx).context("failed to get reference")?;
 
-        let pi = match PlacementIterator::make(&ref_obj, 0, item.ref_len, min_mapq, &cursor, id_src)
-        {
+        let pi = match PlacementIterator::make(&ref_obj, 0, item.ref_len, min_mapq, None, id_src) {
             Ok(pi) => pi,
             Err(e) if e.is_done() => {
                 progress.reference_done();
@@ -423,7 +429,7 @@ fn process_table_parallel(
     // Create bounded resource pool with pool_size sets.
     let (resource_pool_tx, resource_pool_rx) = bounded::<ResourceSet>(pool_size);
     for _ in 0..pool_size {
-        let (cursor, col_idx) = setup_align_cursor(db, table_name, config.use_long_cigar)?;
+        let (cursor, col_idx) = setup_data_cursor(db, table_name, config.use_long_cigar)?;
         let reflist = ReferenceList::make_database(db, reflist_opts, 0)
             .context("failed to create per-pool ReferenceList")?;
         resource_pool_tx
@@ -651,14 +657,7 @@ fn process_one_reference(
 
     let ref_obj = resources.reflist.get(item.ref_idx).context("worker: failed to get reference")?;
 
-    let pi = match PlacementIterator::make(
-        &ref_obj,
-        0,
-        item.ref_len,
-        min_mapq,
-        &resources.cursor,
-        id_src,
-    ) {
+    let pi = match PlacementIterator::make(&ref_obj, 0, item.ref_len, min_mapq, None, id_src) {
         Ok(pi) => pi,
         Err(e) if e.is_done() => {
             // No alignments on this reference — send empty final chunk.
@@ -746,6 +745,11 @@ mod tests {
             num_threads,
             opts: &OPTS,
         }
+    }
+
+    #[test]
+    fn test_data_cursor_cache_bytes() {
+        assert_eq!(DATA_CURSOR_CACHE_BYTES, 32 * 1024 * 1024);
     }
 
     #[test]

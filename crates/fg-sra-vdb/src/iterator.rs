@@ -275,17 +275,20 @@ unsafe impl Send for PlacementIterator {}
 impl PlacementIterator {
     /// Create a placement iterator for a reference.
     ///
-    /// This is a complex operation that sets up iteration over alignments
-    /// on a specific reference using a given cursor.
+    /// When `align_cursor` is `None`, VDB creates its own lightweight internal
+    /// cursor with only the 4 PI columns (`REF_POS`, `REF_LEN`, `MAPQ`,
+    /// `SPOT_GROUP`) and a bounded cache.  Pass `None` to avoid accumulating
+    /// unbounded blob state on a shared data cursor.
     pub fn make(
         ref_obj: &ReferenceObj,
         ref_window_start: i32,
         ref_window_len: u32,
         min_mapq: i32,
-        align_cursor: &VCursor,
+        align_cursor: Option<&VCursor>,
         id_src: AlignIdSrc,
     ) -> Result<Self, VdbError> {
         let mut iter: *mut fg_sra_vdb_sys::PlacementIterator = ptr::null_mut();
+        let align_cur_ptr = align_cursor.map(|c| c.as_ptr()).unwrap_or(ptr::null());
         let rc = unsafe {
             fg_sra_vdb_sys::ReferenceObj_MakePlacementIterator(
                 ref_obj.as_ptr(),
@@ -293,8 +296,8 @@ impl PlacementIterator {
                 ref_window_start,
                 ref_window_len,
                 min_mapq,
-                ptr::null(), // ref_cursor (NULL = use internal)
-                align_cursor.as_ptr(),
+                ptr::null(),   // ref_cursor (NULL = use internal)
+                align_cur_ptr, // NULL = VDB creates lightweight internal cursor
                 id_src as u8,
                 ptr::null(),     // ext_0
                 ptr::null(),     // ext_1
