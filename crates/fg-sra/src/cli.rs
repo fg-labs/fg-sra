@@ -179,7 +179,7 @@ impl ToSam {
     fn process_accession(&self, accession: &str) -> Result<()> {
         use fg_sra_vdb::manager::VdbManager;
 
-        use crate::aligned::process_aligned_table;
+        use crate::aligned::{AlignConfig, process_aligned_table};
         use crate::header::generate_header;
         use crate::output::OutputWriter;
         use crate::record::FormatOptions;
@@ -210,17 +210,20 @@ impl ToSam {
             reverse_unaligned: self.reverse,
         };
 
+        let align_config = AlignConfig {
+            use_seqid: self.seqid,
+            use_long_cigar: self.cigar_long,
+            primary_only: self.primary,
+            min_mapq: self.min_mapq,
+            num_threads: self.threads.unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            }),
+            opts: &opts,
+        };
+
         // Aligned reads (unless --unaligned-spots-only).
         if !self.unaligned_spots_only {
-            process_aligned_table(
-                &db,
-                &mut writer,
-                self.seqid,
-                self.cigar_long,
-                self.primary,
-                self.min_mapq,
-                &opts,
-            )?;
+            process_aligned_table(&db, &mut writer, &align_config)?;
         }
 
         // Unaligned reads (if requested).

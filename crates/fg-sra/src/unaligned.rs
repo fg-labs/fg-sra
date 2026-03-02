@@ -147,7 +147,7 @@ pub fn process_unaligned_reads(
             };
 
             format_unaligned_record(&mut buf, &cols, opts);
-            writer.write_record(&buf)?;
+            writer.write_bytes(&buf)?;
         }
     }
 

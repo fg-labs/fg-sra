@@ -38,9 +38,13 @@ impl OutputWriter {
         Ok(())
     }
 
-    /// Write a pre-formatted SAM record line (must include trailing newline).
-    pub fn write_record(&mut self, record: &[u8]) -> Result<()> {
-        self.inner.write_all(record)?;
+    /// Write pre-formatted bytes to the output.
+    ///
+    /// The bytes may contain one or more SAM lines, or any other pre-formatted
+    /// content. No framing or newlines are added — callers are responsible for
+    /// including record delimiters.
+    pub fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.inner.write_all(data)?;
         Ok(())
     }
 
@@ -48,5 +52,15 @@ impl OutputWriter {
     pub fn finish(mut self) -> Result<()> {
         self.inner.flush()?;
         Ok(())
+    }
+}
+
+impl io::Write for OutputWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
