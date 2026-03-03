@@ -210,12 +210,15 @@ impl ToSam {
             writer.write_header(&header)?;
         }
 
+        let qual_table =
+            self.qual_quant.as_deref().map(crate::quality::parse_qual_quant).transpose()?;
         let opts = FormatOptions {
             prefix: self.prefix.as_deref(),
             spot_group_in_name: self.spot_group,
             xi_tag: self.xi_tag,
             reverse_unaligned: self.reverse,
             omit_quality: self.omit_quality,
+            qual_quant: qual_table.as_ref(),
         };
 
         let align_config = AlignConfig {

@@ -4,6 +4,7 @@
 //! all fields in a single pass rather than multiple formatted-print calls.
 
 use crate::matecache::MateInfo;
+use crate::quality::QuantTable;
 
 /// Column data read from VDB for an aligned record.
 ///
@@ -152,6 +153,8 @@ pub struct FormatOptions<'a> {
     pub reverse_unaligned: bool,
     /// Replace quality values with `*`.
     pub omit_quality: bool,
+    /// Quality score quantization table.
+    pub qual_quant: Option<&'a QuantTable>,
 }
 
 /// Format a SAM line for an aligned record.
@@ -242,6 +245,10 @@ pub fn format_aligned_record(
     buf.push(b'\t');
     if opts.omit_quality || cols.quality.is_empty() {
         buf.push(b'*');
+    } else if let Some(table) = opts.qual_quant {
+        for &q in cols.quality.as_bytes() {
+            buf.push(crate::quality::quantize_phred33(q, table));
+        }
     } else {
         buf.extend_from_slice(cols.quality.as_bytes());
     }
@@ -335,11 +342,21 @@ pub fn format_unaligned_record(
     } else if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
         // Reverse the quality scores.
         for &q in cols.quality.iter().rev() {
-            buf.push(q + 33);
+            let phred = if let Some(table) = opts.qual_quant {
+                crate::quality::quantize_phred(q, table)
+            } else {
+                q
+            };
+            buf.push(phred + 33);
         }
     } else {
         for &q in cols.quality {
-            buf.push(q + 33);
+            let phred = if let Some(table) = opts.qual_quant {
+                crate::quality::quantize_phred(q, table)
+            } else {
+                q
+            };
+            buf.push(phred + 33);
         }
     }
 
@@ -450,6 +467,7 @@ mod tests {
             xi_tag: false,
             reverse_unaligned: false,
             omit_quality: false,
+            qual_quant: None,
         }
     }
 
@@ -760,5 +778,48 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         assert_eq!(fields[10], "*"); // QUAL omitted
+    }
+
+    #[test]
+    fn test_aligned_qual_quant() {
+        let table = crate::quality::parse_qual_quant("0:10,10:20,20:30,30:40").unwrap();
+        let mut cols = default_aligned_cols();
+        // Phred+33 encoded: Phred 5 = 38, Phred 15 = 48, Phred 25 = 58, Phred 35 = 68
+        cols.quality = String::from_utf8(vec![5 + 33, 15 + 33, 25 + 33, 35 + 33]).unwrap();
+        let opts = FormatOptions { qual_quant: Some(&table), ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_aligned_record(&mut buf, &cols, "chr1", 100, 60, 42, None, &opts);
+
+        let line = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        let qual_bytes = fields[10].as_bytes();
+        // Phred 5 → 10, Phred 15 → 20, Phred 25 → 30, Phred 35 → 40
+        assert_eq!(qual_bytes, &[10 + 33, 20 + 33, 30 + 33, 40 + 33]);
+    }
+
+    #[test]
+    fn test_unaligned_qual_quant() {
+        let table = crate::quality::parse_qual_quant("0:10,10:20,20:30,30:40").unwrap();
+        let cols = UnalignedColumns {
+            name: "spot1",
+            read: "ACGT",
+            quality: &[5, 15, 25, 35], // raw Phred values
+            spot_group: "",
+            read_type: READ_TYPE_BIOLOGICAL,
+            read_filter: READ_FILTER_PASS,
+            num_bio_reads: 1,
+            bio_read_index: 0,
+        };
+        let opts = FormatOptions { qual_quant: Some(&table), ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let line = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        let qual_bytes = fields[10].as_bytes();
+        // Phred 5 → 10, Phred 15 → 20, Phred 25 → 30, Phred 35 → 40
+        assert_eq!(qual_bytes, &[10 + 33, 20 + 33, 30 + 33, 40 + 33]);
     }
 }

@@ -781,6 +781,7 @@ mod tests {
             xi_tag: false,
             reverse_unaligned: false,
             omit_quality: false,
+            qual_quant: None,
         };
         AlignConfig {
             use_seqid: false,
