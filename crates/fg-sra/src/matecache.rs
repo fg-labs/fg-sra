@@ -10,12 +10,11 @@ use rustc_hash::FxHashMap;
 ///
 /// The mate cache is cleared between references, so all cached mates are
 /// on the same reference as the current read — `ref_name` is not stored.
+/// Only `ref_pos` is cached; TLEN comes from each record's own VDB column.
 #[derive(Debug, Clone)]
 pub struct MateInfo {
     /// 0-based reference position of this alignment.
     pub ref_pos: i32,
-    /// Template length.
-    pub tlen: i32,
 }
 
 /// Cache for resolving mate-pair information in paired-end reads.
@@ -65,12 +64,11 @@ mod tests {
     #[test]
     fn test_insert_and_take() {
         let mut cache = MateCache::new();
-        let info = MateInfo { ref_pos: 1000, tlen: 300 };
+        let info = MateInfo { ref_pos: 1000 };
         cache.insert(42, info);
 
         let mate = cache.take(42).expect("should find mate");
         assert_eq!(mate.ref_pos, 1000);
-        assert_eq!(mate.tlen, 300);
 
         // Second take should return None (removed).
         assert!(cache.take(42).is_none());
@@ -85,8 +83,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut cache = MateCache::new();
-        cache.insert(1, MateInfo { ref_pos: 0, tlen: 0 });
-        cache.insert(2, MateInfo { ref_pos: 0, tlen: 0 });
+        cache.insert(1, MateInfo { ref_pos: 0 });
+        cache.insert(2, MateInfo { ref_pos: 0 });
         assert_eq!(cache.len(), 2);
 
         cache.clear();

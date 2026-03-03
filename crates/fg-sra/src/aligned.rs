@@ -78,7 +78,7 @@ mod col {
     pub const READ_FILTER: &str = "(INSDC:SRA:read_filter)READ_FILTER";
     pub const REF_POS: &str = "(INSDC:coord:zero)REF_POS";
     pub const MAPQ: &str = "(I32)MAPQ";
-    pub const REF_ID: &str = "(I64)REF_ID";
+    pub const REF_NAME: &str = "(ascii)REF_NAME";
 }
 
 /// Column indices for aligned read cursor.
@@ -187,7 +187,7 @@ struct RefBoundary {
     last_row: i64,
 }
 
-/// Discover per-reference alignment row ranges by probing the `REF_ID` column.
+/// Discover per-reference alignment row ranges by probing the `REF_NAME` column.
 ///
 /// Since PRIMARY_ALIGNMENT rows are contiguous per reference and ordered by
 /// reference index, we can find boundaries with a linear scan over reference
@@ -202,7 +202,7 @@ fn find_ref_boundaries(
 ) -> Result<Vec<RefBoundary>> {
     let table = db.open_table_read(table_name).context("failed to open alignment table")?;
     let cursor = table.create_cursor_read().context("failed to create boundary cursor")?;
-    let ref_id_col = cursor.add_column(col::REF_ID).context("REF_ID")?;
+    let ref_name_col = cursor.add_column(col::REF_NAME).context("REF_NAME")?;
     cursor.open().context("failed to open boundary cursor")?;
 
     let (first_row, total_count) = cursor.id_range(0).context("failed to get id range")?;
@@ -215,15 +215,15 @@ fn find_ref_boundaries(
     let mut current_start = first_row;
 
     while current_start <= last_row {
-        let ref_id = cursor.read_i64(current_start, ref_id_col)?;
+        let current_name = cursor.read_str(current_start, ref_name_col)?;
 
-        // Binary search for the last row with this ref_id.
+        // Binary search for the last row with this reference name.
         let mut lo = current_start;
         let mut hi = last_row;
         while lo < hi {
             let mid = lo + (hi - lo + 1) / 2;
-            let mid_ref_id = cursor.read_i64(mid, ref_id_col)?;
-            if mid_ref_id == ref_id {
+            let mid_name = cursor.read_str(mid, ref_name_col)?;
+            if mid_name == current_name {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -231,13 +231,15 @@ fn find_ref_boundaries(
         }
         let boundary_end = lo;
 
-        let ref_idx = ref_id as u32;
-        let ref_obj = reflist.get(ref_idx).context("failed to get reference for boundary")?;
-        let ref_name = if use_seqid { ref_obj.seq_id()? } else { ref_obj.name()? };
+        let ref_obj = reflist.find(&current_name).with_context(|| {
+            format!("failed to find reference '{current_name}' in reference list")
+        })?;
+        let ref_idx = ref_obj.idx()?;
+        let ref_name = if use_seqid { ref_obj.seq_id()? } else { current_name };
 
         boundaries.push(RefBoundary {
             ref_idx,
-            ref_name: ref_name.to_string(),
+            ref_name,
             first_row: current_start,
             last_row: boundary_end,
         });
@@ -405,8 +407,6 @@ fn process_row_range(
     state: &mut WorkerState,
     mut emit: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    state.mate_cache.clear();
-
     for row_id in item.start_row..=item.end_row {
         read_aligned_columns(cursor, col_idx, row_id, &mut state.cols)?;
 
@@ -427,10 +427,7 @@ fn process_row_range(
         // sam-dump's behavior (the read is output as unpaired).
         let mate_info = if state.cols.mate_align_id != 0 {
             let info = state.mate_cache.take(state.cols.mate_align_id);
-            state.mate_cache.insert(
-                row_id,
-                MateInfo { ref_pos: state.cols.ref_pos, tlen: state.cols.template_len },
-            );
+            state.mate_cache.insert(row_id, MateInfo { ref_pos: state.cols.ref_pos });
             info
         } else {
             state.cols.strip_paired_flags();
@@ -527,9 +524,14 @@ fn process_table_sequential(
         record_buf: Vec::with_capacity(1024),
         mate_cache: MateCache::new(),
         cols: AlignedColumns::new(),
+        current_ref_idx: u32::MAX,
     };
 
     for item in work_items {
+        if item.ref_idx != state.current_ref_idx {
+            state.mate_cache.clear();
+            state.current_ref_idx = item.ref_idx;
+        }
         process_row_range(&cursor, &col_idx, item, min_mapq, config.opts, &mut state, |rec| {
             progress.record(1);
             writer.write_bytes(rec)
@@ -727,6 +729,8 @@ struct WorkerState {
     record_buf: Vec<u8>,
     mate_cache: MateCache,
     cols: AlignedColumns,
+    /// Tracks which reference the mate cache belongs to; cleared on change.
+    current_ref_idx: u32,
 }
 
 /// Worker loop: check out VDB resources from the pool per work item, process,
@@ -740,6 +744,7 @@ fn pool_worker_loop(
         record_buf: Vec::with_capacity(1024),
         mate_cache: MateCache::new(),
         cols: AlignedColumns::new(),
+        current_ref_idx: u32::MAX,
     };
     let min_mapq = config.min_mapq_i32();
 
@@ -749,6 +754,10 @@ fn pool_worker_loop(
     };
 
     while let Ok(item) = channels.work_rx.recv() {
+        if item.ref_idx != state.current_ref_idx {
+            state.mate_cache.clear();
+            state.current_ref_idx = item.ref_idx;
+        }
         // Check out a VDB resource set (blocks if none available).
         let resources = channels
             .resource_pool_rx

@@ -290,11 +290,12 @@ fn format_aligned_record_sam(
     // RNEXT, PNEXT, TLEN — use mate cache if available, else column data.
     // Mate cache is cleared between references, so cached mates are always
     // on the same reference → RNEXT is always "=".
+    // TLEN always comes from the current record's column, not the cache.
     if let Some(mate) = mate_info {
         buf.extend_from_slice(b"\t=\t");
         write_i32(buf, mate.ref_pos + 1);
         buf.push(b'\t');
-        write_i32(buf, mate.tlen);
+        write_i32(buf, cols.template_len);
     } else {
         let rnext = cols.mate_ref_name.as_str();
         buf.push(b'\t');
@@ -643,9 +644,10 @@ fn format_aligned_record_bam(
     let l_seq = seq.len() as i32;
 
     // Resolve mate info.
+    // TLEN always comes from the current record's column, not the cache.
     let (mate_ref_id, mate_pos, tlen) = if let Some(m) = mate_info {
         // Mate is on same reference (mate cache only stores same-ref mates).
-        (ref_id, m.ref_pos, m.tlen)
+        (ref_id, m.ref_pos, cols.template_len)
     } else if cols.mate_align_id != 0 {
         let rnext = cols.mate_ref_name.as_str();
         let mate_rid = if rnext.is_empty() || rnext == "*" {
@@ -1070,7 +1072,7 @@ mod tests {
     fn test_aligned_record_with_mate_cache() {
         let cols = default_aligned_cols();
         let opts = default_opts();
-        let mate = MateInfo { ref_pos: 200, tlen: -300 };
+        let mate = MateInfo { ref_pos: 200 };
         let mut buf = Vec::new();
 
         format_aligned_record(&mut buf, &cols, "chr1", 0, 100, 60, 42, Some(&mate), &opts);
@@ -1079,7 +1081,7 @@ mod tests {
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         assert_eq!(fields[6], "="); // RNEXT from mate cache (same ref)
         assert_eq!(fields[7], "201"); // PNEXT from mate cache (1-based)
-        assert_eq!(fields[8], "-300"); // TLEN from mate cache
+        assert_eq!(fields[8], "300"); // TLEN from record's own column, not cache
     }
 
     #[test]
