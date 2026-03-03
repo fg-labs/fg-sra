@@ -205,8 +205,16 @@ impl ToSam {
             None => OutputWriter::stdout_with_compression(compression),
         };
 
-        // Header.
-        if !self.no_header {
+        let output_mode = if self.fasta {
+            crate::record::OutputMode::Fasta
+        } else if self.fastq {
+            crate::record::OutputMode::Fastq
+        } else {
+            crate::record::OutputMode::Sam
+        };
+
+        // Header (suppressed for FASTA/FASTQ output).
+        if !self.no_header && output_mode == crate::record::OutputMode::Sam {
             let header = generate_header(
                 &db,
                 self.header,
@@ -226,6 +234,7 @@ impl ToSam {
             reverse_unaligned: self.reverse,
             omit_quality: self.omit_quality,
             qual_quant: qual_table.as_ref(),
+            output_mode,
         };
 
         let align_config = AlignConfig {

@@ -141,6 +141,14 @@ mod sam_flags {
         PAIRED | PROPER_PAIR | MATE_UNMAPPED | MATE_REVERSE | FIRST_IN_PAIR | LAST_IN_PAIR;
 }
 
+/// Output format mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Sam,
+    Fasta,
+    Fastq,
+}
+
 /// Options controlling SAM record formatting.
 pub struct FormatOptions<'a> {
     /// Prepend this prefix to QNAME (e.g. "PRE.name").
@@ -155,13 +163,74 @@ pub struct FormatOptions<'a> {
     pub omit_quality: bool,
     /// Quality score quantization table.
     pub qual_quant: Option<&'a QuantTable>,
+    /// Output mode (SAM, FASTA, or FASTQ).
+    pub output_mode: OutputMode,
+}
+
+/// Format a record for an aligned read, dispatching to SAM, FASTA, or FASTQ.
+#[allow(clippy::too_many_arguments)]
+pub fn format_aligned_record(
+    buf: &mut Vec<u8>,
+    cols: &AlignedColumns,
+    ref_name: &str,
+    ref_pos: i32,
+    mapq: i32,
+    align_id: i64,
+    mate_info: Option<&MateInfo>,
+    opts: &FormatOptions<'_>,
+) {
+    match opts.output_mode {
+        OutputMode::Sam => {
+            format_aligned_record_sam(buf, cols, ref_name, ref_pos, mapq, align_id, mate_info, opts)
+        }
+        OutputMode::Fasta => {
+            buf.clear();
+            buf.push(b'>');
+            write_qname(
+                buf,
+                opts.prefix,
+                &cols.seq_name,
+                &cols.spot_group,
+                '.',
+                opts.spot_group_in_name,
+            );
+            buf.push(b'\n');
+            buf.extend_from_slice(cols.read.as_bytes());
+            buf.push(b'\n');
+        }
+        OutputMode::Fastq => {
+            buf.clear();
+            buf.push(b'@');
+            write_qname(
+                buf,
+                opts.prefix,
+                &cols.seq_name,
+                &cols.spot_group,
+                '.',
+                opts.spot_group_in_name,
+            );
+            buf.push(b'\n');
+            buf.extend_from_slice(cols.read.as_bytes());
+            buf.extend_from_slice(b"\n+\n");
+            if opts.omit_quality || cols.quality.is_empty() {
+                buf.push(b'*');
+            } else if let Some(table) = opts.qual_quant {
+                for &q in cols.quality.as_bytes() {
+                    buf.push(crate::quality::quantize_phred33(q, table));
+                }
+            } else {
+                buf.extend_from_slice(cols.quality.as_bytes());
+            }
+            buf.push(b'\n');
+        }
+    }
 }
 
 /// Format a SAM line for an aligned record.
 ///
 /// Writes a complete tab-delimited SAM line (with trailing newline) into `buf`.
 #[allow(clippy::too_many_arguments)]
-pub fn format_aligned_record(
+fn format_aligned_record_sam(
     buf: &mut Vec<u8>,
     cols: &AlignedColumns,
     ref_name: &str,
@@ -271,8 +340,65 @@ pub fn format_aligned_record(
     buf.push(b'\n');
 }
 
-/// Format a SAM line for an unaligned record.
+/// Format a record for an unaligned read, dispatching to SAM, FASTA, or FASTQ.
 pub fn format_unaligned_record(
+    buf: &mut Vec<u8>,
+    cols: &UnalignedColumns<'_>,
+    opts: &FormatOptions<'_>,
+) {
+    match opts.output_mode {
+        OutputMode::Sam => format_unaligned_record_sam(buf, cols, opts),
+        OutputMode::Fasta => {
+            buf.clear();
+            buf.push(b'>');
+            write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
+            buf.push(b'\n');
+            if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+                write_reverse_complement(buf, cols.read.as_bytes());
+            } else {
+                buf.extend_from_slice(cols.read.as_bytes());
+            }
+            buf.push(b'\n');
+        }
+        OutputMode::Fastq => {
+            buf.clear();
+            buf.push(b'@');
+            write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
+            buf.push(b'\n');
+            if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+                write_reverse_complement(buf, cols.read.as_bytes());
+            } else {
+                buf.extend_from_slice(cols.read.as_bytes());
+            }
+            buf.extend_from_slice(b"\n+\n");
+            if opts.omit_quality || cols.quality.is_empty() {
+                buf.push(b'*');
+            } else if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+                for &q in cols.quality.iter().rev() {
+                    let phred = if let Some(table) = opts.qual_quant {
+                        crate::quality::quantize_phred(q, table)
+                    } else {
+                        q
+                    };
+                    buf.push(phred + 33);
+                }
+            } else {
+                for &q in cols.quality {
+                    let phred = if let Some(table) = opts.qual_quant {
+                        crate::quality::quantize_phred(q, table)
+                    } else {
+                        q
+                    };
+                    buf.push(phred + 33);
+                }
+            }
+            buf.push(b'\n');
+        }
+    }
+}
+
+/// Format a SAM line for an unaligned record.
+fn format_unaligned_record_sam(
     buf: &mut Vec<u8>,
     cols: &UnalignedColumns<'_>,
     opts: &FormatOptions<'_>,
@@ -468,6 +594,7 @@ mod tests {
             reverse_unaligned: false,
             omit_quality: false,
             qual_quant: None,
+            output_mode: OutputMode::Sam,
         }
     }
 
@@ -821,5 +948,97 @@ mod tests {
         let qual_bytes = fields[10].as_bytes();
         // Phred 5 → 10, Phred 15 → 20, Phred 25 → 30, Phred 35 → 40
         assert_eq!(qual_bytes, &[10 + 33, 20 + 33, 30 + 33, 40 + 33]);
+    }
+
+    #[test]
+    fn test_aligned_fasta() {
+        let cols = default_aligned_cols();
+        let opts = FormatOptions { output_mode: OutputMode::Fasta, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_aligned_record(&mut buf, &cols, "chr1", 100, 60, 42, None, &opts);
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, ">read1\nACGTACGT\n");
+    }
+
+    #[test]
+    fn test_aligned_fastq() {
+        let cols = default_aligned_cols();
+        let opts = FormatOptions { output_mode: OutputMode::Fastq, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_aligned_record(&mut buf, &cols, "chr1", 100, 60, 42, None, &opts);
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "@read1\nACGTACGT\n+\nIIIIIIII\n");
+    }
+
+    #[test]
+    fn test_unaligned_fasta() {
+        let cols = UnalignedColumns {
+            name: "spot1",
+            read: "ACGT",
+            quality: &[30, 30, 30, 30],
+            spot_group: "",
+            read_type: READ_TYPE_BIOLOGICAL,
+            read_filter: READ_FILTER_PASS,
+            num_bio_reads: 1,
+            bio_read_index: 0,
+        };
+        let opts = FormatOptions { output_mode: OutputMode::Fasta, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, ">spot1\nACGT\n");
+    }
+
+    #[test]
+    fn test_unaligned_fastq() {
+        let cols = UnalignedColumns {
+            name: "spot1",
+            read: "ACGT",
+            quality: &[30, 30, 30, 30],
+            spot_group: "",
+            read_type: READ_TYPE_BIOLOGICAL,
+            read_filter: READ_FILTER_PASS,
+            num_bio_reads: 1,
+            bio_read_index: 0,
+        };
+        let opts = FormatOptions { output_mode: OutputMode::Fastq, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let output = String::from_utf8(buf).unwrap();
+        // Quality: 30+33 = 63 = '?'
+        assert_eq!(output, "@spot1\nACGT\n+\n????\n");
+    }
+
+    #[test]
+    fn test_unaligned_fasta_reverse() {
+        let cols = UnalignedColumns {
+            name: "spot1",
+            read: "ACGT",
+            quality: &[10, 20, 30, 40],
+            spot_group: "",
+            read_type: READ_TYPE_BIOLOGICAL | READ_TYPE_REVERSE,
+            read_filter: READ_FILTER_PASS,
+            num_bio_reads: 1,
+            bio_read_index: 0,
+        };
+        let opts = FormatOptions {
+            reverse_unaligned: true,
+            output_mode: OutputMode::Fasta,
+            ..default_opts()
+        };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, ">spot1\nACGT\n"); // reverse complement of ACGT
     }
 }

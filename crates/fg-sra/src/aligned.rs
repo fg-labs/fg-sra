@@ -869,6 +869,7 @@ mod tests {
             reverse_unaligned: false,
             omit_quality: false,
             qual_quant: None,
+            output_mode: crate::record::OutputMode::Sam,
         };
         AlignConfig {
             use_seqid: false,
