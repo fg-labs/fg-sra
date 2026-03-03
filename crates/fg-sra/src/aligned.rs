@@ -31,6 +31,8 @@ pub struct AlignConfig<'a> {
     pub min_mapq: Option<u32>,
     pub num_threads: usize,
     pub opts: &'a FormatOptions<'a>,
+    /// Genomic regions to restrict output to. Empty means all references.
+    pub regions: &'a [String],
 }
 
 impl AlignConfig<'_> {
@@ -208,6 +210,87 @@ fn collect_work_items(
     Ok(work_items)
 }
 
+/// A parsed genomic region: reference name with optional coordinate window.
+struct Region {
+    name: String,
+    /// 0-based start (parsed from 1-based input).
+    start: Option<u32>,
+    /// 0-based exclusive end.
+    end: Option<u32>,
+}
+
+/// Parse a region string like `"chr1:1000-2000"` or `"chr2"`.
+///
+/// Coordinates in the input are 1-based; the returned start is converted to
+/// 0-based. End remains as-is (1-based end == 0-based exclusive end).
+fn parse_region(s: &str) -> Result<Region> {
+    if let Some((name, range)) = s.split_once(':') {
+        let (start_str, end_str) =
+            range.split_once('-').context("invalid region format: expected name:from-to")?;
+        let start: u32 =
+            start_str.parse::<u32>().context("invalid region start")?.saturating_sub(1);
+        let end: u32 = end_str.parse().context("invalid region end")?;
+        Ok(Region { name: name.to_owned(), start: Some(start), end: Some(end) })
+    } else {
+        Ok(Region { name: s.to_owned(), start: None, end: None })
+    }
+}
+
+/// Build work items for specific genomic regions.
+///
+/// Looks up each region name in the `ReferenceList`, restricting to the
+/// requested coordinate window (or the full reference if unspecified).
+fn collect_region_work_items(
+    reflist: &ReferenceList,
+    regions: &[String],
+    window_size: Option<u32>,
+) -> Result<Vec<WorkItem>> {
+    let mut work_items = Vec::with_capacity(regions.len());
+    for spec in regions {
+        let region = parse_region(spec)?;
+        let ref_obj = reflist
+            .find(&region.name)
+            .with_context(|| format!("reference not found: {}", region.name))?;
+        let ref_idx = ref_obj.idx().context("failed to get reference index")?;
+        let ref_len = ref_obj.seq_length().context("failed to get reference length")?;
+        if ref_len == 0 {
+            continue;
+        }
+
+        let start = region.start.unwrap_or(0).min(ref_len);
+        let end = region.end.unwrap_or(ref_len).min(ref_len);
+        if start >= end {
+            continue;
+        }
+        let total_len = end - start;
+
+        match window_size {
+            Some(ws) if total_len > ws => {
+                let mut pos = start;
+                while pos < end {
+                    let len = ws.min(end - pos);
+                    work_items.push(WorkItem {
+                        order_idx: work_items.len(),
+                        ref_idx,
+                        window_start: pos,
+                        window_len: len,
+                    });
+                    pos += ws;
+                }
+            }
+            _ => {
+                work_items.push(WorkItem {
+                    order_idx: work_items.len(),
+                    ref_idx,
+                    window_start: start,
+                    window_len: total_len,
+                });
+            }
+        }
+    }
+    Ok(work_items)
+}
+
 /// Process all aligned reads for one alignment table, writing SAM records.
 ///
 /// When `num_threads > 1`, references are processed in parallel across worker
@@ -225,8 +308,12 @@ pub fn process_aligned_table(
     let work_items = {
         let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
             .context("failed to create ReferenceList")?;
-        let ref_count = reflist.count().context("failed to get reference count")?;
-        collect_work_items(&reflist, ref_count, window_size)?
+        if config.regions.is_empty() {
+            let ref_count = reflist.count().context("failed to get reference count")?;
+            collect_work_items(&reflist, ref_count, window_size)?
+        } else {
+            collect_region_work_items(&reflist, config.regions, window_size)?
+        }
         // reflist dropped here
     };
 
@@ -790,6 +877,7 @@ mod tests {
             min_mapq: None,
             num_threads,
             opts: &OPTS,
+            regions: &[],
         }
     }
 
@@ -921,5 +1009,41 @@ mod tests {
         let expected: String =
             (0..3).flat_map(|r| (0..10).map(move |c| format!("r{r}c{c}\n"))).collect();
         assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn test_parse_region_name_only() {
+        let r = parse_region("chr1").unwrap();
+        assert_eq!(r.name, "chr1");
+        assert_eq!(r.start, None);
+        assert_eq!(r.end, None);
+    }
+
+    #[test]
+    fn test_parse_region_with_coordinates() {
+        let r = parse_region("chr1:1000-2000").unwrap();
+        assert_eq!(r.name, "chr1");
+        assert_eq!(r.start, Some(999)); // 1-based → 0-based
+        assert_eq!(r.end, Some(2000)); // 1-based end == 0-based exclusive
+    }
+
+    #[test]
+    fn test_parse_region_start_one() {
+        let r = parse_region("chr2:1-500").unwrap();
+        assert_eq!(r.name, "chr2");
+        assert_eq!(r.start, Some(0)); // 1 → 0
+        assert_eq!(r.end, Some(500));
+    }
+
+    #[test]
+    fn test_parse_region_invalid_format() {
+        // Missing dash in coordinate range.
+        assert!(parse_region("chr1:1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_region_invalid_numbers() {
+        assert!(parse_region("chr1:abc-2000").is_err());
+        assert!(parse_region("chr1:1000-xyz").is_err());
     }
 }

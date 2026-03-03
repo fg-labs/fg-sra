@@ -230,6 +230,7 @@ impl ToSam {
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
             }),
             opts: &opts,
+            regions: &self.aligned_region,
         };
 
         const PROGRESS_INTERVAL: u64 = 1_000_000;
