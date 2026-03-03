@@ -18,12 +18,12 @@ use crate::output::OutputWriter;
 use crate::progress::ProgressLogger;
 use crate::record::{AlignedColumns, FormatOptions, format_aligned_record};
 
+/// Default genomic window size for intra-reference parallelism (5 Mbp).
+/// References larger than this are split into windows in parallel mode.
+const DEFAULT_WINDOW_SIZE: u32 = 5_000_000;
+
 /// Configuration for aligned read processing, bundling CLI-derived options
 /// that are threaded through multiple functions.
-/// Maximum number of simultaneously open VDB resource sets (cursors + ReferenceLists).
-/// Bounds peak memory in multi-threaded mode to `MAX_OPEN_RESOURCE_SETS × per-set cost`.
-const MAX_OPEN_RESOURCE_SETS: usize = 2;
-
 pub struct AlignConfig<'a> {
     pub use_seqid: bool,
     pub use_long_cigar: bool,
@@ -48,11 +48,9 @@ impl AlignConfig<'_> {
         self.min_mapq.map(|m| m as i32).unwrap_or(0)
     }
 
-    /// Compute the bounded resource pool size: `min(MAX_OPEN_RESOURCE_SETS, effective_threads)`,
-    /// clamped to at least 1.
+    /// Compute the resource pool size: `min(num_threads, num_work_items)`, clamped to at least 1.
     fn pool_size(&self, num_work_items: usize) -> usize {
-        let effective = self.num_threads.min(num_work_items);
-        MAX_OPEN_RESOURCE_SETS.min(effective).max(1)
+        self.num_threads.min(num_work_items).max(1)
     }
 }
 
@@ -167,7 +165,15 @@ fn read_aligned_columns(
 }
 
 /// Scan reference metadata and build work items, skipping zero-length references.
-fn collect_work_items(reflist: &ReferenceList, ref_count: u32) -> Result<Vec<WorkItem>> {
+///
+/// When `window_size` is `Some(ws)`, references longer than `ws` are split into
+/// multiple work items with sequential `order_idx` values. When `None`, each
+/// reference becomes a single whole-reference work item.
+fn collect_work_items(
+    reflist: &ReferenceList,
+    ref_count: u32,
+    window_size: Option<u32>,
+) -> Result<Vec<WorkItem>> {
     let mut work_items = Vec::with_capacity(ref_count as usize);
     for i in 0..ref_count {
         let ref_obj = reflist.get(i).context("failed to get reference")?;
@@ -175,8 +181,29 @@ fn collect_work_items(reflist: &ReferenceList, ref_count: u32) -> Result<Vec<Wor
         if ref_len == 0 {
             continue;
         }
-        let order_idx = work_items.len();
-        work_items.push(WorkItem { order_idx, ref_idx: i, ref_len });
+        match window_size {
+            Some(ws) if ref_len > ws => {
+                let mut start: u32 = 0;
+                while start < ref_len {
+                    let len = ws.min(ref_len - start);
+                    work_items.push(WorkItem {
+                        order_idx: work_items.len(),
+                        ref_idx: i,
+                        window_start: start,
+                        window_len: len,
+                    });
+                    start += ws;
+                }
+            }
+            _ => {
+                work_items.push(WorkItem {
+                    order_idx: work_items.len(),
+                    ref_idx: i,
+                    window_start: 0,
+                    window_len: ref_len,
+                });
+            }
+        }
     }
     Ok(work_items)
 }
@@ -194,11 +221,12 @@ pub fn process_aligned_table(
 ) -> Result<()> {
     // Build work items in a block scope so the ReferenceList is dropped
     // before we create per-worker resource sets, avoiding N+1 ReferenceLists.
+    let window_size = if config.num_threads > 1 { Some(DEFAULT_WINDOW_SIZE) } else { None };
     let work_items = {
         let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
             .context("failed to create ReferenceList")?;
         let ref_count = reflist.count().context("failed to get reference count")?;
-        collect_work_items(&reflist, ref_count)?
+        collect_work_items(&reflist, ref_count, window_size)?
         // reflist dropped here
     };
 
@@ -267,7 +295,14 @@ fn process_alignment_table_sequential(
     for item in work_items {
         let ref_obj = reflist.get(item.ref_idx).context("failed to get reference")?;
 
-        let pi = match PlacementIterator::make(&ref_obj, 0, item.ref_len, min_mapq, None, id_src) {
+        let pi = match PlacementIterator::make(
+            &ref_obj,
+            item.window_start as i32,
+            item.window_len,
+            min_mapq,
+            None,
+            id_src,
+        ) {
             Ok(pi) => pi,
             Err(e) if e.is_done() => {
                 progress.reference_done();
@@ -376,15 +411,17 @@ fn emit_placement_records(
 /// Maximum bytes a worker buffers before sending a chunk to the collector.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
-/// A unit of work sent to a worker thread: one reference to process.
+/// A unit of work sent to a worker thread: one reference window to process.
 #[derive(Clone, Copy)]
 struct WorkItem {
     /// Contiguous index into the filtered work list, used for ordered output.
     order_idx: usize,
     /// Index into the ReferenceList (each worker has its own list).
     ref_idx: u32,
-    /// Reference sequence length.
-    ref_len: u32,
+    /// 0-based start position within the reference.
+    window_start: u32,
+    /// Length of this window (may be less than the full reference).
+    window_len: u32,
 }
 
 /// A chunk of formatted SAM output from a worker thread.
@@ -657,7 +694,14 @@ fn process_one_reference(
 
     let ref_obj = resources.reflist.get(item.ref_idx).context("worker: failed to get reference")?;
 
-    let pi = match PlacementIterator::make(&ref_obj, 0, item.ref_len, min_mapq, None, id_src) {
+    let pi = match PlacementIterator::make(
+        &ref_obj,
+        item.window_start as i32,
+        item.window_len,
+        min_mapq,
+        None,
+        id_src,
+    ) {
         Ok(pi) => pi,
         Err(e) if e.is_done() => {
             // No alignments on this reference — send empty final chunk.
@@ -753,15 +797,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_size_clamped_by_constant() {
-        // With many threads and many work items, pool_size is MAX_OPEN_RESOURCE_SETS.
+    fn test_pool_size_equals_threads() {
+        // With many work items, pool_size equals num_threads.
         let config = test_config(8);
-        assert_eq!(config.pool_size(100), MAX_OPEN_RESOURCE_SETS);
+        assert_eq!(config.pool_size(100), 8);
     }
 
     #[test]
     fn test_pool_size_clamped_by_threads() {
-        // With 1 thread, pool_size is 1 even though MAX_OPEN_RESOURCE_SETS is 2.
+        // With 1 thread, pool_size is 1 regardless of work items.
         let config = test_config(1);
         assert_eq!(config.pool_size(100), 1);
     }

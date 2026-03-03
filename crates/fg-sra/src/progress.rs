@@ -70,7 +70,7 @@ impl ProgressLogger {
         let elapsed = self.start.elapsed();
 
         let ref_part = if self.total_refs > 0 {
-            format!(" across {} of {} references", refs, self.total_refs)
+            format!(" across {} of {} work items", refs, self.total_refs)
         } else {
             " unaligned".to_owned()
         };
