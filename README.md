@@ -91,7 +91,7 @@ fg-sra tosam --help
 
 SRR20022182 converted to coordinate-sorted BAM (piped through `samtools sort`)
 completes in ~5s wall-clock time with ~400 MB peak memory. Use `--threads` to
-enable multi-threaded reference processing.
+enable multi-threaded aligned read processing.
 
 ## Workspace Structure
 

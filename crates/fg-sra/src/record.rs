@@ -38,6 +38,10 @@ pub struct AlignedColumns {
     pub alignment_count: u8,
     /// Read filter value (`READ_FILTER`), `None` if column unavailable.
     pub read_filter: Option<u8>,
+    /// 0-based reference position (`REF_POS`).
+    pub ref_pos: i32,
+    /// Mapping quality (`MAPQ`).
+    pub mapq: i32,
 }
 
 impl AlignedColumns {
@@ -60,6 +64,8 @@ impl AlignedColumns {
             spot_group: String::new(),
             alignment_count: 0,
             read_filter: None,
+            ref_pos: 0,
+            mapq: 0,
         }
     }
 
@@ -78,6 +84,8 @@ impl AlignedColumns {
         self.spot_group.clear();
         self.alignment_count = 0;
         self.read_filter = None;
+        self.ref_pos = 0;
+        self.mapq = 0;
     }
 
     /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
@@ -1015,6 +1023,8 @@ mod tests {
             spot_group: "RG1".to_string(),
             alignment_count: 1,
             read_filter: None,
+            ref_pos: 0,
+            mapq: 0,
         }
     }
 
@@ -1602,6 +1612,8 @@ mod tests {
             spot_group: String::new(),
             alignment_count: 1,
             read_filter: None,
+            ref_pos: 0,
+            mapq: 0,
         };
         let opts =
             FormatOptions { output_mode: OutputMode::Bam, ref_name_to_id: None, ..default_opts() };
