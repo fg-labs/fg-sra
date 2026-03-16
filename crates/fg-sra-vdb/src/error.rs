@@ -24,6 +24,9 @@ pub enum VdbError {
 /// The `rcDone` state value, indicating iteration is complete (not an error).
 const RC_STATE_DONE: u32 = 1;
 
+/// The `rcNS` module value, indicating a network system error.
+const RC_MODULE_NETWORK: u32 = 18;
+
 impl VdbError {
     /// Create a new `VdbError` from a raw `rc_t` value.
     pub fn new(rc: u32) -> Self {
@@ -33,6 +36,13 @@ impl VdbError {
     /// Returns `true` if this error represents the "done" state (end of iteration).
     pub fn is_done(&self) -> bool {
         matches!(self, Self::Rc(rc) if rc & 0x3F == RC_STATE_DONE)
+    }
+
+    /// Returns `true` if this error is a network error (`module == rcNS == 18`).
+    ///
+    /// Network errors are transient and may be retried.
+    pub fn is_network_error(&self) -> bool {
+        self.module() == RC_MODULE_NETWORK
     }
 
     /// Extract the raw `rc_t` value, or `None` for non-rc errors.
@@ -162,5 +172,42 @@ mod tests {
     fn test_to_cstring() {
         assert!(to_cstring("hello").is_ok());
         assert_eq!(to_cstring("hello\0world").unwrap_err(), VdbError::InvalidNulByte);
+    }
+
+    #[test]
+    fn test_is_network_error_true() {
+        // module=18 (rcNS), other fields arbitrary
+        let rc = (18 << 27) | (5 << 21) | (3 << 14) | (2 << 6) | 4;
+        let err = VdbError::new(rc);
+        assert!(err.is_network_error());
+        assert_eq!(err.module(), 18);
+    }
+
+    #[test]
+    fn test_is_network_error_false() {
+        // module=10 (not rcNS)
+        let rc = (10 << 27) | (5 << 21) | (3 << 14) | (2 << 6) | 4;
+        let err = VdbError::new(rc);
+        assert!(!err.is_network_error());
+    }
+
+    #[test]
+    fn test_is_network_error_specific_rc() {
+        // The specific rc observed in production: 0x900995d8
+        let err = VdbError::new(0x900995d8);
+        assert!(err.is_network_error());
+        assert_eq!(err.module(), 18);
+    }
+
+    #[test]
+    fn test_is_network_error_invalid_nul_byte() {
+        assert!(!VdbError::InvalidNulByte.is_network_error());
+    }
+
+    #[test]
+    fn test_is_network_error_done_not_network() {
+        // rcDone with module=0 is not a network error
+        let err = VdbError::new(RC_STATE_DONE);
+        assert!(!err.is_network_error());
     }
 }

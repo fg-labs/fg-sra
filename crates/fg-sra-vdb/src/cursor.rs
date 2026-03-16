@@ -7,6 +7,7 @@ use std::ptr;
 use std::slice;
 
 use crate::error::{VdbError, check_rc, to_cstring};
+use crate::retry::retry_on_network_error;
 
 /// Sentinel value for columns that were never added or are not available.
 pub const INVALID_COLUMN: u32 = 0xFFFFFFFF;
@@ -195,24 +196,27 @@ impl VCursor {
     /// Low-level: read raw cell data via `VCursorCellDataDirect`.
     ///
     /// Returns a `CellData` with a pointer into VDB's page cache.
+    /// Retries on transient network errors with exponential backoff.
     fn cell_data_direct(&self, row_id: i64, col_idx: u32) -> Result<CellData, VdbError> {
-        let mut elem_bits: u32 = 0;
-        let mut base: *const std::ffi::c_void = ptr::null();
-        let mut boff: u32 = 0;
-        let mut row_len: u32 = 0;
-        let rc = unsafe {
-            fg_sra_vdb_sys::VCursorCellDataDirect(
-                self.ptr,
-                row_id,
-                col_idx,
-                &mut elem_bits,
-                &mut base,
-                &mut boff,
-                &mut row_len,
-            )
-        };
-        check_rc(rc)?;
-        Ok(CellData { elem_bits, base, _boff: boff, row_len })
+        retry_on_network_error("cell_data_direct", || {
+            let mut elem_bits: u32 = 0;
+            let mut base: *const std::ffi::c_void = ptr::null();
+            let mut boff: u32 = 0;
+            let mut row_len: u32 = 0;
+            let rc = unsafe {
+                fg_sra_vdb_sys::VCursorCellDataDirect(
+                    self.ptr,
+                    row_id,
+                    col_idx,
+                    &mut elem_bits,
+                    &mut base,
+                    &mut boff,
+                    &mut row_len,
+                )
+            };
+            check_rc(rc)?;
+            Ok(CellData { elem_bits, base, _boff: boff, row_len })
+        })
     }
 
     /// Get the raw cursor pointer (for passing to PlacementIterator creation).
