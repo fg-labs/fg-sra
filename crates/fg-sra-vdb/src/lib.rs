@@ -9,3 +9,4 @@ pub mod error;
 pub mod iterator;
 pub mod manager;
 pub mod reference;
+pub mod retry;
