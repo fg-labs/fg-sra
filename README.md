@@ -1,6 +1,6 @@
-[![Build](https://github.com/fulcrumgenomics/fg-sra/actions/workflows/ci.yml/badge.svg)](https://github.com/fulcrumgenomics/fg-sra/actions/workflows/ci.yml)
-[![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/fg-sra/blob/main/LICENSE)
-[![codecov](https://codecov.io/gh/fulcrumgenomics/fg-sra/branch/main/graph/badge.svg)](https://codecov.io/gh/fulcrumgenomics/fg-sra)
+[![Build](https://github.com/fg-labs/fg-sra/actions/workflows/ci.yml/badge.svg)](https://github.com/fg-labs/fg-sra/actions/workflows/ci.yml)
+[![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/fg-sra/blob/main/LICENSE)
+[![codecov](https://codecov.io/gh/fg-labs/fg-sra/branch/main/graph/badge.svg)](https://codecov.io/gh/fg-labs/fg-sra)
 
 # fg-sra
 
@@ -50,7 +50,7 @@ These require reference sequence access via VDB FFI that has not yet been implem
 ### Building from source (vendored)
 
 ```bash
-git clone --recurse-submodules https://github.com/fulcrumgenomics/fg-sra
+git clone --recurse-submodules https://github.com/fg-labs/fg-sra
 cd fg-sra
 cargo build --release
 ```
@@ -136,10 +136,10 @@ fg-sra/
 
 ## Resources
 
-- [Issues](https://github.com/fulcrumgenomics/fg-sra/issues): Report a bug or request a feature
-- [Pull requests](https://github.com/fulcrumgenomics/fg-sra/pulls): Submit a patch or new feature
-- [Contributors guide](https://github.com/fulcrumgenomics/fg-sra/blob/main/CONTRIBUTING.md)
-- [License](https://github.com/fulcrumgenomics/fg-sra/blob/main/LICENSE): Released under the MIT license
+- [Issues](https://github.com/fg-labs/fg-sra/issues): Report a bug or request a feature
+- [Pull requests](https://github.com/fg-labs/fg-sra/pulls): Submit a patch or new feature
+- [Contributors guide](https://github.com/fg-labs/fg-sra/blob/main/CONTRIBUTING.md)
+- [License](https://github.com/fg-labs/fg-sra/blob/main/LICENSE): Released under the MIT license
 
 ## Authors
 
@@ -154,6 +154,6 @@ Development of fg-sra is supported by [Fulcrum Genomics](https://www.fulcrumgeno
 ## Disclaimer
 
 This software is under active development.
-While we make a best effort to test this software and to fix issues as they are reported, this software is provided as-is without any warranty (see the [license](https://github.com/fulcrumgenomics/fg-sra/blob/main/LICENSE) for details).
-Please submit an [issue](https://github.com/fulcrumgenomics/fg-sra/issues), and better yet a [pull request](https://github.com/fulcrumgenomics/fg-sra/pulls) as well, if you discover a bug or identify a missing feature.
+While we make a best effort to test this software and to fix issues as they are reported, this software is provided as-is without any warranty (see the [license](https://github.com/fg-labs/fg-sra/blob/main/LICENSE) for details).
+Please submit an [issue](https://github.com/fg-labs/fg-sra/issues), and better yet a [pull request](https://github.com/fg-labs/fg-sra/pulls) as well, if you discover a bug or identify a missing feature.
 Please contact [Fulcrum Genomics](https://www.fulcrumgenomics.com) if you are considering using this software or are interested in sponsoring its development.

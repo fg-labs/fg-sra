@@ -10,7 +10,7 @@
 ### Building
 
 ```bash
-git clone --recurse-submodules https://github.com/fulcrumgenomics/fg-sra
+git clone --recurse-submodules https://github.com/fg-labs/fg-sra
 cd fg-sra
 cargo build --release
 ```
