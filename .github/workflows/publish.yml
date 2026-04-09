@@ -1,4 +1,4 @@
-name: Manage Release PRs and Publish
+name: Manage Release PRs and Publish Crates
 
 permissions:
   pull-requests: write
@@ -39,6 +39,10 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
     steps:
       - name: Generate app token
         id: app-token
@@ -56,17 +60,91 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libxml2-dev
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe  # v1.0.4
+      - name: Verify lockstep workspace versions
+        run: |
+          set -euo pipefail
+          WORKSPACE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '.packages[] | select(.name == "fg-sra") | .version')
+          MISMATCHES=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            --arg ver "$WORKSPACE_VERSION" \
+            '.packages[] | select(.name | startswith("fg-sra")) | select(.version != $ver) | "\(.name) \(.version)"')
+          if [ -n "$MISMATCHES" ]; then
+            echo "ERROR: workspace version drift detected (expected $WORKSPACE_VERSION):"
+            echo "$MISMATCHES"
+            exit 1
+          fi
+          echo "All workspace crates at v$WORKSPACE_VERSION"
+      - name: Publish workspace crates in dependency order
+        id: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          # All workspace crates share a single version (lockstep).
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '.packages[] | select(.name == "fg-sra") | .version')
+
+          # Use fg-sra-vdb-sys as the reference for "has v<X> been published?"
+          # because it is the leaf of the workspace dependency graph and must
+          # be published first.
+          PUBLISHED_VERSION=$(curl -sS \
+            -H "User-Agent: fg-sra-ci (https://github.com/fg-labs/fg-sra)" \
+            "https://crates.io/api/v1/crates/fg-sra-vdb-sys" | jq -r \
+            '.crate.max_version // "0.0.0"')
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "All crates already at v$VERSION -- nothing to publish"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Publishing all workspace crates (v$VERSION)..."
+
+          # Publish helper. Uses --no-verify because the workspace's ncbi-vdb
+          # submodule lives at the repository root (outside the sys crate
+          # directory) and therefore is not included in the published tarball,
+          # which makes the default verification build fail. Downstream users
+          # on crates.io are also affected until the vendoring story is fixed
+          # -- see https://github.com/fg-labs/fg-sra/issues/TBD.
+          publish_crate() {
+            local crate="$1"
+            local max_version
+            max_version=$(curl -sS \
+              -H "User-Agent: fg-sra-ci (https://github.com/fg-labs/fg-sra)" \
+              "https://crates.io/api/v1/crates/${crate}" | jq -r \
+              '.crate.max_version // "0.0.0"')
+
+            if [ "$max_version" = "$VERSION" ]; then
+              echo "$crate v$VERSION already exists on crates.io -- skipping"
+              return
+            fi
+
+            echo "Publishing $crate v$VERSION..."
+            cargo publish --no-verify -p "$crate"
+            echo "Published $crate v$VERSION"
+          }
+
+          # Workspace crates in topological (dependency) order.
+          publish_crate fg-sra-vdb-sys
+          publish_crate fg-sra-vdb
+          publish_crate fg-sra
+
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub release
-        id: release
+        if: steps.publish.outputs.version != ''
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
-            '.packages[] | select(.name == "fg-sra") | .version')
+          VERSION="${{ steps.publish.outputs.version }}"
           TAG="v${VERSION}"
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           # Idempotent: skip if tag/release already exist.
           if ! git rev-parse "$TAG" >/dev/null 2>&1; then
