@@ -111,7 +111,7 @@ jobs:
           # directory) and therefore is not included in the published tarball,
           # which makes the default verification build fail. Downstream users
           # on crates.io are also affected until the vendoring story is fixed
-          # -- see https://github.com/fg-labs/fg-sra/issues/TBD.
+          # -- see https://github.com/fg-labs/fg-sra/issues/15.
           publish_crate() {
             local crate="$1"
             local max_version
