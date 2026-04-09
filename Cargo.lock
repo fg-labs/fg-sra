@@ -259,7 +259,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "fg-sra"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "fg-sra-vdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "fg-sra-vdb-sys",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "fg-sra-vdb-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen",
  "cmake",

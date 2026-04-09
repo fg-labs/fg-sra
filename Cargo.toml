@@ -7,15 +7,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85.0"
 repository = "https://github.com/fg-labs/fg-sra"
 license = "MIT"
 
 [workspace.dependencies]
-fg-sra-vdb-sys = { version = "0.1.0", path = "crates/fg-sra-vdb-sys", default-features = false }
-fg-sra-vdb = { version = "0.1.0", path = "crates/fg-sra-vdb", default-features = false }
+fg-sra-vdb-sys = { version = "0.1.1", path = "crates/fg-sra-vdb-sys", default-features = false }
+fg-sra-vdb = { version = "0.1.1", path = "crates/fg-sra-vdb", default-features = false }
 anyhow = "1"
 
 [workspace.lints.clippy]
