@@ -1,4 +1,6 @@
 [![Build](https://github.com/fg-labs/fg-sra/actions/workflows/ci.yml/badge.svg)](https://github.com/fg-labs/fg-sra/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/fg-sra.svg)](https://crates.io/crates/fg-sra)
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/fg-sra.svg?label=bioconda)](https://bioconda.github.io/recipes/fg-sra/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/fg-sra/blob/main/LICENSE)
 [![codecov](https://codecov.io/gh/fg-labs/fg-sra/branch/main/graph/badge.svg)](https://codecov.io/gh/fg-labs/fg-sra)
 
