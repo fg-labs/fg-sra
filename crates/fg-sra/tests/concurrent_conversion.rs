@@ -1,11 +1,13 @@
-//! Regression test for the concurrent-VDB-cursor data race.
+//! Regression test for the aligned-read concurrency crash.
 //!
-//! Multi-threaded `tosam` used to create every worker cursor from a single
-//! shared `VDatabase`. Cursors opened on the same table share libncbi-vdb's
-//! internal KColumn/blob caches, which are not thread-safe for concurrent
-//! reads, so conversions crashed intermittently with a native SIGSEGV. The fix
-//! gives each worker its own `VDatabase` (hence its own `VDBManager` and cache
-//! graph).
+//! Multi-threaded `tosam` on aligned runs used to read the virtual
+//! `PRIMARY_ALIGNMENT.READ` column, which makes libncbi-vdb reconstruct the
+//! read from the `REFERENCE` table through an internal sub-cursor whose MRU
+//! blob cache is unsynchronized. Concurrent workers corrupted that cache and
+//! crashed intermittently with a native SIGSEGV/SIGBUS. The fix reconstructs
+//! `READ` in fg-sra from the physically stored alignment deltas plus a
+//! reference preloaded once on the main thread, so no `REFERENCE` access
+//! happens while workers run.
 //!
 //! The race is timing-dependent, so a single well-behaved run rarely triggers
 //! it. This test reproduces it the way it was originally observed: several

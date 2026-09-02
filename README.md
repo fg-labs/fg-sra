@@ -40,6 +40,14 @@ Key features:
 - **Reference cache warming** via `cache-refs` to avoid resolver failures under load
 - **Mate cache** for proper SAM flag and mate-pair information
 
+For aligned runs, `fg-sra` reconstructs each read from the stored alignment
+deltas rather than reading the virtual `READ` column: it preloads each aligned
+reference sequence into memory once (single-threaded), then rebuilds `READ` on
+worker threads with a port of ncbi-vdb's own reconstruction routine. This keeps
+worker threads off libncbi-vdb's `REFERENCE` sub-select, whose blob cache is not
+thread-safe. The preload costs roughly one byte per reference base — on the
+order of the genome size for whole-genome runs.
+
 The following `sam-dump` options are accepted but **not yet supported**:
 - `--hide-identical` — output `=` for bases matching reference
 - `--with-md-flag` — compute and output the MD tag
