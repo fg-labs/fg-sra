@@ -17,7 +17,9 @@ license = "MIT"
 fg-sra-vdb-sys = { version = "0.1.0", path = "crates/fg-sra-vdb-sys", default-features = false }
 fg-sra-vdb = { version = "0.1.0", path = "crates/fg-sra-vdb", default-features = false }
 anyhow = "1"
-rstest = "0.26"
+# default-features off drops rstest's async-timeout support (futures/tokio-ish
+# ecosystem + a second syn) that this fully-synchronous workspace never uses.
+rstest = { version = "0.26", default-features = false }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

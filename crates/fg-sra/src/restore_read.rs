@@ -7,7 +7,7 @@
 //! that is not safe for concurrent reads).
 //!
 //! Ported from `libs/axf/align-restore-read.c` (`align_restore_read_impl`) in
-//! NCBI ncbi-vdb (vendored 3.4.1). That source is in the **public domain** — a
+//! NCBI ncbi-vdb (vendored 3.3.0). That source is in the **public domain** — a
 //! "United States Government Work" by the National Center for Biotechnology
 //! Information / National Library of Medicine, with a request to cite the
 //! author. The schema function it implements is:
@@ -63,7 +63,8 @@ impl fmt::Display for RestoreReadError {
 
 impl std::error::Error for RestoreReadError {}
 
-/// Reconstruct a read into `out`, returning the reconstructed length on success.
+/// Reconstruct a read into `out`, replacing its contents; returns `Ok(())` on
+/// success. `out` ends up holding `has_mismatch.len()` bytes.
 ///
 /// - `ref_read`: reference bases spanning the alignment (same alphabet as the
 ///   desired output; ASCII here).

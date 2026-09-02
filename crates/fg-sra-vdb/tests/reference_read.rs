@@ -24,8 +24,11 @@ fn reference_read_into_returns_valid_4na() {
         return;
     };
     let obj = reflist.get(0).expect("get(0)");
+    // Read from the middle of reference 0, derived from its length, so the test
+    // does not assume reference 0 is at least 1 Mb long.
+    let offset = (obj.seq_length().expect("seq_length") / 2) as i32;
     let mut buf = [0u8; 100];
-    let written = obj.read_into(1_000_000, &mut buf).expect("read_into") as usize;
+    let written = obj.read_into(offset, &mut buf).expect("read_into") as usize;
     assert!(written > 0 && written <= buf.len());
     assert!(buf[..written].iter().all(|&b| b < 16), "READ_4NA bytes must be 0..=15");
 }

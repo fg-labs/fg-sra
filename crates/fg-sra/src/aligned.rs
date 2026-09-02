@@ -486,16 +486,23 @@ fn process_row_range(
 
 /// Default reference-preload budget: bound peak memory by processing work items
 /// in reference batches whose sequences sum to at most this many bytes.
+///
+/// The budget counts the persisted (ASCII-mapped) reference bytes. Preloading a
+/// single reference also transiently holds its raw 4na buffer, so momentary peak
+/// RSS during a batch can exceed the budget by roughly the largest single
+/// reference in it.
 const REF_PRELOAD_BUDGET_BYTES: usize = 1 << 30; // 1 GiB
 
-/// The reference-preload budget, overridable via `FG_SRA_REF_PRELOAD_BUDGET_MB`
-/// (primarily to force multi-batch behavior in tests). A value of 0 is ignored.
+/// The reference-preload budget in bytes, overridable via the
+/// `FG_SRA_REF_PRELOAD_BUDGET_MB` environment variable (documented in the
+/// README; useful to cap memory or to force multi-batch behavior in tests). A
+/// value of 0, or one that does not parse, falls back to the default.
 fn ref_preload_budget_bytes() -> usize {
     std::env::var("FG_SRA_REF_PRELOAD_BUDGET_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
-        .map_or(REF_PRELOAD_BUDGET_BYTES, |mb| mb * 1024 * 1024)
+        .map_or(REF_PRELOAD_BUDGET_BYTES, |mb| mb.saturating_mul(1024 * 1024))
 }
 
 /// Group consecutive work items into batches whose distinct references sum to at
@@ -536,13 +543,6 @@ fn batch_work_items(
         batches.push(start..work_items.len());
     }
     batches
-}
-
-/// Whether a table must be processed single-threaded to avoid the virtual
-/// `READ` reconstruction: true when its mismatch columns are not physically
-/// stored.
-fn secondary_needs_serial(has_physical_mismatch: bool) -> bool {
-    !has_physical_mismatch
 }
 
 /// Whether the SECONDARY table physically stores `TMP_HAS_MISMATCH` (so
@@ -603,12 +603,32 @@ pub fn process_aligned_table(
         }
         let batches = batch_work_items(&work_items, &ref_len_of, ref_preload_budget_bytes());
 
-        // On a SECONDARY table whose HAS_MISMATCH/MISMATCH are not physically
-        // stored (no TMP_* columns), those columns are generated from the virtual
-        // READ, which re-enters the unsynchronized reference sub-select. Process
-        // such a table single-threaded so reconstruction stays race-free.
-        let force_serial = table_name == SECONDARY_ALIGNMENT_TABLE
-            && secondary_needs_serial(secondary_has_physical_mismatch(db));
+        // Only the SECONDARY table can force serial processing. In the align
+        // schema (align.vschema), PRIMARY_ALIGNMENT stores HAS_MISMATCH/MISMATCH
+        // as physical columns (`physical column <INSDC:4na:bin> ... .MISMATCH`),
+        // so reading them never re-enters the reference sub-select — PRIMARY is
+        // race-free on the parallel path by construction. SECONDARY, by
+        // contrast, backs those columns with a TMP_* "hack" column that, when
+        // absent, is generated from a RAW_READ sub-select into PRIMARY, which
+        // does re-enter the unsynchronized reference reconstruction. Detect that
+        // case and process such a SECONDARY table single-threaded.
+        let force_serial =
+            table_name == SECONDARY_ALIGNMENT_TABLE && !secondary_has_physical_mismatch(db);
+        if force_serial && config.num_threads > 1 {
+            eprintln!(
+                "[preload] SECONDARY_ALIGNMENT lacks physical mismatch columns; \
+                 processing it single-threaded to avoid a libncbi-vdb data race"
+            );
+        }
+        // One concise summary per table (orchestration layer, not the data
+        // module): distinct references and their total size, plus batch count.
+        let total_ref_bytes: usize = ref_len_of.values().sum();
+        eprintln!(
+            "[preload] {table_name}: {} reference(s), {:.1} MiB, {} batch(es)",
+            ref_len_of.len(),
+            total_ref_bytes as f64 / (1024.0 * 1024.0),
+            batches.len(),
+        );
         let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
 
         for range in batches {
@@ -1034,16 +1054,15 @@ mod tests {
         assert_eq!(DATA_CURSOR_CACHE_BYTES, 32 * 1024 * 1024);
     }
 
-    #[test]
-    fn secondary_needs_serial_when_mismatch_not_physical() {
-        assert!(secondary_needs_serial(false));
-        assert!(!secondary_needs_serial(true));
-    }
-
     /// Build a work item for reference `ref_idx` (row range/ordering irrelevant here).
     fn wi(ref_idx: u32) -> RowRangeWorkItem {
+        wi_ordered(0, ref_idx)
+    }
+
+    /// Build a work item with an explicit `order_idx` (for ordering-sensitive tests).
+    fn wi_ordered(order_idx: usize, ref_idx: u32) -> RowRangeWorkItem {
         RowRangeWorkItem {
-            order_idx: 0,
+            order_idx,
             ref_idx,
             ref_name: String::new(),
             start_row: 0,
@@ -1081,6 +1100,18 @@ mod tests {
         let lens = HashMap::from([(0, 100), (1, 5000), (2, 100)]);
         // ref 1 alone exceeds budget -> its own batch; 0 and 2 batched separately.
         assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn batch_region_mode_repeated_reference_only_overcounts() {
+        // Region mode can repeat a reference non-adjacently (overlapping regions).
+        // The repeat re-counts ref 0's length toward the budget but must not
+        // affect batching correctness — items stay in reference-adjacency order.
+        let items = vec![wi(0), wi(1), wi(0)];
+        let lens = HashMap::from([(0, 400), (1, 400)]);
+        // 0 (400) + 1 (400) = 800 <= 1000; then the non-adjacent 0 re-counts 400
+        // -> 1200 > 1000 -> new batch. Only over-counts; boundaries stay valid.
+        assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..2, 2..3]);
     }
 
     /// End-to-end contract check: the in-Rust reconstruction must reproduce the
@@ -1213,6 +1244,12 @@ mod tests {
 
     /// Helper: send chunks into a channel and collect the output via `collect_ordered_chunks`.
     fn run_collector(chunks: Vec<ResultChunk>) -> Vec<u8> {
+        run_collector_base(chunks, 0)
+    }
+
+    /// As [`run_collector`], but starting collection from `base_order` (the value
+    /// a non-first preload batch passes in).
+    fn run_collector_base(chunks: Vec<ResultChunk>, base_order: usize) -> Vec<u8> {
         let (tx, rx) = bounded::<ResultChunk>(chunks.len() + 1);
         let (pool_tx, _pool_rx) = bounded::<Vec<u8>>(16);
         for chunk in chunks {
@@ -1221,8 +1258,29 @@ mod tests {
         drop(tx);
 
         let mut output = Vec::new();
-        collect_ordered_chunks(&rx, &pool_tx, &mut output, 0).unwrap();
+        collect_ordered_chunks(&rx, &pool_tx, &mut output, base_order).unwrap();
         output
+    }
+
+    #[test]
+    fn test_nonzero_base_order_orders_from_base() {
+        // A later preload batch numbers its work items from a non-zero global
+        // order_idx; the collector must emit them in order starting at that base
+        // (not from 0). Deliver them out of order to prove the ordering holds.
+        let output = run_collector_base(
+            vec![
+                ResultChunk { order_idx: 6, chunk_seq: 0, data: b"r6\n".to_vec(), is_last: true },
+                ResultChunk { order_idx: 5, chunk_seq: 1, data: b"r5c1\n".to_vec(), is_last: true },
+                ResultChunk {
+                    order_idx: 5,
+                    chunk_seq: 0,
+                    data: b"r5c0\n".to_vec(),
+                    is_last: false,
+                },
+            ],
+            5,
+        );
+        assert_eq!(output, b"r5c0\nr5c1\nr6\n");
     }
 
     #[test]

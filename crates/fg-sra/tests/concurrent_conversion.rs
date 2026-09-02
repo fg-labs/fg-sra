@@ -29,7 +29,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    // Only accept a positive value: a zero (or unparseable) setting would make
+    // the stress test vacuous — zero rounds/parallelism launches no conversion,
+    // and zero threads takes the sequential path instead of exercising the race.
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
 }
 
 #[test]
@@ -46,12 +53,18 @@ fn concurrent_bam_conversion_is_crash_free() {
     let parallel = env_usize("FG_SRA_TEST_STRESS_PARALLEL", 3);
     let threads = env_usize("FG_SRA_TEST_STRESS_THREADS", 8);
 
+    // Namespace outputs by pid so concurrent test binaries don't collide.
+    let pid = std::process::id();
+    let out_path = |round: usize, w: usize| -> PathBuf {
+        std::env::temp_dir().join(format!("fg_sra_stress_{pid}_{round}_{w}.bam"))
+    };
+
     for round in 1..=rounds {
         // Launch `parallel` conversions concurrently, each to its own output.
         let children: Vec<_> = (0..parallel)
             .map(|w| {
-                let out: PathBuf = std::env::temp_dir().join(format!("fg_sra_stress_{w}.bam"));
-                Command::new(&bin)
+                let out = out_path(round, w);
+                let child = Command::new(&bin)
                     .args([
                         "tosam",
                         "--output-format",
@@ -63,17 +76,26 @@ fn concurrent_bam_conversion_is_crash_free() {
                         &sra,
                     ])
                     .spawn()
-                    .expect("failed to spawn fg-sra")
+                    .expect("failed to spawn fg-sra");
+                (child, out)
             })
             .collect();
 
-        for (w, mut child) in children.into_iter().enumerate() {
+        // Drain every worker before asserting: waiting for and cleaning up each
+        // child regardless of outcome avoids leaking processes/output files when
+        // one fails. Record the first failure and assert once the round is drained.
+        let mut first_failure: Option<String> = None;
+        for (w, (mut child, out)) in children.into_iter().enumerate() {
             let status = child.wait().expect("failed to wait for fg-sra");
-            assert!(
-                status.success(),
-                "round {round}/{rounds} worker {w} of concurrent `fg-sra tosam -t {threads}` \
-                 failed with {status} (a crash here indicates the concurrent-cursor race)",
-            );
+            // Clean up the output regardless of outcome.
+            let _ = std::fs::remove_file(&out);
+            if !status.success() && first_failure.is_none() {
+                first_failure = Some(format!(
+                    "round {round}/{rounds} worker {w} of concurrent `fg-sra tosam -t {threads}` \
+                     failed with {status} (a crash here indicates the concurrent-cursor race)"
+                ));
+            }
         }
+        assert!(first_failure.is_none(), "{}", first_failure.unwrap());
     }
 }

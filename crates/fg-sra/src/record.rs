@@ -55,8 +55,10 @@ pub struct AlignedColumns {
 impl AlignedColumns {
     /// Create a new `AlignedColumns` with empty/default values.
     ///
-    /// String fields start empty and grow to needed capacity on first use,
-    /// reusing their heap allocation across subsequent records.
+    /// The heap-backed fields — the `String`s, the reconstructed `read`, and the
+    /// `Vec` reconstruction inputs (`has_mismatch`, `mismatch`, `has_ref_offset`,
+    /// `ref_offset`) — start empty and grow to needed capacity on first use,
+    /// reusing their allocation across subsequent records.
     pub fn new() -> Self {
         Self {
             seq_name: String::new(),

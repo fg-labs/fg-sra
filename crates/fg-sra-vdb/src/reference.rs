@@ -150,7 +150,12 @@ pub struct ReferenceObj {
     ptr: *const fg_sra_vdb_sys::ReferenceObj,
 }
 
-unsafe impl Send for ReferenceObj {}
+// `ReferenceObj` is deliberately neither `Send` nor `Sync`. Its reads go through
+// the owning `ReferenceList`'s single, unsynchronized `REFERENCE` blob cache, so
+// two objects from one list read concurrently would corrupt that cache
+// (SIGSEGV/SIGBUS). Leaving it `!Send` makes the compiler forbid moving distinct
+// objects onto separate threads; the raw pointer already makes it `!Sync`. All
+// reference reads therefore stay single-threaded (see `preload_references`).
 
 impl ReferenceObj {
     /// Get the reference name (e.g., "chr1").
@@ -191,9 +196,10 @@ impl ReferenceObj {
     /// reference writes fewer bytes than requested.
     ///
     /// # Thread safety
-    /// This uses the owning [`ReferenceList`]'s single shared reader. Never call
-    /// it concurrently with any other read on the same list; the types are
-    /// `Send` but not `Sync`, so the compiler enforces single-threaded use.
+    /// This uses the owning [`ReferenceList`]'s single shared reader, whose
+    /// `REFERENCE` blob cache is unsynchronized. `ReferenceObj` is neither `Send`
+    /// nor `Sync`, so the compiler forbids moving distinct objects onto separate
+    /// threads and reads stay single-threaded.
     pub fn read_into(&self, offset: i32, buf: &mut [u8]) -> Result<u32, VdbError> {
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         retry_on_network_error("ReferenceObj_Read", || {

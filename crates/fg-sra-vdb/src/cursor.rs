@@ -12,6 +12,16 @@ use crate::retry::retry_on_network_error;
 /// Sentinel value for columns that were never added or are not available.
 pub const INVALID_COLUMN: u32 = 0xFFFF_FFFF;
 
+/// Reject a cell whose element width differs from what a typed read expects.
+///
+/// The typed readers interpret the raw cell as `T` using `row_len` as the
+/// element count. If the cell's `elem_bits` is narrower than `T`, the derived
+/// byte length exceeds the cell, so `slice::from_raw_parts` would read out of
+/// bounds. Validate in every build (not just debug) before casting.
+fn check_elem_bits(actual: u32, expected: u32) -> Result<(), VdbError> {
+    if actual == expected { Ok(()) } else { Err(VdbError::ElemBitsMismatch { expected, actual }) }
+}
+
 /// Safe wrapper around the VDB `VCursor` opaque type.
 ///
 /// A cursor is opened on a table and reads column data row-by-row.
@@ -81,7 +91,7 @@ impl VCursor {
         if data.row_len == 0 {
             return Ok(T::default());
         }
-        debug_assert_eq!(data.elem_bits, expected_bits);
+        check_elem_bits(data.elem_bits, expected_bits)?;
         Ok(unsafe { *data.base.cast::<T>() })
     }
 
@@ -98,7 +108,7 @@ impl VCursor {
         if data.row_len == 0 {
             return Ok(Vec::new());
         }
-        debug_assert_eq!(data.elem_bits, expected_bits);
+        check_elem_bits(data.elem_bits, expected_bits)?;
         let values = unsafe { slice::from_raw_parts(data.base.cast::<T>(), data.row_len as usize) };
         Ok(values.to_vec())
     }
@@ -117,7 +127,7 @@ impl VCursor {
         if data.row_len == 0 {
             return Ok(());
         }
-        debug_assert_eq!(data.elem_bits, expected_bits);
+        check_elem_bits(data.elem_bits, expected_bits)?;
         let values = unsafe { slice::from_raw_parts(data.base.cast::<T>(), data.row_len as usize) };
         buf.extend_from_slice(values);
         Ok(())
@@ -157,7 +167,7 @@ impl VCursor {
         if data.row_len == 0 {
             return Ok(String::new());
         }
-        debug_assert_eq!(data.elem_bits, 8);
+        check_elem_bits(data.elem_bits, 8)?;
         let bytes = unsafe { slice::from_raw_parts(data.base.cast::<u8>(), data.row_len as usize) };
         Ok(String::from_utf8_lossy(bytes).into_owned())
     }
@@ -178,7 +188,7 @@ impl VCursor {
         if data.row_len == 0 {
             return Ok(());
         }
-        debug_assert_eq!(data.elem_bits, 8);
+        check_elem_bits(data.elem_bits, 8)?;
         let bytes = unsafe { slice::from_raw_parts(data.base.cast::<u8>(), data.row_len as usize) };
         // VDB ASCII columns are always valid UTF-8; from_utf8_lossy borrows
         // without allocation in the common (valid) case.
@@ -214,16 +224,6 @@ impl VCursor {
         buf: &mut Vec<u8>,
     ) -> Result<(), VdbError> {
         self.read_slice_into(row_id, col_idx, 8, buf)
-    }
-
-    /// Read a slice of `u32` values into an existing `Vec`, reusing its allocation.
-    pub fn read_u32_slice_into(
-        &self,
-        row_id: i64,
-        col_idx: u32,
-        buf: &mut Vec<u32>,
-    ) -> Result<(), VdbError> {
-        self.read_slice_into(row_id, col_idx, 32, buf)
     }
 
     /// Read a slice of `i32` values into an existing `Vec`, reusing its allocation.
@@ -292,4 +292,32 @@ struct CellData {
     base: *const std::ffi::c_void,
     _boff: u32,
     row_len: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_elem_bits_accepts_matching_width() {
+        assert!(check_elem_bits(32, 32).is_ok());
+        assert!(check_elem_bits(8, 8).is_ok());
+    }
+
+    #[test]
+    fn check_elem_bits_rejects_narrower_cell() {
+        // An 8-bit cell read as a 32-bit type would over-read: reject it.
+        assert_eq!(
+            check_elem_bits(8, 32),
+            Err(VdbError::ElemBitsMismatch { expected: 32, actual: 8 })
+        );
+    }
+
+    #[test]
+    fn check_elem_bits_rejects_wider_cell() {
+        assert_eq!(
+            check_elem_bits(32, 8),
+            Err(VdbError::ElemBitsMismatch { expected: 8, actual: 32 })
+        );
+    }
 }
