@@ -484,6 +484,53 @@ fn process_row_range(
 
 // ── Table-level dispatch ─────────────────────────────────────────────────
 
+/// Default reference-preload budget: bound peak memory by processing work items
+/// in reference batches whose sequences sum to at most this many bytes.
+const REF_PRELOAD_BUDGET_BYTES: usize = 1 << 30; // 1 GiB
+
+/// The reference-preload budget, overridable via `FG_SRA_REF_PRELOAD_BUDGET_MB`
+/// (primarily to force multi-batch behavior in tests). A value of 0 is ignored.
+fn ref_preload_budget_bytes() -> usize {
+    std::env::var("FG_SRA_REF_PRELOAD_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .map_or(REF_PRELOAD_BUDGET_BYTES, |mb| mb * 1024 * 1024)
+}
+
+/// Group consecutive work items into batches whose distinct references sum to at
+/// most `budget_bytes`. Work items are already reference-ordered, so each batch
+/// is a contiguous range covering whole references; a single reference larger
+/// than the budget forms its own batch. Returns index ranges into `work_items`.
+fn batch_work_items(
+    work_items: &[RowRangeWorkItem],
+    ref_len_of: &HashMap<u32, usize>,
+    budget_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut batch_bytes = 0usize;
+    let mut refs_in_batch: Vec<u32> = Vec::new();
+    for (i, w) in work_items.iter().enumerate() {
+        if refs_in_batch.contains(&w.ref_idx) {
+            continue; // same reference as an earlier item in this batch
+        }
+        let len = ref_len_of.get(&w.ref_idx).copied().unwrap_or(0);
+        if !refs_in_batch.is_empty() && batch_bytes + len > budget_bytes {
+            batches.push(start..i);
+            start = i;
+            batch_bytes = 0;
+            refs_in_batch.clear();
+        }
+        refs_in_batch.push(w.ref_idx);
+        batch_bytes += len;
+    }
+    if start < work_items.len() {
+        batches.push(start..work_items.len());
+    }
+    batches
+}
+
 /// Whether a table must be processed single-threaded to avoid the virtual
 /// `READ` reconstruction: true when its mismatch columns are not physically
 /// stored.
@@ -515,36 +562,35 @@ pub fn process_aligned_table(
     progress_interval: u64,
 ) -> Result<()> {
     let mut process_table = |table_name: &str| -> Result<()> {
-        // Build work items in a block scope so the ReferenceList is dropped
-        // before we create per-worker cursors.
-        // Build work items and preload their references into memory while the
-        // ReferenceList is alive, in a block scope so it is dropped (its reader
-        // is single-threaded) before any worker cursors are created.
-        let (work_items, store) = {
-            let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
-                .context("failed to create ReferenceList")?;
-            let boundaries = find_ref_boundaries(db, table_name, &reflist, config.use_seqid)?;
-            let work_items = if config.regions.is_empty() {
-                collect_row_range_work_items(&boundaries, config.num_threads)
-            } else {
-                collect_row_range_region_work_items(
-                    &boundaries,
-                    config.regions,
-                    &reflist,
-                    config.num_threads,
-                )?
-            };
-            let ref_indices: Vec<u32> = work_items.iter().map(|w| w.ref_idx).collect();
-            let store = preload_references(&reflist, &ref_indices)?;
-            (work_items, store)
-            // reflist dropped here
+        // The ReferenceList lives for the whole table: its single-threaded reader
+        // is used only on the main thread, to preload each batch of references
+        // between (never during) the parallel worker phases.
+        let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
+            .context("failed to create ReferenceList")?;
+        let boundaries = find_ref_boundaries(db, table_name, &reflist, config.use_seqid)?;
+        let work_items = if config.regions.is_empty() {
+            collect_row_range_work_items(&boundaries, config.num_threads)
+        } else {
+            collect_row_range_region_work_items(
+                &boundaries,
+                config.regions,
+                &reflist,
+                config.num_threads,
+            )?
         };
-
         if work_items.is_empty() {
             return Ok(());
         }
 
-        let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
+        // Reference lengths for the distinct references, to size preload batches.
+        let mut ref_len_of: HashMap<u32, usize> = HashMap::new();
+        for w in &work_items {
+            if let std::collections::hash_map::Entry::Vacant(entry) = ref_len_of.entry(w.ref_idx) {
+                let len = reflist.get(w.ref_idx)?.seq_length()? as usize;
+                entry.insert(len);
+            }
+        }
+        let batches = batch_work_items(&work_items, &ref_len_of, ref_preload_budget_bytes());
 
         // On a SECONDARY table whose HAS_MISMATCH/MISMATCH are not physically
         // stored (no TMP_* columns), those columns are generated from the virtual
@@ -552,18 +598,32 @@ pub fn process_aligned_table(
         // such a table single-threaded so reconstruction stays race-free.
         let force_serial = table_name == SECONDARY_ALIGNMENT_TABLE
             && secondary_needs_serial(secondary_has_physical_mismatch(db));
-        if config.num_threads <= 1 || force_serial {
-            process_table_sequential(
-                db,
-                table_name,
-                &work_items,
-                &store,
-                writer,
-                config,
-                &progress,
-            )?;
-        } else {
-            process_table_parallel(db, table_name, &work_items, &store, writer, config, &progress)?;
+        let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
+
+        for range in batches {
+            let batch = &work_items[range];
+            let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
+            let store = preload_references(&reflist, &ref_indices)?;
+            // Re-base order_idx to 0 for this batch so the ordered collector,
+            // which expects a contiguous 0-based sequence, works per batch.
+            let rebased: Vec<RowRangeWorkItem> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    let mut w = w.clone();
+                    w.order_idx = i;
+                    w
+                })
+                .collect();
+            if config.num_threads <= 1 || force_serial {
+                process_table_sequential(
+                    db, table_name, &rebased, &store, writer, config, &progress,
+                )?;
+            } else {
+                process_table_parallel(
+                    db, table_name, &rebased, &store, writer, config, &progress,
+                )?;
+            }
         }
 
         progress.complete();
@@ -980,6 +1040,49 @@ mod tests {
     fn secondary_needs_serial_when_mismatch_not_physical() {
         assert!(secondary_needs_serial(false));
         assert!(!secondary_needs_serial(true));
+    }
+
+    /// Build a work item for reference `ref_idx` (row range/ordering irrelevant here).
+    fn wi(ref_idx: u32) -> RowRangeWorkItem {
+        RowRangeWorkItem {
+            order_idx: 0,
+            ref_idx,
+            ref_name: String::new(),
+            start_row: 0,
+            end_row: 0,
+            region_filter: None,
+        }
+    }
+
+    #[test]
+    fn batch_empty_work_items() {
+        let lens = HashMap::new();
+        assert!(batch_work_items(&[], &lens, 1000).is_empty());
+    }
+
+    #[test]
+    fn batch_groups_references_under_budget() {
+        // refs 0,1 (400 each) then 2 (400): budget 1000 -> [0,1] then [2].
+        let items = vec![wi(0), wi(0), wi(1), wi(2)];
+        let lens = HashMap::from([(0, 400), (1, 400), (2, 400)]);
+        assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..3, 3..4]);
+    }
+
+    #[test]
+    fn batch_never_splits_a_reference() {
+        // Two consecutive items of ref 0 stay in the same batch even though a
+        // second reference would exceed budget.
+        let items = vec![wi(0), wi(0), wi(1)];
+        let lens = HashMap::from([(0, 800), (1, 800)]);
+        assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn batch_oversized_reference_is_own_batch() {
+        let items = vec![wi(0), wi(1), wi(2)];
+        let lens = HashMap::from([(0, 100), (1, 5000), (2, 100)]);
+        // ref 1 alone exceeds budget -> its own batch; 0 and 2 batched separately.
+        assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..1, 1..2, 2..3]);
     }
 
     #[test]
