@@ -10,6 +10,7 @@ mod output;
 mod progress;
 mod quality;
 mod record;
+mod restore_read;
 mod unaligned;
 
 use anyhow::Result;
