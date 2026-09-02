@@ -31,3 +31,6 @@ noodles-bam = "0.91"
 noodles-bgzf = "0.48"
 noodles-sam = "0.86"
 rustc-hash = "2"
+
+[dev-dependencies]
+rstest = { workspace = true }
