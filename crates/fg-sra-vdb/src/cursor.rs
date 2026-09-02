@@ -103,6 +103,26 @@ impl VCursor {
         Ok(values.to_vec())
     }
 
+    /// Like [`read_slice`](Self::read_slice), but into an existing `Vec`,
+    /// reusing its allocation. Clears `buf` and appends the cell data.
+    fn read_slice_into<T: Copy>(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        expected_bits: u32,
+        buf: &mut Vec<T>,
+    ) -> Result<(), VdbError> {
+        buf.clear();
+        let data = self.cell_data_direct(row_id, col_idx)?;
+        if data.row_len == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(data.elem_bits, expected_bits);
+        let values = unsafe { slice::from_raw_parts(data.base.cast::<T>(), data.row_len as usize) };
+        buf.extend_from_slice(values);
+        Ok(())
+    }
+
     /// Read a single `i64` value from a cell.
     pub fn read_i64(&self, row_id: i64, col_idx: u32) -> Result<i64, VdbError> {
         self.read_scalar(row_id, col_idx, 64)
@@ -184,6 +204,36 @@ impl VCursor {
     /// Read a slice of `i32` values (e.g., `INSDC_coord_zero`).
     pub fn read_i32_slice(&self, row_id: i64, col_idx: u32) -> Result<Vec<i32>, VdbError> {
         self.read_slice(row_id, col_idx, 32)
+    }
+
+    /// Read a slice of `u8` values into an existing `Vec`, reusing its allocation.
+    pub fn read_u8_slice_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), VdbError> {
+        self.read_slice_into(row_id, col_idx, 8, buf)
+    }
+
+    /// Read a slice of `u32` values into an existing `Vec`, reusing its allocation.
+    pub fn read_u32_slice_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut Vec<u32>,
+    ) -> Result<(), VdbError> {
+        self.read_slice_into(row_id, col_idx, 32, buf)
+    }
+
+    /// Read a slice of `i32` values into an existing `Vec`, reusing its allocation.
+    pub fn read_i32_slice_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut Vec<i32>,
+    ) -> Result<(), VdbError> {
+        self.read_slice_into(row_id, col_idx, 32, buf)
     }
 
     /// Read an `INSDC_coord_zero` value (0-based coordinate, i32).

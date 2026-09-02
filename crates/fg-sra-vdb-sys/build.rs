@@ -190,6 +190,9 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("ReferenceObj_SeqId")
         .allowlist_function("ReferenceObj_SeqLength")
         .allowlist_function("ReferenceObj_Idx")
+        .allowlist_function("ReferenceObj_Read")
+        .allowlist_function("ReferenceObj_Circular")
+        .allowlist_function("ReferenceObj_External")
         .allowlist_function("ReferenceObj_MakePlacementIterator")
         .allowlist_function("ReferenceObj_Release")
         // AlignMgr / PlacementSetIterator
