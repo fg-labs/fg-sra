@@ -26,8 +26,8 @@ pub struct AlignedColumns {
     pub mate_ref_pos: i32,
     /// Template length (`TEMPLATE_LEN`).
     pub template_len: i32,
-    /// Read sequence (`SAM_QUALITY` column provides pre-encoded quality).
-    pub read: String,
+    /// Read sequence bytes (ASCII), reconstructed from the reference and deltas.
+    pub read: Vec<u8>,
     /// Quality string (already Phred+33 encoded from `SAM_QUALITY`).
     pub quality: String,
     /// Edit distance (`EDIT_DISTANCE`) for NM tag.
@@ -66,7 +66,7 @@ impl AlignedColumns {
             mate_ref_name: String::new(),
             mate_ref_pos: 0,
             template_len: 0,
-            read: String::new(),
+            read: Vec::new(),
             quality: String::new(),
             edit_distance: 0,
             spot_group: String::new(),
@@ -231,7 +231,7 @@ pub fn format_aligned_record(
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
-            buf.extend_from_slice(cols.read.as_bytes());
+            buf.extend_from_slice(cols.read.as_slice());
             buf.push(b'\n');
         }
         OutputMode::Fastq => {
@@ -246,7 +246,7 @@ pub fn format_aligned_record(
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
-            buf.extend_from_slice(cols.read.as_bytes());
+            buf.extend_from_slice(cols.read.as_slice());
             buf.extend_from_slice(b"\n+\n");
             if opts.omit_quality || cols.quality.is_empty() {
                 buf.push(b'*');
@@ -344,7 +344,7 @@ fn format_aligned_record_sam(
     if cols.read.is_empty() {
         buf.push(b'*');
     } else {
-        buf.extend_from_slice(cols.read.as_bytes());
+        buf.extend_from_slice(cols.read.as_slice());
     }
 
     // QUAL
@@ -659,7 +659,7 @@ fn format_aligned_record_bam(
     let align_end = ref_pos + cigar_ref_length(&cigar_ops);
     let bin = reg2bin(ref_pos as u32, align_end as u32);
 
-    let seq = cols.read.as_bytes();
+    let seq = cols.read.as_slice();
     let l_seq = seq.len() as i32;
 
     // Resolve mate info.
@@ -1038,7 +1038,7 @@ mod tests {
             mate_ref_name: "chr1".to_string(),
             mate_ref_pos: 500,
             template_len: 300,
-            read: "ACGTACGT".to_string(),
+            read: b"ACGTACGT".to_vec(),
             quality: "IIIIIIII".to_string(),
             edit_distance: 1,
             spot_group: "RG1".to_string(),
@@ -1631,7 +1631,7 @@ mod tests {
             mate_ref_name: "*".to_string(),
             mate_ref_pos: 0,
             template_len: 0,
-            read: "ACGT".to_string(),
+            read: b"ACGT".to_vec(),
             quality: "IIII".to_string(), // Phred+33: 73-33 = 40
             edit_distance: 0,
             spot_group: String::new(),

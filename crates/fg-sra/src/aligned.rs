@@ -510,19 +510,26 @@ fn batch_work_items(
     let mut batches = Vec::new();
     let mut start = 0usize;
     let mut batch_bytes = 0usize;
-    let mut refs_in_batch: Vec<u32> = Vec::new();
+    // Work items are reference-ordered and contiguous per reference, so a new
+    // reference is one whose index differs from the previous item's. (In region
+    // mode, overlapping regions could repeat a reference non-adjacently; that
+    // only over-counts its length here, never affects correctness — preload
+    // de-duplicates.)
+    let mut last_ref: Option<u32> = None;
+    let mut refs_in_batch = 0usize;
     for (i, w) in work_items.iter().enumerate() {
-        if refs_in_batch.contains(&w.ref_idx) {
-            continue; // same reference as an earlier item in this batch
+        if last_ref == Some(w.ref_idx) {
+            continue;
         }
         let len = ref_len_of.get(&w.ref_idx).copied().unwrap_or(0);
-        if !refs_in_batch.is_empty() && batch_bytes + len > budget_bytes {
+        if refs_in_batch > 0 && batch_bytes + len > budget_bytes {
             batches.push(start..i);
             start = i;
             batch_bytes = 0;
-            refs_in_batch.clear();
+            refs_in_batch = 0;
         }
-        refs_in_batch.push(w.ref_idx);
+        last_ref = Some(w.ref_idx);
+        refs_in_batch += 1;
         batch_bytes += len;
     }
     if start < work_items.len() {
@@ -548,7 +555,11 @@ fn secondary_has_physical_mismatch(db: &VDatabase) -> bool {
     let Ok(cursor) = table.create_cursor_read() else {
         return false;
     };
+    // Both HAS_MISMATCH and MISMATCH are read and each falls back independently
+    // to a READ-derived generator when its TMP_* physical column is absent, so
+    // require both to be physically stored.
     cursor.add_column_optional("(bool)TMP_HAS_MISMATCH").is_some()
+        && cursor.add_column_optional("(INSDC:dna:text)TMP_MISMATCH").is_some()
 }
 
 /// Process all aligned reads, writing SAM/BAM records.
@@ -604,24 +615,14 @@ pub fn process_aligned_table(
             let batch = &work_items[range];
             let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
             let store = preload_references(&reflist, &ref_indices)?;
-            // Re-base order_idx to 0 for this batch so the ordered collector,
-            // which expects a contiguous 0-based sequence, works per batch.
-            let rebased: Vec<RowRangeWorkItem> = batch
-                .iter()
-                .enumerate()
-                .map(|(i, w)| {
-                    let mut w = w.clone();
-                    w.order_idx = i;
-                    w
-                })
-                .collect();
+            // order_idx is globally contiguous, so the batch's first item's index
+            // is the base the ordered collector starts from — no re-basing needed.
+            let base_order = batch.first().map_or(0, |w| w.order_idx);
             if config.num_threads <= 1 || force_serial {
-                process_table_sequential(
-                    db, table_name, &rebased, &store, writer, config, &progress,
-                )?;
+                process_table_sequential(db, table_name, batch, &store, writer, config, &progress)?;
             } else {
                 process_table_parallel(
-                    db, table_name, &rebased, &store, writer, config, &progress,
+                    db, table_name, batch, base_order, &store, writer, config, &progress,
                 )?;
             }
         }
@@ -711,10 +712,12 @@ struct ResourceSet {
 ///
 /// Creates a bounded pool of K VDB resource sets (K = `pool_size`), distributes
 /// row-range work items via a work channel, and collects chunked results in order.
+#[allow(clippy::too_many_arguments)]
 fn process_table_parallel(
     db: &VDatabase,
     table_name: &str,
     work_items: &[RowRangeWorkItem],
+    base_order: usize,
     store: &ReferenceStore,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
@@ -772,7 +775,7 @@ fn process_table_parallel(
         });
 
         // Collector — runs on the main thread, writes chunks in reference order.
-        collect_ordered_chunks(&result_rx, &buf_pool_tx, writer)?;
+        collect_ordered_chunks(&result_rx, &buf_pool_tx, writer, base_order)?;
 
         // Workers have finished (result channel closed). Check for errors.
         for handle in worker_handles {
@@ -793,8 +796,9 @@ fn collect_ordered_chunks(
     result_rx: &Receiver<ResultChunk>,
     pool_tx: &Sender<Vec<u8>>,
     writer: &mut impl Write,
+    base_order: usize,
 ) -> Result<()> {
-    let mut next_order: usize = 0;
+    let mut next_order: usize = base_order;
     // Per-work-item: next chunk_seq we expect to write.
     let mut next_chunk_seq: BTreeMap<usize, usize> = BTreeMap::new();
     // Per-work-item: chunk_seq of the is_last chunk (once seen).
@@ -877,13 +881,11 @@ struct WorkerState {
     current_ref_idx: u32,
 }
 
-/// Reusable buffers for [`reconstruct_read`], one per worker.
+/// Reusable buffer for [`reconstruct_read`], one per worker.
 #[derive(Default)]
 struct ReadScratch {
     /// Reference window, when the sub-select wraps (borrowed directly otherwise).
     window: Vec<u8>,
-    /// Reconstructed read bytes.
-    read: Vec<u8>,
 }
 
 /// Reconstruct `cols.read` from the reference window and the stored deltas,
@@ -898,7 +900,7 @@ fn reconstruct_read(
     let ref_len = ref_window_len(cols.has_ref_offset.len(), &cols.ref_offset);
     let window = store
         .window(ref_idx, cols.ref_pos, ref_len, &mut scratch.window)
-        .map_err(|e| anyhow::anyhow!("row {row_id}: {e}"))?;
+        .with_context(|| format!("row {row_id}: reference window"))?;
     restore_read(
         window,
         &cols.has_mismatch,
@@ -906,13 +908,9 @@ fn reconstruct_read(
         &cols.has_ref_offset,
         &cols.ref_offset,
         &[],
-        &mut scratch.read,
+        &mut cols.read,
     )
-    .map_err(|e| anyhow::anyhow!("row {row_id}: {e}"))?;
-    cols.read.clear();
-    // CHARSET output is ASCII; `from_utf8_lossy` borrows without allocating in
-    // the valid case and never panics on a malformed MISMATCH cell.
-    cols.read.push_str(&String::from_utf8_lossy(&scratch.read));
+    .with_context(|| format!("row {row_id}: reconstruct READ"))?;
     Ok(())
 }
 
@@ -1085,6 +1083,84 @@ mod tests {
         assert_eq!(batch_work_items(&items, &lens, 1000), vec![0..1, 1..2, 2..3]);
     }
 
+    /// End-to-end contract check: the in-Rust reconstruction must reproduce the
+    /// bytes of libncbi-vdb's virtual `(ascii)READ` column exactly. Opt-in via
+    /// `FG_SRA_TEST_ALIGNED_SRA` (a reference-compressed aligned SRA), read
+    /// single-threaded so touching the virtual `READ` is safe.
+    #[test]
+    fn reconstructed_read_matches_virtual_read_column() {
+        use fg_sra_vdb::manager::VdbManager;
+        let Ok(sra) = std::env::var("FG_SRA_TEST_ALIGNED_SRA") else {
+            eprintln!(
+                "skipping: set FG_SRA_TEST_ALIGNED_SRA to a reference-compressed aligned SRA"
+            );
+            return;
+        };
+        let mgr = VdbManager::make_read().expect("make_read");
+        mgr.disable_pagemap_thread().ok();
+        let db = mgr.open_db_read(&sra).expect("open_db");
+        let opts = reflist_options::READ_4NA | reflist_options::USE_PRIMARY_IDS;
+        let reflist = ReferenceList::make_database(&db, opts, 0).expect("reflist");
+
+        let table = db.open_table_read(PRIMARY_ALIGNMENT_TABLE).expect("table");
+        let cursor = table.create_cursor_read().expect("cursor");
+        let has_mismatch_col = cursor.add_column(col::HAS_MISMATCH).unwrap();
+        let mismatch_col = cursor.add_column(col::MISMATCH).unwrap();
+        let has_ref_offset_col = cursor.add_column(col::HAS_REF_OFFSET).unwrap();
+        let ref_offset_col = cursor.add_column(col::REF_OFFSET).unwrap();
+        let ref_pos_col = cursor.add_column(col::REF_POS).unwrap();
+        let ref_name_col = cursor.add_column(col::REF_NAME).unwrap();
+        let read_col = cursor.add_column("(ascii)READ").unwrap();
+        cursor.open().expect("open");
+
+        let (first, count) = cursor.id_range(read_col).expect("id_range");
+        let last = first + count.min(5000) as i64;
+
+        // Resolve each sampled row's reference to a ReferenceObj index and preload.
+        let mut name_to_idx: HashMap<String, u32> = HashMap::new();
+        let mut idxs = Vec::new();
+        for row in first..last {
+            let name = cursor.read_str(row, ref_name_col).unwrap();
+            if let std::collections::hash_map::Entry::Vacant(slot) = name_to_idx.entry(name.clone())
+            {
+                let idx = reflist.find(&name).expect("find ref").idx().expect("idx");
+                slot.insert(idx);
+                idxs.push(idx);
+            }
+        }
+        let store = preload_references(&reflist, &idxs).expect("preload");
+
+        let mut has_mismatch = Vec::new();
+        let mut mismatch = Vec::new();
+        let mut has_ref_offset = Vec::new();
+        let mut ref_offset = Vec::new();
+        let mut window_scratch = Vec::new();
+        let mut reconstructed = Vec::new();
+        for row in first..last {
+            let name = cursor.read_str(row, ref_name_col).unwrap();
+            let ref_idx = name_to_idx[&name];
+            let ref_pos = cursor.read_coord_zero(row, ref_pos_col).unwrap();
+            cursor.read_u8_slice_into(row, has_mismatch_col, &mut has_mismatch).unwrap();
+            cursor.read_u8_slice_into(row, mismatch_col, &mut mismatch).unwrap();
+            cursor.read_u8_slice_into(row, has_ref_offset_col, &mut has_ref_offset).unwrap();
+            cursor.read_i32_slice_into(row, ref_offset_col, &mut ref_offset).unwrap();
+            let ref_len = ref_window_len(has_ref_offset.len(), &ref_offset);
+            let window = store.window(ref_idx, ref_pos, ref_len, &mut window_scratch).unwrap();
+            restore_read(
+                window,
+                &has_mismatch,
+                &mismatch,
+                &has_ref_offset,
+                &ref_offset,
+                &[],
+                &mut reconstructed,
+            )
+            .unwrap();
+            let expected = cursor.read_str(row, read_col).unwrap();
+            assert_eq!(reconstructed, expected.as_bytes(), "row {row} ref {name} pos {ref_pos}");
+        }
+    }
+
     #[test]
     fn test_pool_size_equals_threads() {
         // Default: 1:1 cursors to threads.
@@ -1145,7 +1221,7 @@ mod tests {
         drop(tx);
 
         let mut output = Vec::new();
-        collect_ordered_chunks(&rx, &pool_tx, &mut output).unwrap();
+        collect_ordered_chunks(&rx, &pool_tx, &mut output, 0).unwrap();
         output
     }
 

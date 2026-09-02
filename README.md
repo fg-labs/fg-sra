@@ -45,8 +45,9 @@ deltas rather than reading the virtual `READ` column: it preloads each aligned
 reference sequence into memory once (single-threaded), then rebuilds `READ` on
 worker threads with a port of ncbi-vdb's own reconstruction routine. This keeps
 worker threads off libncbi-vdb's `REFERENCE` sub-select, whose blob cache is not
-thread-safe. The preload costs roughly one byte per reference base — on the
-order of the genome size for whole-genome runs.
+thread-safe. The preload costs roughly one byte per reference base; peak memory
+is bounded by processing references in batches (default 1 GiB, overridable with
+the `FG_SRA_REF_PRELOAD_BUDGET_MB` environment variable).
 
 The following `sam-dump` options are accepted but **not yet supported**:
 - `--hide-identical` — output `=` for bases matching reference

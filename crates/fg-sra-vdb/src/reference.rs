@@ -229,7 +229,12 @@ impl ReferenceObj {
                 break;
             }
             filled += written;
-            offset = i32::try_from(filled).unwrap_or(i32::MAX);
+            // References are i32-coordinate; stop rather than saturate past the
+            // limit, so a short read is caught loudly by the caller's length check.
+            let Ok(next) = i32::try_from(filled) else {
+                break;
+            };
+            offset = next;
         }
         out.truncate(filled);
         Ok(out)

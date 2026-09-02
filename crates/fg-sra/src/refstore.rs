@@ -153,8 +153,8 @@ pub fn preload_references(reflist: &ReferenceList, ref_indices: &[u32]) -> Resul
     let count = seqs.len();
     let store = ReferenceStore::from_parts(seqs);
     eprintln!(
-        "[fg-sra] preloaded {count} reference(s), {} MB",
-        store.total_bytes() / (1024 * 1024)
+        "[fg-sra] preloaded {count} reference(s), {:.1} MiB",
+        store.total_bytes() as f64 / (1024.0 * 1024.0)
     );
     Ok(store)
 }
