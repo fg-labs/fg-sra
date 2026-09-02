@@ -42,6 +42,14 @@ pub struct AlignedColumns {
     pub ref_pos: i32,
     /// Mapping quality (`MAPQ`).
     pub mapq: i32,
+    /// `HAS_MISMATCH` (one 0/1 byte per read base); input to read reconstruction.
+    pub has_mismatch: Vec<u8>,
+    /// `MISMATCH` bases (CHARSET/ASCII); input to read reconstruction.
+    pub mismatch: Vec<u8>,
+    /// `HAS_REF_OFFSET` (one 0/1 byte per read base); input to read reconstruction.
+    pub has_ref_offset: Vec<u8>,
+    /// `REF_OFFSET` values; input to read reconstruction.
+    pub ref_offset: Vec<i32>,
 }
 
 impl AlignedColumns {
@@ -66,6 +74,10 @@ impl AlignedColumns {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         }
     }
 
@@ -86,6 +98,10 @@ impl AlignedColumns {
         self.read_filter = None;
         self.ref_pos = 0;
         self.mapq = 0;
+        self.has_mismatch.clear();
+        self.mismatch.clear();
+        self.has_ref_offset.clear();
+        self.ref_offset.clear();
     }
 
     /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
@@ -1030,6 +1046,10 @@ mod tests {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         }
     }
 
@@ -1619,6 +1639,10 @@ mod tests {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         };
         let opts =
             FormatOptions { output_mode: OutputMode::Bam, ref_name_to_id: None, ..default_opts() };

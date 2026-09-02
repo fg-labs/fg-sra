@@ -17,6 +17,8 @@ use crate::matecache::{MateCache, MateInfo};
 use crate::output::OutputWriter;
 use crate::progress::ProgressLogger;
 use crate::record::{AlignedColumns, FormatOptions, format_aligned_record};
+use crate::refstore::{ReferenceStore, preload_references, ref_window_len};
+use crate::restore_read::restore_read;
 
 /// VDB table name for primary alignments.
 const PRIMARY_ALIGNMENT_TABLE: &str = "PRIMARY_ALIGNMENT";
@@ -44,7 +46,9 @@ pub struct AlignConfig<'a> {
 impl AlignConfig<'_> {
     /// Compute the `ReferenceList` option flags from `primary_only`.
     fn reflist_opts(&self) -> u32 {
-        let mut opts = reflist_options::USE_PRIMARY_IDS;
+        // READ_4NA: reference bases are read as 4na so we can apply the CHARSET
+        // map ourselves and match the `(ascii)READ` column exactly.
+        let mut opts = reflist_options::READ_4NA | reflist_options::USE_PRIMARY_IDS;
         if !self.primary_only {
             opts |= reflist_options::USE_SECONDARY_IDS;
         }
@@ -76,7 +80,12 @@ mod col {
     pub const MATE_REF_NAME: &str = "(ascii)MATE_REF_NAME";
     pub const MATE_REF_POS: &str = "(INSDC:coord:zero)MATE_REF_POS";
     pub const TEMPLATE_LEN: &str = "(I32)TEMPLATE_LEN";
-    pub const READ: &str = "(ascii)READ";
+    // Physical columns used to reconstruct READ in fg-sra (avoids the virtual
+    // READ column, whose reference sub-select is not thread-safe).
+    pub const HAS_MISMATCH: &str = "(bool)HAS_MISMATCH";
+    pub const MISMATCH: &str = "(INSDC:dna:text)MISMATCH";
+    pub const HAS_REF_OFFSET: &str = "(bool)HAS_REF_OFFSET";
+    pub const REF_OFFSET: &str = "(I32)REF_OFFSET";
     pub const SAM_QUALITY: &str = "(INSDC:quality:text:phred_33)SAM_QUALITY";
     pub const EDIT_DISTANCE: &str = "(U32)EDIT_DISTANCE";
     pub const SEQ_SPOT_GROUP: &str = "(ascii)SEQ_SPOT_GROUP";
@@ -96,7 +105,10 @@ struct AlignColumnIndices {
     mate_ref_name: u32,
     mate_ref_pos: u32,
     template_len: u32,
-    read: u32,
+    has_mismatch: u32,
+    mismatch: u32,
+    has_ref_offset: u32,
+    ref_offset: u32,
     sam_quality: u32,
     edit_distance: u32,
     seq_spot_group: u32,
@@ -134,7 +146,10 @@ fn setup_data_cursor(
         mate_ref_name: cursor.add_column(col::MATE_REF_NAME).context("MATE_REF_NAME")?,
         mate_ref_pos: cursor.add_column(col::MATE_REF_POS).context("MATE_REF_POS")?,
         template_len: cursor.add_column(col::TEMPLATE_LEN).context("TEMPLATE_LEN")?,
-        read: cursor.add_column(col::READ).context("READ")?,
+        has_mismatch: cursor.add_column(col::HAS_MISMATCH).context("HAS_MISMATCH")?,
+        mismatch: cursor.add_column(col::MISMATCH).context("MISMATCH")?,
+        has_ref_offset: cursor.add_column(col::HAS_REF_OFFSET).context("HAS_REF_OFFSET")?,
+        ref_offset: cursor.add_column(col::REF_OFFSET).context("REF_OFFSET")?,
         sam_quality: cursor.add_column(col::SAM_QUALITY).context("SAM_QUALITY")?,
         edit_distance: cursor.add_column(col::EDIT_DISTANCE).context("EDIT_DISTANCE")?,
         seq_spot_group: cursor.add_column(col::SEQ_SPOT_GROUP).context("SEQ_SPOT_GROUP")?,
@@ -167,7 +182,10 @@ fn read_aligned_columns(
     cursor.read_str_into(row_id, idx.mate_ref_name, &mut cols.mate_ref_name)?;
     cols.mate_ref_pos = cursor.read_coord_zero(row_id, idx.mate_ref_pos)?;
     cols.template_len = cursor.read_i32(row_id, idx.template_len)?;
-    cursor.read_str_into(row_id, idx.read, &mut cols.read)?;
+    cursor.read_u8_slice_into(row_id, idx.has_mismatch, &mut cols.has_mismatch)?;
+    cursor.read_u8_slice_into(row_id, idx.mismatch, &mut cols.mismatch)?;
+    cursor.read_u8_slice_into(row_id, idx.has_ref_offset, &mut cols.has_ref_offset)?;
+    cursor.read_i32_slice_into(row_id, idx.ref_offset, &mut cols.ref_offset)?;
     cursor.read_str_into(row_id, idx.sam_quality, &mut cols.quality)?;
     cols.edit_distance = cursor.read_u32(row_id, idx.edit_distance)?;
     cursor.read_str_into(row_id, idx.seq_spot_group, &mut cols.spot_group)?;
@@ -411,6 +429,7 @@ fn process_row_range(
     item: &RowRangeWorkItem,
     min_mapq: i32,
     opts: &FormatOptions<'_>,
+    store: &ReferenceStore,
     state: &mut WorkerState,
     mut emit: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
@@ -428,6 +447,10 @@ fn process_row_range(
                 continue;
             }
         }
+
+        // Reconstruct READ from the preloaded reference and stored deltas (done
+        // after the filters so skipped rows pay nothing).
+        reconstruct_read(&mut state.cols, store, item.ref_idx, &mut state.scratch, row_id)?;
 
         // Resolve mate: look up cached mate info and store ours.
         // When mate has no alignment, strip paired-end flags to match
@@ -474,11 +497,14 @@ pub fn process_aligned_table(
     let mut process_table = |table_name: &str| -> Result<()> {
         // Build work items in a block scope so the ReferenceList is dropped
         // before we create per-worker cursors.
-        let work_items = {
+        // Build work items and preload their references into memory while the
+        // ReferenceList is alive, in a block scope so it is dropped (its reader
+        // is single-threaded) before any worker cursors are created.
+        let (work_items, store) = {
             let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
                 .context("failed to create ReferenceList")?;
             let boundaries = find_ref_boundaries(db, table_name, &reflist, config.use_seqid)?;
-            if config.regions.is_empty() {
+            let work_items = if config.regions.is_empty() {
                 collect_row_range_work_items(&boundaries, config.num_threads)
             } else {
                 collect_row_range_region_work_items(
@@ -487,7 +513,10 @@ pub fn process_aligned_table(
                     &reflist,
                     config.num_threads,
                 )?
-            }
+            };
+            let ref_indices: Vec<u32> = work_items.iter().map(|w| w.ref_idx).collect();
+            let store = preload_references(&reflist, &ref_indices)?;
+            (work_items, store)
             // reflist dropped here
         };
 
@@ -498,9 +527,17 @@ pub fn process_aligned_table(
         let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
 
         if config.num_threads <= 1 {
-            process_table_sequential(db, table_name, &work_items, writer, config, &progress)?;
+            process_table_sequential(
+                db,
+                table_name,
+                &work_items,
+                &store,
+                writer,
+                config,
+                &progress,
+            )?;
         } else {
-            process_table_parallel(db, table_name, &work_items, writer, config, &progress)?;
+            process_table_parallel(db, table_name, &work_items, &store, writer, config, &progress)?;
         }
 
         progress.complete();
@@ -520,6 +557,7 @@ fn process_table_sequential(
     db: &VDatabase,
     table_name: &str,
     work_items: &[RowRangeWorkItem],
+    store: &ReferenceStore,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
     progress: &ProgressLogger,
@@ -531,6 +569,7 @@ fn process_table_sequential(
         record_buf: Vec::with_capacity(1024),
         mate_cache: MateCache::new(),
         cols: AlignedColumns::new(),
+        scratch: ReadScratch::default(),
         current_ref_idx: u32::MAX,
     };
 
@@ -539,10 +578,19 @@ fn process_table_sequential(
             state.mate_cache.clear();
             state.current_ref_idx = item.ref_idx;
         }
-        process_row_range(&cursor, &col_idx, item, min_mapq, config.opts, &mut state, |rec| {
-            progress.record(1);
-            writer.write_bytes(rec)
-        })?;
+        process_row_range(
+            &cursor,
+            &col_idx,
+            item,
+            min_mapq,
+            config.opts,
+            store,
+            &mut state,
+            |rec| {
+                progress.record(1);
+                writer.write_bytes(rec)
+            },
+        )?;
         progress.reference_done();
     }
 
@@ -581,6 +629,7 @@ fn process_table_parallel(
     db: &VDatabase,
     table_name: &str,
     work_items: &[RowRangeWorkItem],
+    store: &ReferenceStore,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
     progress: &ProgressLogger,
@@ -614,9 +663,9 @@ fn process_table_parallel(
                 resource_pool_rx: resource_pool_rx.clone(),
                 resource_pool_tx: resource_pool_tx.clone(),
             };
-            worker_handles.push(
-                s.spawn(move || -> Result<()> { pool_worker_loop(&channels, config, progress) }),
-            );
+            worker_handles.push(s.spawn(move || -> Result<()> {
+                pool_worker_loop(&channels, config, store, progress)
+            }));
         }
         // Drop our copies so only workers hold channel ends.
         drop(work_rx);
@@ -736,8 +785,48 @@ struct WorkerState {
     record_buf: Vec<u8>,
     mate_cache: MateCache,
     cols: AlignedColumns,
+    /// Reusable buffers for reconstructing READ from the reference window.
+    scratch: ReadScratch,
     /// Tracks which reference the mate cache belongs to; cleared on change.
     current_ref_idx: u32,
+}
+
+/// Reusable buffers for [`reconstruct_read`], one per worker.
+#[derive(Default)]
+struct ReadScratch {
+    /// Reference window, when the sub-select wraps (borrowed directly otherwise).
+    window: Vec<u8>,
+    /// Reconstructed read bytes.
+    read: Vec<u8>,
+}
+
+/// Reconstruct `cols.read` from the reference window and the stored deltas,
+/// replacing what the virtual `READ` column would have produced.
+fn reconstruct_read(
+    cols: &mut AlignedColumns,
+    store: &ReferenceStore,
+    ref_idx: u32,
+    scratch: &mut ReadScratch,
+    row_id: i64,
+) -> Result<()> {
+    let ref_len = ref_window_len(cols.has_ref_offset.len(), &cols.ref_offset);
+    let window = store
+        .window(ref_idx, cols.ref_pos, ref_len, &mut scratch.window)
+        .map_err(|e| anyhow::anyhow!("row {row_id}: {e}"))?;
+    restore_read(
+        window,
+        &cols.has_mismatch,
+        &cols.mismatch,
+        &cols.has_ref_offset,
+        &cols.ref_offset,
+        &[],
+        &mut scratch.read,
+    )
+    .map_err(|e| anyhow::anyhow!("row {row_id}: {e}"))?;
+    cols.read.clear();
+    // CHARSET output is ASCII, so this is valid UTF-8.
+    cols.read.push_str(std::str::from_utf8(&scratch.read).expect("CHARSET bases are ASCII"));
+    Ok(())
 }
 
 /// Worker loop: check out VDB resources from the pool per work item, process,
@@ -745,12 +834,14 @@ struct WorkerState {
 fn pool_worker_loop(
     channels: &PoolWorkerChannels,
     config: &AlignConfig<'_>,
+    store: &ReferenceStore,
     progress: &ProgressLogger,
 ) -> Result<()> {
     let mut state = WorkerState {
         record_buf: Vec::with_capacity(1024),
         mate_cache: MateCache::new(),
         cols: AlignedColumns::new(),
+        scratch: ReadScratch::default(),
         current_ref_idx: u32::MAX,
     };
     let min_mapq = config.min_mapq_i32();
@@ -782,6 +873,7 @@ fn pool_worker_loop(
             &item,
             min_mapq,
             config.opts,
+            store,
             &mut state,
             |rec| {
                 progress.record(1);

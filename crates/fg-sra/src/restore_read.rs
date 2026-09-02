@@ -22,10 +22,6 @@
 //! reference and `MISMATCH` mapped through CHARSET) yields exactly the bytes the
 //! `(ascii)READ` column produces — no per-read conversion pass is needed.
 
-// Wired into the aligned read path in the commit that switches to reconstruction;
-// this allow is removed there.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// Error reconstructing a read; each variant mirrors an `rcInconsistent` return
