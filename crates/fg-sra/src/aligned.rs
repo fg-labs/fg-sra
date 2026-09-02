@@ -484,6 +484,26 @@ fn process_row_range(
 
 // ── Table-level dispatch ─────────────────────────────────────────────────
 
+/// Whether a table must be processed single-threaded to avoid the virtual
+/// `READ` reconstruction: true when its mismatch columns are not physically
+/// stored.
+fn secondary_needs_serial(has_physical_mismatch: bool) -> bool {
+    !has_physical_mismatch
+}
+
+/// Whether the SECONDARY table physically stores `TMP_HAS_MISMATCH` (so
+/// `HAS_MISMATCH` resolves to it rather than being generated from `READ`).
+/// Returns `false` (forcing the safe serial path) if the table cannot be probed.
+fn secondary_has_physical_mismatch(db: &VDatabase) -> bool {
+    let Ok(table) = db.open_table_read(SECONDARY_ALIGNMENT_TABLE) else {
+        return false;
+    };
+    let Ok(cursor) = table.create_cursor_read() else {
+        return false;
+    };
+    cursor.add_column_optional("(bool)TMP_HAS_MISMATCH").is_some()
+}
+
 /// Process all aligned reads, writing SAM/BAM records.
 ///
 /// Discovers per-reference alignment boundaries, splits into row-range work
@@ -526,7 +546,13 @@ pub fn process_aligned_table(
 
         let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
 
-        if config.num_threads <= 1 {
+        // On a SECONDARY table whose HAS_MISMATCH/MISMATCH are not physically
+        // stored (no TMP_* columns), those columns are generated from the virtual
+        // READ, which re-enters the unsynchronized reference sub-select. Process
+        // such a table single-threaded so reconstruction stays race-free.
+        let force_serial = table_name == SECONDARY_ALIGNMENT_TABLE
+            && secondary_needs_serial(secondary_has_physical_mismatch(db));
+        if config.num_threads <= 1 || force_serial {
             process_table_sequential(
                 db,
                 table_name,
@@ -824,8 +850,9 @@ fn reconstruct_read(
     )
     .map_err(|e| anyhow::anyhow!("row {row_id}: {e}"))?;
     cols.read.clear();
-    // CHARSET output is ASCII, so this is valid UTF-8.
-    cols.read.push_str(std::str::from_utf8(&scratch.read).expect("CHARSET bases are ASCII"));
+    // CHARSET output is ASCII; `from_utf8_lossy` borrows without allocating in
+    // the valid case and never panics on a malformed MISMATCH cell.
+    cols.read.push_str(&String::from_utf8_lossy(&scratch.read));
     Ok(())
 }
 
@@ -947,6 +974,12 @@ mod tests {
     #[test]
     fn test_data_cursor_cache_bytes() {
         assert_eq!(DATA_CURSOR_CACHE_BYTES, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn secondary_needs_serial_when_mismatch_not_physical() {
+        assert!(secondary_needs_serial(false));
+        assert!(!secondary_needs_serial(true));
     }
 
     #[test]

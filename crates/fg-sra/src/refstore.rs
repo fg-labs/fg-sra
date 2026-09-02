@@ -150,10 +150,10 @@ pub fn preload_references(reflist: &ReferenceList, ref_indices: &[u32]) -> Resul
             || !obj.external().with_context(|| format!("external {idx}"))?;
         seqs.insert(idx, RefSeq { bases: std::mem::take(&mut ascii), wrap });
     }
+    let count = seqs.len();
     let store = ReferenceStore::from_parts(seqs);
     eprintln!(
-        "[fg-sra] preloaded {} reference(s), {} MB",
-        ref_indices.iter().collect::<std::collections::HashSet<_>>().len(),
+        "[fg-sra] preloaded {count} reference(s), {} MB",
         store.total_bytes() / (1024 * 1024)
     );
     Ok(store)
