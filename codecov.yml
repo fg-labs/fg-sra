@@ -1,0 +1,24 @@
+# Codecov configuration for fg-sra.
+# https://docs.codecov.com/docs/codecovyml-reference
+#
+# fg-sra is largely a safe wrapper around the ncbi-vdb C library. The bulk of
+# the uncovered lines are thin FFI shims and conversion orchestration that can
+# only be exercised against a real, network-resolved SRA accession -- the
+# integration tests that do so are opt-in / `#[ignore]`d in CI (see
+# `crates/fg-sra-vdb/tests` and `crates/fg-sra/tests`). Per-PR patch coverage
+# therefore does not reflect code health for this crate, so the patch status is
+# disabled (as in fulcrumgenomics/hgvs-rs). The project status still tracks
+# overall coverage with the usual Fulcrum Rust threshold so it cannot silently
+# regress.
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch: false
+
+ignore:
+  - "**/tests/**"               # integration / opt-in tests are not measured
+  - "crates/fg-sra-vdb-sys/**"  # generated bindgen FFI bindings
