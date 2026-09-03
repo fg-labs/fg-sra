@@ -19,6 +19,16 @@ pub enum VdbError {
     Rc(u32),
     /// A string argument contained an interior nul byte.
     InvalidNulByte,
+    /// A cell's element width did not match the width expected by a typed read.
+    ///
+    /// Reinterpreting the cell as the requested type would read past the cell,
+    /// so the read is rejected rather than constructing an out-of-bounds slice.
+    ElemBitsMismatch {
+        /// Bits per element the typed read requires.
+        expected: u32,
+        /// Bits per element the cell actually stores.
+        actual: u32,
+    },
 }
 
 /// The `rcDone` state value, indicating iteration is complete (not an error).
@@ -53,7 +63,7 @@ impl VdbError {
     pub fn rc(&self) -> Option<u32> {
         match self {
             Self::Rc(rc) => Some(*rc),
-            Self::InvalidNulByte => None,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => None,
         }
     }
 
@@ -62,7 +72,7 @@ impl VdbError {
     pub fn state(&self) -> u32 {
         match self {
             Self::Rc(rc) => rc & 0x3F,
-            Self::InvalidNulByte => 0,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -71,7 +81,7 @@ impl VdbError {
     pub fn object(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 6) & 0xFF,
-            Self::InvalidNulByte => 0,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -80,7 +90,7 @@ impl VdbError {
     pub fn context(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 14) & 0x7F,
-            Self::InvalidNulByte => 0,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -89,7 +99,7 @@ impl VdbError {
     pub fn target(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 21) & 0x3F,
-            Self::InvalidNulByte => 0,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -98,7 +108,7 @@ impl VdbError {
     pub fn module(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 27) & 0x1F,
-            Self::InvalidNulByte => 0,
+            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 }
@@ -118,6 +128,10 @@ impl fmt::Display for VdbError {
             Self::InvalidNulByte => {
                 write!(f, "VDB error: string argument contains interior nul byte")
             }
+            Self::ElemBitsMismatch { expected, actual } => write!(
+                f,
+                "VDB error: cell element width {actual} bits does not match expected {expected} bits"
+            ),
         }
     }
 }
@@ -211,6 +225,17 @@ mod tests {
     #[test]
     fn test_is_network_error_invalid_nul_byte() {
         assert!(!VdbError::InvalidNulByte.is_network_error());
+    }
+
+    #[test]
+    fn test_elem_bits_mismatch() {
+        let err = VdbError::ElemBitsMismatch { expected: 32, actual: 8 };
+        assert!(!err.is_done());
+        assert!(!err.is_network_error());
+        assert_eq!(err.rc(), None);
+        let msg = err.to_string();
+        assert!(msg.contains("8 bits"), "{msg}");
+        assert!(msg.contains("expected 32 bits"), "{msg}");
     }
 
     #[test]

@@ -40,6 +40,20 @@ Key features:
 - **Reference cache warming** via `cache-refs` to avoid resolver failures under load
 - **Mate cache** for proper SAM flag and mate-pair information
 
+For aligned runs, `fg-sra` reconstructs each read from the stored alignment
+deltas rather than reading the virtual `READ` column: it preloads each aligned
+reference sequence into memory (single-threaded, once per preload batch), then
+rebuilds `READ` on worker threads with a port of ncbi-vdb's own reconstruction
+routine. This keeps
+worker threads off libncbi-vdb's `REFERENCE` sub-select, whose blob cache is not
+thread-safe. The preload costs roughly one byte per reference base; references
+are processed in batches to cap this (default 1 GiB, overridable with the
+`FG_SRA_REF_PRELOAD_BUDGET_MB` environment variable). The budget targets the
+retained reference-store bytes, not strict peak memory: a single reference
+larger than the budget still forms its own batch, and loading a reference
+transiently holds both its raw 4na and mapped bases, so peak memory can exceed
+the configured value by roughly the largest single reference.
+
 The following `sam-dump` options are accepted but **not yet supported**:
 - `--hide-identical` — output `=` for bases matching reference
 - `--with-md-flag` — compute and output the MD tag

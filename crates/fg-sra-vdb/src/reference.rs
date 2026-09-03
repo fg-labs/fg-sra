@@ -13,6 +13,10 @@ use crate::retry::retry_on_network_error;
 ///
 /// These control which alignment ID columns are read from the REFERENCE table.
 pub mod reflist_options {
+    /// Make `ReferenceObj::read*` return `INSDC:4na:bin` (4-bit codes 0..=15)
+    /// instead of DNA text. Used so callers can apply the CHARSET mapping
+    /// themselves and match the `(ascii)READ` column exactly.
+    pub const READ_4NA: u32 = 0x01;
     /// Include `PRIMARY_ALIGNMENT_IDS` column (required for primary alignment iteration).
     pub const USE_PRIMARY_IDS: u32 = 0x02;
     /// Include `SECONDARY_ALIGNMENT_IDS` column (required for secondary alignment iteration).
@@ -146,7 +150,12 @@ pub struct ReferenceObj {
     ptr: *const fg_sra_vdb_sys::ReferenceObj,
 }
 
-unsafe impl Send for ReferenceObj {}
+// `ReferenceObj` is deliberately neither `Send` nor `Sync`. Its reads go through
+// the owning `ReferenceList`'s single, unsynchronized `REFERENCE` blob cache, so
+// two objects from one list read concurrently would corrupt that cache
+// (SIGSEGV/SIGBUS). Leaving it `!Send` makes the compiler forbid moving distinct
+// objects onto separate threads; the raw pointer already makes it `!Sync`. All
+// reference reads therefore stay single-threaded (see `preload_references`).
 
 impl ReferenceObj {
     /// Get the reference name (e.g., "chr1").
@@ -176,6 +185,87 @@ impl ReferenceObj {
             let rc = unsafe { fg_sra_vdb_sys::ReferenceObj_Idx(self.ptr, &raw mut idx) };
             check_rc(rc)?;
             Ok(idx)
+        })
+    }
+
+    /// Read up to `buf.len()` reference bases starting at 0-based `offset`,
+    /// returning the number of bases written into `buf`.
+    ///
+    /// With [`reflist_options::READ_4NA`] the bytes are 4na codes (`0..=15`);
+    /// otherwise they are DNA text. A read past the end of a non-circular
+    /// reference writes fewer bytes than requested.
+    ///
+    /// # Thread safety
+    /// This uses the owning [`ReferenceList`]'s single shared reader, whose
+    /// `REFERENCE` blob cache is unsynchronized. `ReferenceObj` is neither `Send`
+    /// nor `Sync`, so the compiler forbids moving distinct objects onto separate
+    /// threads and reads stay single-threaded.
+    pub fn read_into(&self, offset: i32, buf: &mut [u8]) -> Result<u32, VdbError> {
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        retry_on_network_error("ReferenceObj_Read", || {
+            let mut written: u32 = 0;
+            let rc = unsafe {
+                fg_sra_vdb_sys::ReferenceObj_Read(
+                    self.ptr,
+                    offset,
+                    len,
+                    buf.as_mut_ptr(),
+                    &raw mut written,
+                )
+            };
+            check_rc(rc)?;
+            Ok(written)
+        })
+    }
+
+    /// Read the entire reference sequence into a freshly allocated `Vec`.
+    ///
+    /// Reads sequentially in chunks until the sequence length is reached (or a
+    /// chunk returns zero bases). The result may be shorter than
+    /// [`seq_length`](Self::seq_length) only if the underlying reader stops
+    /// early; callers that require the full sequence should check the length.
+    pub fn read_all(&self) -> Result<Vec<u8>, VdbError> {
+        let len = self.seq_length()? as usize;
+        let mut out = vec![0u8; len];
+        let mut filled = 0usize;
+        let mut offset: i32 = 0;
+        while filled < len {
+            let written = self.read_into(offset, &mut out[filled..])? as usize;
+            if written == 0 {
+                break;
+            }
+            filled += written;
+            // References are i32-coordinate; stop rather than saturate past the
+            // limit, so a short read is caught loudly by the caller's length check.
+            let Ok(next) = i32::try_from(filled) else {
+                break;
+            };
+            offset = next;
+        }
+        out.truncate(filled);
+        Ok(out)
+    }
+
+    /// Whether this reference is circular.
+    pub fn circular(&self) -> Result<bool, VdbError> {
+        retry_on_network_error("ReferenceObj_Circular", || {
+            let mut circular = false;
+            let rc = unsafe { fg_sra_vdb_sys::ReferenceObj_Circular(self.ptr, &raw mut circular) };
+            check_rc(rc)?;
+            Ok(circular)
+        })
+    }
+
+    /// Whether this reference is stored externally (a separate refseq object)
+    /// rather than locally inside the run.
+    pub fn external(&self) -> Result<bool, VdbError> {
+        retry_on_network_error("ReferenceObj_External", || {
+            let mut external = false;
+            let rc = unsafe {
+                fg_sra_vdb_sys::ReferenceObj_External(self.ptr, &raw mut external, ptr::null_mut())
+            };
+            check_rc(rc)?;
+            Ok(external)
         })
     }
 

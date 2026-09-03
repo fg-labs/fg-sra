@@ -26,8 +26,8 @@ pub struct AlignedColumns {
     pub mate_ref_pos: i32,
     /// Template length (`TEMPLATE_LEN`).
     pub template_len: i32,
-    /// Read sequence (`SAM_QUALITY` column provides pre-encoded quality).
-    pub read: String,
+    /// Read sequence bytes (ASCII), reconstructed from the reference and deltas.
+    pub read: Vec<u8>,
     /// Quality string (already Phred+33 encoded from `SAM_QUALITY`).
     pub quality: String,
     /// Edit distance (`EDIT_DISTANCE`) for NM tag.
@@ -42,13 +42,23 @@ pub struct AlignedColumns {
     pub ref_pos: i32,
     /// Mapping quality (`MAPQ`).
     pub mapq: i32,
+    /// `HAS_MISMATCH` (one 0/1 byte per read base); input to read reconstruction.
+    pub has_mismatch: Vec<u8>,
+    /// `MISMATCH` bases (CHARSET/ASCII); input to read reconstruction.
+    pub mismatch: Vec<u8>,
+    /// `HAS_REF_OFFSET` (one 0/1 byte per read base); input to read reconstruction.
+    pub has_ref_offset: Vec<u8>,
+    /// `REF_OFFSET` values; input to read reconstruction.
+    pub ref_offset: Vec<i32>,
 }
 
 impl AlignedColumns {
     /// Create a new `AlignedColumns` with empty/default values.
     ///
-    /// String fields start empty and grow to needed capacity on first use,
-    /// reusing their heap allocation across subsequent records.
+    /// The heap-backed fields — the `String`s, the reconstructed `read`, and the
+    /// `Vec` reconstruction inputs (`has_mismatch`, `mismatch`, `has_ref_offset`,
+    /// `ref_offset`) — start empty and grow to needed capacity on first use,
+    /// reusing their allocation across subsequent records.
     pub fn new() -> Self {
         Self {
             seq_name: String::new(),
@@ -58,7 +68,7 @@ impl AlignedColumns {
             mate_ref_name: String::new(),
             mate_ref_pos: 0,
             template_len: 0,
-            read: String::new(),
+            read: Vec::new(),
             quality: String::new(),
             edit_distance: 0,
             spot_group: String::new(),
@@ -66,6 +76,10 @@ impl AlignedColumns {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         }
     }
 
@@ -86,6 +100,10 @@ impl AlignedColumns {
         self.read_filter = None;
         self.ref_pos = 0;
         self.mapq = 0;
+        self.has_mismatch.clear();
+        self.mismatch.clear();
+        self.has_ref_offset.clear();
+        self.ref_offset.clear();
     }
 
     /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
@@ -215,7 +233,7 @@ pub fn format_aligned_record(
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
-            buf.extend_from_slice(cols.read.as_bytes());
+            buf.extend_from_slice(cols.read.as_slice());
             buf.push(b'\n');
         }
         OutputMode::Fastq => {
@@ -230,7 +248,7 @@ pub fn format_aligned_record(
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
-            buf.extend_from_slice(cols.read.as_bytes());
+            buf.extend_from_slice(cols.read.as_slice());
             buf.extend_from_slice(b"\n+\n");
             if opts.omit_quality || cols.quality.is_empty() {
                 buf.push(b'*');
@@ -328,7 +346,7 @@ fn format_aligned_record_sam(
     if cols.read.is_empty() {
         buf.push(b'*');
     } else {
-        buf.extend_from_slice(cols.read.as_bytes());
+        buf.extend_from_slice(cols.read.as_slice());
     }
 
     // QUAL
@@ -643,7 +661,7 @@ fn format_aligned_record_bam(
     let align_end = ref_pos + cigar_ref_length(&cigar_ops);
     let bin = reg2bin(ref_pos as u32, align_end as u32);
 
-    let seq = cols.read.as_bytes();
+    let seq = cols.read.as_slice();
     let l_seq = seq.len() as i32;
 
     // Resolve mate info.
@@ -1022,7 +1040,7 @@ mod tests {
             mate_ref_name: "chr1".to_string(),
             mate_ref_pos: 500,
             template_len: 300,
-            read: "ACGTACGT".to_string(),
+            read: b"ACGTACGT".to_vec(),
             quality: "IIIIIIII".to_string(),
             edit_distance: 1,
             spot_group: "RG1".to_string(),
@@ -1030,6 +1048,10 @@ mod tests {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         }
     }
 
@@ -1611,7 +1633,7 @@ mod tests {
             mate_ref_name: "*".to_string(),
             mate_ref_pos: 0,
             template_len: 0,
-            read: "ACGT".to_string(),
+            read: b"ACGT".to_vec(),
             quality: "IIII".to_string(), // Phred+33: 73-33 = 40
             edit_distance: 0,
             spot_group: String::new(),
@@ -1619,6 +1641,10 @@ mod tests {
             read_filter: None,
             ref_pos: 0,
             mapq: 0,
+            has_mismatch: Vec::new(),
+            mismatch: Vec::new(),
+            has_ref_offset: Vec::new(),
+            ref_offset: Vec::new(),
         };
         let opts =
             FormatOptions { output_mode: OutputMode::Bam, ref_name_to_id: None, ..default_opts() };
