@@ -32,5 +32,9 @@ noodles-bgzf = "0.48"
 noodles-sam = "0.86"
 rustc-hash = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
 [dev-dependencies]
 rstest = { workspace = true }

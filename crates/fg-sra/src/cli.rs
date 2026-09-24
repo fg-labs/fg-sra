@@ -82,7 +82,12 @@ pub struct ToSam {
     pub unaligned_spots_only: bool,
 
     // ── Output options ────────────────────────────────────────────────
-    /// Write to file instead of stdout.
+    /// Write to file instead of stdout. The output is written under a temporary
+    /// name in the same directory and renamed into place only on success, so an
+    /// existing file is kept (and needs room alongside) until the run completes.
+    /// Written in place instead: symlinks, devices, pipes, hard-linked files,
+    /// files owned by another user or group, and when the temporary file
+    /// cannot be created (e.g. a read-only directory).
     #[arg(long = "output-file")]
     pub output_file: Option<PathBuf>,
 
