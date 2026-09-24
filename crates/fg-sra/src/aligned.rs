@@ -10,7 +10,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fg_sra_vdb::cursor::VCursor;
-use fg_sra_vdb::database::VDatabase;
+use fg_sra_vdb::database::{VDatabase, VTable};
 use fg_sra_vdb::reference::{ReferenceList, reflist_options};
 
 use crate::matecache::{MateCache, MateInfo};
@@ -95,6 +95,7 @@ mod col {
     pub const REF_POS: &str = "(INSDC:coord:zero)REF_POS";
     pub const MAPQ: &str = "(I32)MAPQ";
     pub const REF_NAME: &str = "(ascii)REF_NAME";
+    pub const REF_ID: &str = "(I64)REF_ID";
 }
 
 /// Column indices for aligned read cursor.
@@ -204,7 +205,11 @@ fn read_aligned_columns(
 
 // ── Reference boundary discovery ─────────────────────────────────────────
 
-/// Per-reference alignment boundary: ref index, name, first/last alignment row IDs.
+/// A contiguous run of alignment rows that all belong to one reference.
+///
+/// A reference normally has exactly one run, but a table loaded as several
+/// separately sorted batches stores a reference's alignments in several runs
+/// (one per batch).
 struct RefBoundary {
     ref_idx: u32,
     ref_name: String,
@@ -212,80 +217,278 @@ struct RefBoundary {
     last_row: i64,
 }
 
-/// Discover per-reference alignment row ranges by probing the `REF_NAME` column.
+/// The per-reference alignment runs of one table, in output order.
+struct RefLayout {
+    /// Runs grouped by reference (in `ReferenceList` order), and in table order
+    /// within a reference.
+    boundaries: Vec<RefBoundary>,
+    /// Number of maximal row ranges sorted by `(REF_ID, REF_POS)`, i.e. the
+    /// number of separately sorted batches the table was loaded as.
+    num_sorted_segments: usize,
+    /// Names of references whose alignments span more than one run. Output for
+    /// these references is grouped but not coordinate-sorted.
+    split_references: Vec<String>,
+}
+
+/// A row's sort key in a sorted alignment table: `(REF_ID, REF_POS)`.
 ///
-/// Since `PRIMARY_ALIGNMENT` rows are contiguous per reference and ordered by
-/// reference index, we can find boundaries with a linear scan over reference
-/// transitions using binary search to find each transition point.
+/// `REF_ID` is the `REFERENCE` table row (a fixed-size chunk of one reference)
+/// holding the alignment's start, so it orders rows by reference and coarsely
+/// by position; `REF_POS` orders rows within a chunk.
+type SortKey = (i64, i32);
+
+/// Minimum number of rows per slice when scanning sort keys in parallel.
+const MIN_SCAN_SLICE_ROWS: i64 = 1_000_000;
+
+/// Maximum number of sorted segments accepted before a table is rejected as not
+/// sorted by reference, bounding the memory spent describing its layout.
+const MAX_SORTED_SEGMENTS: usize = 100_000;
+
+/// Split `first_row..=last_row` into at most `num_slices` contiguous slices of
+/// at least `min_slice_rows` rows each (fewer when the range is small).
+fn slice_row_range(
+    first_row: i64,
+    last_row: i64,
+    num_slices: usize,
+    min_slice_rows: i64,
+) -> Vec<(i64, i64)> {
+    let total_rows = last_row - first_row + 1;
+    let max_slices = (total_rows / min_slice_rows).max(1) as usize;
+    let num_slices = num_slices.clamp(1, max_slices) as i64;
+    let slice_rows = (total_rows + num_slices - 1) / num_slices;
+    (0..num_slices)
+        .map(|i| first_row + i * slice_rows)
+        .take_while(|&start| start <= last_row)
+        .map(|start| (start, (start + slice_rows - 1).min(last_row)))
+        .collect()
+}
+
+/// Return the rows in the slice `start..=end` whose sort key is less than the
+/// previous row's, for a table whose first row is `first_row`.
 ///
-/// Returns boundaries in reference order, only for references that have alignments.
+/// The row before the slice is probed too, so a descent at `start` itself is
+/// found; the table's first row has no predecessor and is never a descent.
+/// Fails if the slice has more than `max_descents` descents.
+fn find_descents_in_slice(
+    first_row: i64,
+    start: i64,
+    end: i64,
+    max_descents: usize,
+    mut probe: impl FnMut(i64) -> Result<SortKey>,
+) -> Result<Vec<i64>> {
+    let mut prev = if start > first_row { Some(probe(start - 1)?) } else { None };
+    let mut descents = Vec::new();
+    for row in start..=end {
+        let key = probe(row)?;
+        if prev.is_some_and(|p| key < p) {
+            anyhow::ensure!(
+                descents.len() < max_descents,
+                "alignment table is not sorted by reference (more than {max_descents} sorted \
+                 row ranges); converting such tables is not supported"
+            );
+            descents.push(row);
+        }
+        prev = Some(key);
+    }
+    Ok(descents)
+}
+
+/// Find the maximal row ranges of `first_row..=last_row` that are sorted by
+/// [`SortKey`], scanning one slice per probe in parallel.
+///
+/// `slices` pairs each slice (from [`slice_row_range`]) with a probe returning a
+/// row's sort key; each probe runs on its own thread, so it must own any VDB
+/// cursor it reads.
+fn find_sorted_segments<P>(
+    first_row: i64,
+    last_row: i64,
+    slices: Vec<((i64, i64), P)>,
+) -> Result<Vec<(i64, i64)>>
+where
+    P: FnMut(i64) -> Result<SortKey> + Send,
+{
+    let descents = std::thread::scope(|s| -> Result<Vec<i64>> {
+        let handles: Vec<_> = slices
+            .into_iter()
+            .map(|((start, end), probe)| {
+                s.spawn(move || {
+                    find_descents_in_slice(first_row, start, end, MAX_SORTED_SEGMENTS, probe)
+                })
+            })
+            .collect();
+        // Slices are ascending and joined in order, so the result is sorted.
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.join().expect("sort-key scan thread panicked")?);
+            anyhow::ensure!(
+                all.len() < MAX_SORTED_SEGMENTS,
+                "alignment table is not sorted by reference (more than {MAX_SORTED_SEGMENTS} \
+                 sorted row ranges); converting such tables is not supported"
+            );
+        }
+        Ok(all)
+    })?;
+
+    let mut segments = Vec::with_capacity(descents.len() + 1);
+    let mut start = first_row;
+    for descent in descents {
+        segments.push((start, descent - 1));
+        start = descent;
+    }
+    segments.push((start, last_row));
+    Ok(segments)
+}
+
+/// Find the per-reference runs within each sorted segment.
+///
+/// `probe` returns a row's reference name. Within a sorted segment each
+/// reference's rows are contiguous, so each run's end is found by binary search.
+/// Returns `(name, first_row, last_row)` runs in row order.
+fn find_runs_in_segments(
+    segments: &[(i64, i64)],
+    mut probe: impl FnMut(i64) -> Result<String>,
+) -> Result<Vec<(String, i64, i64)>> {
+    let mut runs = Vec::new();
+    for &(start, end) in segments {
+        let mut current_start = start;
+        while current_start <= end {
+            let current_name = probe(current_start)?;
+            let mut lo = current_start;
+            let mut hi = end;
+            while lo < hi {
+                let mid = lo + (hi - lo + 1) / 2;
+                if probe(mid)? == current_name {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            runs.push((current_name, current_start, lo));
+            current_start = lo + 1;
+        }
+    }
+    Ok(runs)
+}
+
+/// Group runs by reference in `ReferenceList` order, keeping table order within
+/// a reference. Returns the grouped runs and the names of references with more
+/// than one run.
+///
+/// A sorted table is already in this order, and for a table of several sorted
+/// batches this restores reference order, so only references whose alignments
+/// span several batches are left unsorted.
+fn group_runs_by_reference(mut runs: Vec<RefBoundary>) -> (Vec<RefBoundary>, Vec<String>) {
+    // Stable sort: runs of the same reference keep their table order.
+    runs.sort_by_key(|run| run.ref_idx);
+    let split = runs
+        .chunk_by(|a, b| a.ref_idx == b.ref_idx)
+        .filter(|group| group.len() > 1)
+        .map(|group| group[0].ref_name.clone())
+        .collect();
+    (runs, split)
+}
+
+/// Discover the per-reference alignment runs of `table`.
+///
+/// Scans every row's [`SortKey`] (split across up to `num_threads` cursors) for
+/// the table's sorted segments, then binary-searches `REF_NAME` within each
+/// segment for the per-reference runs. The concurrent scan is safe because each
+/// thread owns a cursor that was created and opened on this thread, and
+/// `REF_ID`/`REF_POS` are physical or computed per row from physical columns
+/// without touching the `REFERENCE` table's sequence.
 fn find_ref_boundaries(
-    db: &VDatabase,
-    table_name: &str,
+    table: &VTable,
     reflist: &ReferenceList,
     use_seqid: bool,
-) -> Result<Vec<RefBoundary>> {
-    let table = db.open_table_read(table_name).context("failed to open alignment table")?;
+    num_threads: usize,
+) -> Result<RefLayout> {
     let cursor = table.create_cursor_read().context("failed to create boundary cursor")?;
     let ref_name_col = cursor.add_column(col::REF_NAME).context("REF_NAME")?;
     cursor.open().context("failed to open boundary cursor")?;
 
     let (first_row, total_count) = cursor.id_range(0).context("failed to get id range")?;
     if total_count == 0 {
-        return Ok(Vec::new());
+        return Ok(RefLayout {
+            boundaries: Vec::new(),
+            num_sorted_segments: 0,
+            split_references: Vec::new(),
+        });
     }
     let last_row = first_row + total_count as i64 - 1;
 
-    let mut boundaries = Vec::new();
-    let mut current_start = first_row;
-
-    while current_start <= last_row {
-        let current_name = cursor.read_str(current_start, ref_name_col)?;
-
-        // Binary search for the last row with this reference name.
-        let mut lo = current_start;
-        let mut hi = last_row;
-        while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
-            let mid_name = cursor.read_str(mid, ref_name_col)?;
-            if mid_name == current_name {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        let boundary_end = lo;
-
-        let ref_obj = reflist.find(&current_name).with_context(|| {
-            format!("failed to find reference '{current_name}' in reference list")
-        })?;
-        let ref_idx = ref_obj.idx()?;
-        let ref_name = if use_seqid { ref_obj.seq_id()? } else { current_name };
-
-        boundaries.push(RefBoundary {
-            ref_idx,
-            ref_name,
-            first_row: current_start,
-            last_row: boundary_end,
-        });
-
-        current_start = boundary_end + 1;
+    let mut slices = Vec::new();
+    for slice in slice_row_range(first_row, last_row, num_threads, MIN_SCAN_SLICE_ROWS) {
+        let scan = table.create_cursor_read().context("failed to create sort-key cursor")?;
+        let ref_id_col = scan.add_column(col::REF_ID).context("REF_ID")?;
+        let ref_pos_col = scan.add_column(col::REF_POS).context("REF_POS")?;
+        scan.open().context("failed to open sort-key cursor")?;
+        let probe = move |row: i64| -> Result<SortKey> {
+            Ok((scan.read_i64(row, ref_id_col)?, scan.read_coord_zero(row, ref_pos_col)?))
+        };
+        slices.push((slice, probe));
     }
+    let segments = find_sorted_segments(first_row, last_row, slices)?;
+    let runs = find_runs_in_segments(&segments, |row| Ok(cursor.read_str(row, ref_name_col)?))?;
 
-    Ok(boundaries)
+    let mut boundaries = Vec::with_capacity(runs.len());
+    for (name, first, last) in runs {
+        let ref_obj = reflist
+            .find(&name)
+            .with_context(|| format!("failed to find reference '{name}' in reference list"))?;
+        let ref_idx = ref_obj.idx()?;
+        let ref_name = if use_seqid { ref_obj.seq_id()? } else { name };
+        boundaries.push(RefBoundary { ref_idx, ref_name, first_row: first, last_row: last });
+    }
+    let (boundaries, split_references) = group_runs_by_reference(boundaries);
+
+    Ok(RefLayout { boundaries, num_sorted_segments: segments.len(), split_references })
+}
+
+/// The BAM `ref_id` of an output reference: its index among the output header's
+/// `@SQ` lines, looked up by name in `ref_name_to_id` (see
+/// [`crate::header::build_ref_id_map`], which also maps each reference's
+/// alternate name). Without a header map (no header written) falls back to the
+/// `ReferenceList` index.
+fn resolve_bam_ref_id(
+    ref_name_to_id: Option<&HashMap<String, i32>>,
+    ref_name: &str,
+    ref_idx: u32,
+) -> Result<i32> {
+    let Some(map) = ref_name_to_id else {
+        return Ok(ref_idx as i32);
+    };
+    map.get(ref_name).copied().with_context(|| {
+        format!("reference '{ref_name}' has alignments but no @SQ line in the output header")
+    })
+}
+
+/// Set each work item's BAM `ref_id` (see [`resolve_bam_ref_id`]).
+///
+/// Runs on the final work items, so only references that are actually output
+/// (e.g. those selected by `--aligned-region`) need an `@SQ` line.
+fn assign_bam_ref_ids(
+    work_items: &mut [RowRangeWorkItem],
+    ref_name_to_id: Option<&HashMap<String, i32>>,
+) -> Result<()> {
+    for item in work_items {
+        item.bam_ref_id = resolve_bam_ref_id(ref_name_to_id, &item.ref_name, item.ref_idx)?;
+    }
+    Ok(())
 }
 
 // ── Work item construction ───────────────────────────────────────────────
 
 /// A unit of work: a contiguous range of alignment row IDs from one reference.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct RowRangeWorkItem {
     /// Contiguous index into the work list, used for ordered output.
     order_idx: usize,
-    /// Reference index (for BAM `ref_id` encoding).
+    /// Reference index into the `ReferenceList` (for the preloaded reference).
     ref_idx: u32,
     /// Reference name (pre-resolved, avoids per-worker `ReferenceList`).
     ref_name: String,
+    /// BAM `ref_id`: the reference's index among the output header's `@SQ` lines.
+    bam_ref_id: i32,
     /// First alignment row ID (inclusive).
     start_row: i64,
     /// Last alignment row ID (inclusive).
@@ -322,6 +525,9 @@ fn chunk_boundaries(
                 order_idx: work_items.len(),
                 ref_idx: boundary.ref_idx,
                 ref_name: boundary.ref_name.clone(),
+                // The no-header fallback; `assign_bam_ref_ids` resolves it against
+                // the output header.
+                bam_ref_id: boundary.ref_idx as i32,
                 start_row: start,
                 end_row: end,
                 region_filter: filter,
@@ -370,37 +576,37 @@ fn parse_region(s: &str) -> Result<Region> {
 /// Build row-range work items for specific genomic regions.
 ///
 /// For each region, finds the matching reference in `boundaries` and creates
-/// work items covering that reference's full row range, with a coordinate
-/// filter applied post-read.
+/// work items covering all of that reference's row runs, with a coordinate
+/// filter applied post-read. A region naming a reference by its other name
+/// (name vs seqid) is resolved to a `ReferenceList` index by `ref_idx_of`.
 fn collect_row_range_region_work_items(
     boundaries: &[RefBoundary],
     regions: &[String],
-    reflist: &ReferenceList,
+    mut ref_idx_of: impl FnMut(&str) -> Result<u32>,
     num_threads: usize,
 ) -> Result<Vec<RowRangeWorkItem>> {
-    // Build a map from ref_name → boundary index for quick lookup.
-    let name_to_boundary: HashMap<&str, usize> =
-        boundaries.iter().enumerate().map(|(i, b)| (b.ref_name.as_str(), i)).collect();
+    // A reference may have several runs (one per sorted batch); index them all.
+    let mut runs_by_name: HashMap<&str, Vec<&RefBoundary>> = HashMap::new();
+    let mut runs_by_idx: HashMap<u32, Vec<&RefBoundary>> = HashMap::new();
+    for b in boundaries {
+        runs_by_name.entry(b.ref_name.as_str()).or_default().push(b);
+        runs_by_idx.entry(b.ref_idx).or_default().push(b);
+    }
 
     let mut entries: Vec<(&RefBoundary, Option<(i32, i32)>)> = Vec::new();
 
     for spec in regions {
         let region = parse_region(spec)?;
 
-        // First check the boundary map by name, then fall back to reflist.find()
-        // to handle name/seqid aliasing.
-        let boundary_idx = if let Some(&idx) = name_to_boundary.get(region.name.as_str()) {
-            idx
+        // First match boundaries by name, then fall back to reflist.find() to
+        // handle name/seqid aliasing.
+        let runs = if let Some(runs) = runs_by_name.get(region.name.as_str()) {
+            runs
         } else {
-            // The region name might be the alternate form (name vs seqid). Look up
-            // via reflist to get the ref_idx, then find the matching boundary.
-            let ref_obj = reflist
-                .find(&region.name)
-                .with_context(|| format!("reference not found: {}", region.name))?;
-            let ref_idx = ref_obj.idx().context("failed to get reference index")?;
-            boundaries
-                .iter()
-                .position(|b| b.ref_idx == ref_idx)
+            // The region name might be the alternate form (name vs seqid).
+            let ref_idx = ref_idx_of(&region.name)?;
+            runs_by_idx
+                .get(&ref_idx)
                 .with_context(|| format!("no alignments found for reference: {}", region.name))?
         };
 
@@ -409,7 +615,7 @@ fn collect_row_range_region_work_items(
             _ => None,
         };
 
-        entries.push((&boundaries[boundary_idx], filter));
+        entries.extend(runs.iter().map(|&b| (b, filter)));
     }
 
     Ok(chunk_boundaries(&entries, num_threads))
@@ -468,7 +674,7 @@ fn process_row_range(
             &mut state.record_buf,
             &state.cols,
             &item.ref_name,
-            item.ref_idx as i32,
+            item.bam_ref_id,
             state.cols.ref_pos,
             state.cols.mapq,
             row_id,
@@ -503,6 +709,25 @@ fn ref_preload_budget_bytes() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
         .map_or(REF_PRELOAD_BUDGET_BYTES, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The warning for a table whose references have alignments in several
+/// separately sorted row ranges, so its output is not coordinate-sorted.
+fn split_layout_warning(table_name: &str, layout: &RefLayout) -> String {
+    format!(
+        "{table_name} is stored as {} separately sorted row ranges; alignments for {} \
+         reference(s) ({}) are grouped by reference but are not coordinate-sorted within \
+         those references",
+        layout.num_sorted_segments,
+        layout.split_references.len(),
+        abbreviate_names(&layout.split_references, 5),
+    )
+}
+
+/// Join up to `max` names with commas, noting how many more were omitted.
+fn abbreviate_names(names: &[String], max: usize) -> String {
+    let shown = names.iter().take(max).map(String::as_str).collect::<Vec<_>>().join(", ");
+    if names.len() > max { format!("{shown}, and {} more", names.len() - max) } else { shown }
 }
 
 /// Group consecutive work items into batches whose distinct references sum to at
@@ -562,100 +787,140 @@ fn secondary_has_physical_mismatch(db: &VDatabase) -> bool {
         && cursor.add_column_optional("(INSDC:dna:text)TMP_MISMATCH").is_some()
 }
 
+/// One alignment table's planned conversion: its references and work items.
+struct TablePlan {
+    table_name: &'static str,
+    /// Lives for the whole table: its single-threaded reader is used only on the
+    /// main thread, to preload each batch of references between (never during)
+    /// the parallel worker phases.
+    reflist: ReferenceList,
+    work_items: Vec<RowRangeWorkItem>,
+}
+
+/// Plan the conversion of one alignment table: discover its reference runs,
+/// build its work items and resolve their BAM `ref_id`s. Returns `None` when
+/// the table has nothing to output.
+fn plan_table(
+    db: &VDatabase,
+    table_name: &'static str,
+    config: &AlignConfig<'_>,
+) -> Result<Option<TablePlan>> {
+    let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
+        .context("failed to create ReferenceList")?;
+    let table = db.open_table_read(table_name).context("failed to open alignment table")?;
+    let layout = find_ref_boundaries(&table, &reflist, config.use_seqid, config.num_threads)?;
+    if !layout.split_references.is_empty() {
+        eprintln!("[layout] {}", split_layout_warning(table_name, &layout));
+    }
+    let mut work_items = if config.regions.is_empty() {
+        collect_row_range_work_items(&layout.boundaries, config.num_threads)
+    } else {
+        let ref_idx_of = |name: &str| -> Result<u32> {
+            let ref_obj =
+                reflist.find(name).with_context(|| format!("reference not found: {name}"))?;
+            ref_obj.idx().context("failed to get reference index")
+        };
+        collect_row_range_region_work_items(
+            &layout.boundaries,
+            config.regions,
+            ref_idx_of,
+            config.num_threads,
+        )?
+    };
+    if work_items.is_empty() {
+        return Ok(None);
+    }
+    assign_bam_ref_ids(&mut work_items, config.opts.ref_name_to_id)?;
+    Ok(Some(TablePlan { table_name, reflist, work_items }))
+}
+
 /// Process all aligned reads, writing SAM/BAM records.
 ///
-/// Discovers per-reference alignment boundaries, splits into row-range work
-/// items, and dispatches to sequential or parallel processing.
+/// Plans every alignment table first (so a table that cannot be converted fails
+/// before any record is written), then processes each table's work items
+/// sequentially or in parallel.
 pub fn process_aligned_table(
     db: &VDatabase,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
     progress_interval: u64,
 ) -> Result<()> {
-    let mut process_table = |table_name: &str| -> Result<()> {
-        // The ReferenceList lives for the whole table: its single-threaded reader
-        // is used only on the main thread, to preload each batch of references
-        // between (never during) the parallel worker phases.
-        let reflist = ReferenceList::make_database(db, config.reflist_opts(), 0)
-            .context("failed to create ReferenceList")?;
-        let boundaries = find_ref_boundaries(db, table_name, &reflist, config.use_seqid)?;
-        let work_items = if config.regions.is_empty() {
-            collect_row_range_work_items(&boundaries, config.num_threads)
-        } else {
-            collect_row_range_region_work_items(
-                &boundaries,
-                config.regions,
-                &reflist,
-                config.num_threads,
-            )?
-        };
-        if work_items.is_empty() {
-            return Ok(());
-        }
-
-        // Reference lengths for the distinct references, to size preload batches.
-        let mut ref_len_of: HashMap<u32, usize> = HashMap::new();
-        for w in &work_items {
-            if let std::collections::hash_map::Entry::Vacant(entry) = ref_len_of.entry(w.ref_idx) {
-                let len = reflist.get(w.ref_idx)?.seq_length()? as usize;
-                entry.insert(len);
-            }
-        }
-        let batches = batch_work_items(&work_items, &ref_len_of, ref_preload_budget_bytes());
-
-        // Only the SECONDARY table can force serial processing. In the align
-        // schema (align.vschema), PRIMARY_ALIGNMENT stores HAS_MISMATCH/MISMATCH
-        // as physical columns (`physical column <INSDC:4na:bin> ... .MISMATCH`),
-        // so reading them never re-enters the reference sub-select — PRIMARY is
-        // race-free on the parallel path by construction. SECONDARY, by
-        // contrast, backs those columns with a TMP_* "hack" column that, when
-        // absent, is generated from a RAW_READ sub-select into PRIMARY, which
-        // does re-enter the unsynchronized reference reconstruction. Detect that
-        // case and process such a SECONDARY table single-threaded.
-        let force_serial =
-            table_name == SECONDARY_ALIGNMENT_TABLE && !secondary_has_physical_mismatch(db);
-        if force_serial && config.num_threads > 1 {
-            eprintln!(
-                "[preload] SECONDARY_ALIGNMENT lacks physical mismatch columns; \
-                 processing it single-threaded to avoid a libncbi-vdb data race"
-            );
-        }
-        // One concise summary per table (orchestration layer, not the data
-        // module): distinct references and their total size, plus batch count.
-        let total_ref_bytes: usize = ref_len_of.values().sum();
-        eprintln!(
-            "[preload] {table_name}: {} reference(s), {:.1} MiB, {} batch(es)",
-            ref_len_of.len(),
-            total_ref_bytes as f64 / (1024.0 * 1024.0),
-            batches.len(),
-        );
-        let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
-
-        for range in batches {
-            let batch = &work_items[range];
-            let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
-            let store = preload_references(&reflist, &ref_indices)?;
-            // order_idx is globally contiguous, so the batch's first item's index
-            // is the base the ordered collector starts from — no re-basing needed.
-            let base_order = batch.first().map_or(0, |w| w.order_idx);
-            if config.num_threads <= 1 || force_serial {
-                process_table_sequential(db, table_name, batch, &store, writer, config, &progress)?;
-            } else {
-                process_table_parallel(
-                    db, table_name, batch, base_order, &store, writer, config, &progress,
-                )?;
-            }
-        }
-
-        progress.complete();
-        Ok(())
-    };
-
-    process_table(PRIMARY_ALIGNMENT_TABLE)?;
+    let mut plans = Vec::new();
+    plans.extend(plan_table(db, PRIMARY_ALIGNMENT_TABLE, config)?);
     if !config.primary_only && db.has_table(SECONDARY_ALIGNMENT_TABLE) {
-        process_table(SECONDARY_ALIGNMENT_TABLE)?;
+        plans.extend(plan_table(db, SECONDARY_ALIGNMENT_TABLE, config)?);
+    }
+    for plan in &plans {
+        process_table_plan(db, plan, writer, config, progress_interval)?;
+    }
+    Ok(())
+}
+
+/// Process one planned alignment table, preloading references batch by batch.
+fn process_table_plan(
+    db: &VDatabase,
+    plan: &TablePlan,
+    writer: &mut OutputWriter,
+    config: &AlignConfig<'_>,
+    progress_interval: u64,
+) -> Result<()> {
+    let TablePlan { table_name, reflist, work_items } = plan;
+    let table_name = *table_name;
+
+    // Reference lengths for the distinct references, to size preload batches.
+    let mut ref_len_of: HashMap<u32, usize> = HashMap::new();
+    for w in work_items {
+        if let std::collections::hash_map::Entry::Vacant(entry) = ref_len_of.entry(w.ref_idx) {
+            let len = reflist.get(w.ref_idx)?.seq_length()? as usize;
+            entry.insert(len);
+        }
+    }
+    let batches = batch_work_items(work_items, &ref_len_of, ref_preload_budget_bytes());
+    // Only the SECONDARY table can force serial processing. In the align
+    // schema (align.vschema), PRIMARY_ALIGNMENT stores HAS_MISMATCH/MISMATCH
+    // as physical columns (`physical column <INSDC:4na:bin> ... .MISMATCH`),
+    // so reading them never re-enters the reference sub-select — PRIMARY is
+    // race-free on the parallel path by construction. SECONDARY, by
+    // contrast, backs those columns with a TMP_* "hack" column that, when
+    // absent, is generated from a RAW_READ sub-select into PRIMARY, which
+    // does re-enter the unsynchronized reference reconstruction. Detect that
+    // case and process such a SECONDARY table single-threaded.
+    let force_serial =
+        table_name == SECONDARY_ALIGNMENT_TABLE && !secondary_has_physical_mismatch(db);
+    if force_serial && config.num_threads > 1 {
+        eprintln!(
+            "[preload] SECONDARY_ALIGNMENT lacks physical mismatch columns; \
+             processing it single-threaded to avoid a libncbi-vdb data race"
+        );
+    }
+    // One concise summary per table (orchestration layer, not the data
+    // module): distinct references and their total size, plus batch count.
+    let total_ref_bytes: usize = ref_len_of.values().sum();
+    eprintln!(
+        "[preload] {table_name}: {} reference(s), {:.1} MiB, {} batch(es)",
+        ref_len_of.len(),
+        total_ref_bytes as f64 / (1024.0 * 1024.0),
+        batches.len(),
+    );
+    let progress = ProgressLogger::new(work_items.len() as u32, progress_interval);
+
+    for range in batches {
+        let batch = &work_items[range];
+        let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
+        let store = preload_references(reflist, &ref_indices)?;
+        // order_idx is globally contiguous, so the batch's first item's index
+        // is the base the ordered collector starts from — no re-basing needed.
+        let base_order = batch.first().map_or(0, |w| w.order_idx);
+        if config.num_threads <= 1 || force_serial {
+            process_table_sequential(db, table_name, batch, &store, writer, config, &progress)?;
+        } else {
+            process_table_parallel(
+                db, table_name, batch, base_order, &store, writer, config, &progress,
+            )?;
+        }
     }
 
+    progress.complete();
     Ok(())
 }
 
@@ -1065,6 +1330,7 @@ mod tests {
             order_idx,
             ref_idx,
             ref_name: String::new(),
+            bam_ref_id: ref_idx as i32,
             start_row: 0,
             end_row: 0,
             region_filter: None,
@@ -1189,6 +1455,50 @@ mod tests {
             .unwrap();
             let expected = cursor.read_str(row, read_col).unwrap();
             assert_eq!(reconstructed, expected.as_bytes(), "row {row} ref {name} pos {ref_pos}");
+        }
+    }
+
+    /// End-to-end check of boundary discovery on a real table: the runs must
+    /// tile `PRIMARY_ALIGNMENT` and each run's name must match the `REF_NAME` of
+    /// its rows (checked at its ends and at evenly spaced rows). Opt-in via
+    /// `FG_SRA_TEST_ALIGNED_SRA`; most informative on a table stored as several
+    /// separately sorted batches.
+    #[test]
+    fn ref_boundaries_match_ref_name_column() {
+        use fg_sra_vdb::manager::VdbManager;
+        let Ok(sra) = std::env::var("FG_SRA_TEST_ALIGNED_SRA") else {
+            eprintln!("skipping: set FG_SRA_TEST_ALIGNED_SRA to an aligned SRA");
+            return;
+        };
+        let mgr = VdbManager::make_read().expect("make_read");
+        mgr.disable_pagemap_thread().ok();
+        let db = mgr.open_db_read(&sra).expect("open_db");
+        let reflist = ReferenceList::make_database(&db, 0, 0).expect("reflist");
+        let table = db.open_table_read(PRIMARY_ALIGNMENT_TABLE).expect("table");
+        let layout = find_ref_boundaries(&table, &reflist, false, 4).expect("find_ref_boundaries");
+
+        let cursor = table.create_cursor_read().expect("cursor");
+        let ref_name_col = cursor.add_column(col::REF_NAME).unwrap();
+        cursor.open().expect("open");
+        let (first, count) = cursor.id_range(0).expect("id_range");
+
+        let mut runs: Vec<_> =
+            layout.boundaries.iter().map(|b| (b.first_row, b.last_row)).collect();
+        runs.sort_unstable();
+        let mut expected_start = first;
+        for (start, end) in runs {
+            assert_eq!(start, expected_start, "runs must tile the table");
+            expected_start = end + 1;
+        }
+        assert_eq!(expected_start, first + count as i64, "runs must cover every row");
+
+        for b in &layout.boundaries {
+            let step = ((b.last_row - b.first_row) / 100).max(1);
+            let rows = (b.first_row..=b.last_row).step_by(step as usize).chain([b.last_row]);
+            for row in rows {
+                let name = cursor.read_str(row, ref_name_col).unwrap();
+                assert_eq!(name, b.ref_name, "row {row}");
+            }
         }
     }
 
@@ -1401,6 +1711,344 @@ mod tests {
     fn test_parse_region_invalid_numbers() {
         assert!(parse_region("chr1:abc-2000").is_err());
         assert!(parse_region("chr1:1000-xyz").is_err());
+    }
+
+    // ── Reference boundary discovery tests ───────────────────────────────
+
+    /// A synthetic alignment table: each row's `(SortKey, REF_NAME)`, row IDs from 1.
+    ///
+    /// Each batch is a sorted run of `(reference name, row count)` entries. Rows of
+    /// one reference share a `REF_ID` chunk and have increasing positions, so keys
+    /// ascend within a batch (the loader's sort order) and drop at the start of a
+    /// batch that begins at an earlier reference or position.
+    fn synthetic_table(batches: &[&[(&str, usize)]]) -> Vec<(SortKey, String)> {
+        let ordinal = |name: &str| -> i64 {
+            ["1", "2", "3", "4", "X", "GL1"].iter().position(|n| *n == name).unwrap() as i64
+        };
+        let mut rows = Vec::new();
+        for batch in batches {
+            for &(name, count) in *batch {
+                for pos in 0..count {
+                    rows.push(((ordinal(name), pos as i32), name.to_string()));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Run the production segment and run discovery (without VDB) over a
+    /// synthetic table, scanning sort keys in `num_slices` threads.
+    fn discover_runs(rows: &[(SortKey, String)], num_slices: usize) -> Vec<(String, i64, i64)> {
+        let (first, last) = (1, rows.len() as i64);
+        let slices = slice_row_range(first, last, num_slices, 1)
+            .into_iter()
+            .map(|slice| (slice, |row: i64| Ok(rows[(row - 1) as usize].0)))
+            .collect();
+        let segments = find_sorted_segments(first, last, slices).unwrap();
+        find_runs_in_segments(&segments, |row| Ok(rows[(row - 1) as usize].1.clone())).unwrap()
+    }
+
+    /// Assert the runs tile rows `1..=len` in order and label every row correctly.
+    fn assert_runs_label_every_row(rows: &[(SortKey, String)], runs: &[(String, i64, i64)]) {
+        let mut expected_start = 1;
+        for (name, first, last) in runs {
+            assert_eq!(*first, expected_start, "runs must tile the table");
+            for row in *first..=*last {
+                assert_eq!(&rows[(row - 1) as usize].1, name, "row {row} mislabeled");
+            }
+            expected_start = last + 1;
+        }
+        assert_eq!(expected_start, rows.len() as i64 + 1, "runs must cover every row");
+    }
+
+    #[test]
+    fn test_find_descents_ignores_equal_and_rising_keys() {
+        let keys = [(0, 1), (0, 1), (0, 2), (1, 0), (1, 0), (2, 5)];
+        let probe = |row: i64| Ok(keys[row as usize]);
+        assert!(find_descents_in_slice(0, 0, 5, 10, probe).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_find_descents_reports_drops_in_ref_id_and_position() {
+        // Row 2 drops in REF_ID; row 4 drops in position within the same REF_ID.
+        let keys = [(3, 0), (4, 9), (1, 2), (1, 7), (1, 3)];
+        let probe = |row: i64| Ok(keys[row as usize]);
+        assert_eq!(find_descents_in_slice(0, 0, 4, 10, probe).unwrap(), vec![2, 4]);
+    }
+
+    #[test]
+    fn test_find_descents_in_slice_detects_drop_at_slice_start() {
+        // Row 3 drops below row 2; a slice starting at row 3 must still see it.
+        let keys = [(0, 0), (5, 0), (6, 0), (1, 0), (2, 0)];
+        let probe = |row: i64| Ok(keys[row as usize]);
+        assert_eq!(find_descents_in_slice(0, 3, 4, 10, probe).unwrap(), vec![3]);
+        // The table's first row has no predecessor and is never a descent.
+        assert!(find_descents_in_slice(0, 0, 2, 10, probe).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_find_descents_rejects_unsorted_table() {
+        let keys = [(3, 0), (2, 0), (1, 0), (0, 0)];
+        let probe = |row: i64| Ok(keys[row as usize]);
+        // Two descents are allowed; the third fails.
+        assert_eq!(find_descents_in_slice(0, 0, 2, 2, probe).unwrap(), vec![1, 2]);
+        let err = find_descents_in_slice(0, 0, 3, 2, probe).unwrap_err();
+        assert!(err.to_string().contains("not sorted by reference"), "{err}");
+    }
+
+    #[test]
+    fn test_slice_row_range_tiles_range() {
+        assert_eq!(slice_row_range(1, 10, 3, 1), vec![(1, 4), (5, 8), (9, 10)]);
+        assert_eq!(slice_row_range(1, 10, 1, 1), vec![(1, 10)]);
+        // More slices than rows: one row per slice.
+        assert_eq!(slice_row_range(5, 7, 8, 1), vec![(5, 5), (6, 6), (7, 7)]);
+        // The minimum slice size caps the number of slices.
+        assert_eq!(slice_row_range(1, 10, 8, 5), vec![(1, 5), (6, 10)]);
+        assert_eq!(slice_row_range(1, 9, 8, 5), vec![(1, 9)]);
+        assert_eq!(slice_row_range(1, 3, 8, 5), vec![(1, 3)]);
+        assert_eq!(slice_row_range(1, 10, 0, 1), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn test_find_sorted_segments_splits_at_descents() {
+        let keys = [(0, 0), (0, 1), (1, 0), (0, 5), (1, 1), (0, 0)];
+        for num_slices in 1..=keys.len() {
+            let slices = slice_row_range(1, 6, num_slices, 1)
+                .into_iter()
+                .map(|slice| (slice, |row: i64| Ok(keys[(row - 1) as usize])))
+                .collect();
+            let segments = find_sorted_segments(1, 6, slices).unwrap();
+            assert_eq!(segments, vec![(1, 3), (4, 5), (6, 6)], "{num_slices} slices");
+        }
+    }
+
+    #[test]
+    fn test_discover_runs_single_batch() {
+        let rows = synthetic_table(&[&[("1", 5), ("2", 3), ("X", 1)]]);
+        let runs = discover_runs(&rows, 2);
+        assert_eq!(runs, [("1".into(), 1, 5), ("2".into(), 6, 8), ("X".into(), 9, 9)]);
+    }
+
+    #[test]
+    fn test_discover_runs_two_sorted_batches() {
+        // A table loaded as two separately sorted batches stores each reference
+        // twice. Every row must be labeled with its own reference. Batch 2's "1"
+        // spans the table's midpoint, so a binary search over the whole table
+        // would land in it and label batch 1's "2" and "3" rows as "1".
+        let rows = synthetic_table(&[
+            &[("1", 10), ("2", 10), ("3", 10)],
+            &[("1", 60), ("2", 5), ("3", 5), ("GL1", 2)],
+        ]);
+        for num_slices in 1..=8 {
+            let runs = discover_runs(&rows, num_slices);
+            let names: Vec<_> = runs.iter().map(|r| r.0.as_str()).collect();
+            assert_eq!(names, ["1", "2", "3", "1", "2", "3", "GL1"], "{num_slices} slices");
+            assert_runs_label_every_row(&rows, &runs);
+        }
+    }
+
+    #[test]
+    fn test_discover_runs_varied_batch_layouts() {
+        let layouts: &[&[&[(&str, usize)]]] = &[
+            // Later batch covers only later references (no descent).
+            &[&[("1", 10), ("2", 10)], &[("3", 10), ("X", 10)]],
+            // Later batch covers only earlier references.
+            &[&[("3", 10), ("X", 10)], &[("1", 10), ("2", 10)]],
+            // Single-row references and a one-row batch.
+            &[&[("1", 1), ("2", 1), ("3", 1)], &[("2", 1)], &[("1", 1), ("X", 1)]],
+            // The same reference ends one batch and restarts the next at an
+            // earlier position (a descent in position only).
+            &[&[("1", 10), ("2", 10)], &[("2", 10), ("3", 10)]],
+            // Three batches.
+            &[&[("1", 7), ("4", 3)], &[("1", 2), ("2", 9)], &[("1", 4), ("X", 6)]],
+        ];
+        for layout in layouts {
+            let rows = synthetic_table(layout);
+            for num_slices in 1..=rows.len() {
+                assert_runs_label_every_row(&rows, &discover_runs(&rows, num_slices));
+            }
+        }
+    }
+
+    #[test]
+    fn test_discover_runs_detects_batch_restart_within_a_reference() {
+        // Batch 2 restarts reference "2" at position 0, which REF_ID alone would
+        // not reveal; "2" must come back as two runs.
+        let rows = synthetic_table(&[&[("1", 4), ("2", 4)], &[("2", 4), ("3", 4)]]);
+        let runs = discover_runs(&rows, 3);
+        assert_eq!(
+            runs,
+            [("1".into(), 1, 4), ("2".into(), 5, 8), ("2".into(), 9, 12), ("3".into(), 13, 16)]
+        );
+    }
+
+    /// A boundary for reference `ref_idx` named `chr{ref_idx}`.
+    fn boundary(ref_idx: u32, first_row: i64, last_row: i64) -> RefBoundary {
+        RefBoundary { ref_idx, ref_name: format!("chr{ref_idx}"), first_row, last_row }
+    }
+
+    #[test]
+    fn test_group_runs_by_reference() {
+        // Table order: 2, 1, 2, 3, 1, 2 -> grouped 1, 1, 2, 2, 2, 3; 1 and 2 split.
+        let runs = vec![
+            boundary(2, 1, 10),
+            boundary(1, 11, 20),
+            boundary(2, 21, 30),
+            boundary(3, 31, 40),
+            boundary(1, 41, 50),
+            boundary(2, 51, 60),
+        ];
+        let (grouped, split) = group_runs_by_reference(runs);
+        let got: Vec<_> = grouped.iter().map(|b| (b.ref_idx, b.first_row)).collect();
+        assert_eq!(got, [(1, 11), (1, 41), (2, 1), (2, 21), (2, 51), (3, 31)]);
+        assert_eq!(split, ["chr1", "chr2"], "each split reference is listed once");
+    }
+
+    #[test]
+    fn test_group_runs_by_reference_restores_reference_order() {
+        // Disjoint batches out of reference order: no reference is split, so the
+        // grouped output is fully in reference order.
+        let runs = vec![boundary(3, 1, 10), boundary(4, 11, 20), boundary(0, 21, 30)];
+        let (grouped, split) = group_runs_by_reference(runs);
+        let got: Vec<_> = grouped.iter().map(|b| b.ref_idx).collect();
+        assert_eq!(got, [0, 3, 4]);
+        assert!(split.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_bam_ref_id_uses_header_map() {
+        // Header order differs from the ReferenceList index.
+        let map = HashMap::from([("chr2".to_string(), 0), ("chr1".to_string(), 1)]);
+        assert_eq!(resolve_bam_ref_id(Some(&map), "chr1", 0).unwrap(), 1);
+        assert_eq!(resolve_bam_ref_id(Some(&map), "chr2", 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resolve_bam_ref_id_missing_from_header_is_error() {
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let err = resolve_bam_ref_id(Some(&map), "chrZ", 7).unwrap_err();
+        assert!(err.to_string().contains("'chrZ' has alignments but no @SQ line"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_bam_ref_id_without_header_uses_reflist_index() {
+        assert_eq!(resolve_bam_ref_id(None, "chr1", 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_assign_bam_ref_ids() {
+        let mut items = vec![wi(0), wi(1), wi(0)];
+        for item in &mut items {
+            item.ref_name = format!("chr{}", item.ref_idx);
+        }
+        let map = HashMap::from([("chr1".to_string(), 0), ("chr0".to_string(), 1)]);
+        assign_bam_ref_ids(&mut items, Some(&map)).unwrap();
+        let ids: Vec<_> = items.iter().map(|w| w.bam_ref_id).collect();
+        assert_eq!(ids, [1, 0, 1]);
+    }
+
+    /// Boundaries for references `chr0..chr{n-1}`, 10 rows each.
+    fn boundaries_for(n: u32) -> Vec<RefBoundary> {
+        (0..n).map(|i| boundary(i, i64::from(i) * 10 + 1, i64::from(i) * 10 + 10)).collect()
+    }
+
+    /// A `ref_idx_of` for region tests: resolves `NC_<i>` to index `i`.
+    fn seqid_to_idx(name: &str) -> Result<u32> {
+        name.strip_prefix("NC_")
+            .and_then(|i| i.parse().ok())
+            .with_context(|| format!("reference not found: {name}"))
+    }
+
+    #[test]
+    fn test_assign_bam_ref_ids_needs_only_output_references() {
+        // The table has chr0..chr4 but only chr4 is output (one --aligned-region);
+        // a header listing only chr4 must suffice.
+        let boundaries = boundaries_for(5);
+        let regions = ["chr4".to_string()];
+        let mut items =
+            collect_row_range_region_work_items(&boundaries, &regions, seqid_to_idx, 1).unwrap();
+        let map = HashMap::from([("chr4".to_string(), 0)]);
+        assign_bam_ref_ids(&mut items, Some(&map)).unwrap();
+        assert_eq!(items.iter().map(|w| w.bam_ref_id).collect::<Vec<_>>(), [0]);
+        // Whereas resolving every reference in the table fails.
+        let mut all = collect_row_range_work_items(&boundaries, 1);
+        assert!(assign_bam_ref_ids(&mut all, Some(&map)).is_err());
+    }
+
+    #[test]
+    fn test_region_work_items_cover_every_run_of_a_split_reference() {
+        let boundaries = vec![
+            boundary(0, 1, 10),
+            boundary(0, 31, 40),
+            boundary(1, 11, 20),
+            boundary(1, 41, 50),
+            boundary(2, 21, 30),
+        ];
+        let regions = ["chr1:5-100".to_string()];
+        let items =
+            collect_row_range_region_work_items(&boundaries, &regions, seqid_to_idx, 1).unwrap();
+        let got: Vec<_> =
+            items.iter().map(|w| (w.ref_idx, w.start_row, w.end_row, w.region_filter)).collect();
+        assert_eq!(got, [(1, 11, 20, Some((4, 100))), (1, 41, 50, Some((4, 100)))]);
+    }
+
+    #[test]
+    fn test_region_work_items_resolve_alternate_name() {
+        let boundaries = vec![boundary(0, 1, 10), boundary(1, 11, 20), boundary(1, 21, 30)];
+        let regions = ["NC_1".to_string()];
+        let items =
+            collect_row_range_region_work_items(&boundaries, &regions, seqid_to_idx, 1).unwrap();
+        let got: Vec<_> = items.iter().map(|w| (w.start_row, w.end_row)).collect();
+        assert_eq!(got, [(11, 20), (21, 30)]);
+    }
+
+    #[test]
+    fn test_region_work_items_errors() {
+        let boundaries = boundaries_for(2);
+        // Known reference without alignments.
+        let err =
+            collect_row_range_region_work_items(&boundaries, &["NC_7".into()], seqid_to_idx, 1)
+                .unwrap_err();
+        assert!(err.to_string().contains("no alignments found for reference: NC_7"), "{err}");
+        // Unknown reference.
+        let err =
+            collect_row_range_region_work_items(&boundaries, &["chrZ".into()], seqid_to_idx, 1)
+                .unwrap_err();
+        assert!(err.to_string().contains("reference not found: chrZ"), "{err}");
+    }
+
+    #[test]
+    fn test_split_layout_warning() {
+        let layout = |split: &[&str]| RefLayout {
+            boundaries: Vec::new(),
+            num_sorted_segments: 3,
+            split_references: split.iter().map(ToString::to_string).collect(),
+        };
+        assert_eq!(
+            split_layout_warning("T", &layout(&["1", "2"])),
+            "T is stored as 3 separately sorted row ranges; alignments for 2 reference(s) \
+             (1, 2) are grouped by reference but are not coordinate-sorted within those \
+             references"
+        );
+    }
+
+    #[test]
+    fn test_abbreviate_names() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+        assert_eq!(abbreviate_names(&names, 5), "a, b, c");
+        assert_eq!(abbreviate_names(&names, 3), "a, b, c");
+        assert_eq!(abbreviate_names(&names, 2), "a, b, and 1 more");
+        assert_eq!(abbreviate_names(&[], 2), "");
+    }
+
+    #[test]
+    fn test_collect_row_range_split_reference_keeps_run_labels() {
+        // Two runs of chr0 (grouped by reference) then a run of chr1.
+        let boundaries = vec![boundary(0, 1, 100), boundary(0, 201, 300), boundary(1, 101, 200)];
+        let items = collect_row_range_work_items(&boundaries, 1);
+        let got: Vec<_> =
+            items.iter().map(|w| (w.ref_name.as_str(), w.start_row, w.end_row)).collect();
+        assert_eq!(got, [("chr0", 1, 100), ("chr0", 201, 300), ("chr1", 101, 200)]);
     }
 
     // ── Row-range work item tests ────────────────────────────────────────
