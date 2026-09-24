@@ -306,7 +306,7 @@ impl ToSam {
 
         // Build ref_name → ref_id map for BAM output.
         let ref_name_to_id = if output_mode == crate::record::OutputMode::Bam {
-            header_text.as_deref().map(crate::output::build_ref_name_to_id)
+            header_text.as_deref().map(|h| crate::header::build_ref_id_map(&db, h)).transpose()?
         } else {
             None
         };
