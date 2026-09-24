@@ -33,7 +33,9 @@ pub enum Command {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
 pub struct ToSam {
-    /// SRA accession(s) or file path(s) to convert.
+    /// SRA accession(s) or file path(s) to convert. Several accessions are
+    /// written, in order, to one output; BAM output takes a single accession,
+    /// and SAM output of several accessions requires `--no-header`.
     #[arg(required = true)]
     pub accessions: Vec<String>,
 
@@ -284,11 +286,47 @@ impl CacheRefs {
 
 impl ToSam {
     /// Run the conversion with the parsed CLI options.
+    ///
+    /// All accessions are written, in order, to one output (`--output-file` or
+    /// stdout). A header cannot follow records, so several accessions need output
+    /// without one: BAM output takes a single accession, and SAM output requires
+    /// `--no-header` (FASTA/FASTQ have no header).
     pub fn execute(&self) -> Result<()> {
-        for accession in &self.accessions {
-            self.process_accession(accession)?;
+        self.validate()?;
+        let Some((first, rest)) = self.accessions.split_first() else {
+            anyhow::bail!("no accessions given");
+        };
+        // Open the first accession before creating the output, so that an
+        // accession that cannot be opened does not truncate an existing file.
+        let first_db = open_database(first)?;
+        let mut writer = self.create_writer()?;
+        self.process_database(&first_db, &mut writer)?;
+        drop(first_db);
+        for accession in rest {
+            self.process_database(&open_database(accession)?, &mut writer)?;
         }
-        Ok(())
+        writer.finish()
+    }
+
+    /// Reject option combinations that cannot produce valid output, before any
+    /// work is done.
+    fn validate(&self) -> Result<()> {
+        let num_accessions = self.accessions.len();
+        if num_accessions == 1 {
+            return Ok(());
+        }
+        match self.output_mode() {
+            crate::record::OutputMode::Bam => anyhow::bail!(
+                "BAM output takes a single accession ({num_accessions} given): concatenated BAM \
+                 streams are not a valid BAM; convert each accession separately"
+            ),
+            crate::record::OutputMode::Sam if !self.no_header => anyhow::bail!(
+                "SAM output of several accessions ({num_accessions} given) would put each \
+                 accession's header after the previous accession's records; pass --no-header or \
+                 convert each accession separately"
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// The record format selected by the output options.
@@ -304,39 +342,43 @@ impl ToSam {
         }
     }
 
-    /// Process a single SRA accession or file path.
-    fn process_accession(&self, accession: &str) -> Result<()> {
+    /// Open the output (`--output-file` or stdout) for the selected format.
+    fn create_writer(&self) -> Result<crate::output::OutputWriter> {
+        use crate::output::{CompressionMode, OutputWriter};
+        if self.output_mode() == crate::record::OutputMode::Bam {
+            return Ok(match &self.output_file {
+                Some(path) => OutputWriter::bam_from_path(path)?,
+                None => OutputWriter::bam_stdout(),
+            });
+        }
+        let compression = if self.gzip {
+            CompressionMode::Gzip
+        } else if self.bzip2 {
+            CompressionMode::Bzip2
+        } else {
+            CompressionMode::None
+        };
+        Ok(match &self.output_file {
+            Some(path) => OutputWriter::from_path_with_compression(path, compression)?,
+            None => OutputWriter::stdout_with_compression(compression),
+        })
+    }
+
+    /// Convert a single opened SRA database, writing to `writer`.
+    fn process_database(
+        &self,
+        db: &VDatabase,
+        writer: &mut crate::output::OutputWriter,
+    ) -> Result<()> {
         use crate::aligned::{AlignConfig, plan_aligned_tables, process_aligned_plan};
         use crate::header::generate_header;
-        use crate::output::OutputWriter;
         use crate::progress::ProgressLogger;
         use crate::record::FormatOptions;
         use crate::unaligned::process_unaligned_reads;
 
         const PROGRESS_INTERVAL: u64 = 1_000_000;
 
-        let db = open_database(accession)?;
-
         let output_mode = self.output_mode();
-
-        let mut writer = if output_mode == crate::record::OutputMode::Bam {
-            match &self.output_file {
-                Some(path) => OutputWriter::bam_from_path(path)?,
-                None => OutputWriter::bam_stdout(),
-            }
-        } else {
-            let compression = if self.gzip {
-                crate::output::CompressionMode::Gzip
-            } else if self.bzip2 {
-                crate::output::CompressionMode::Bzip2
-            } else {
-                crate::output::CompressionMode::None
-            };
-            match &self.output_file {
-                Some(path) => OutputWriter::from_path_with_compression(path, compression)?,
-                None => OutputWriter::stdout_with_compression(compression),
-            }
-        };
 
         // Generate the header for SAM and BAM modes.
         let header_text = if !self.no_header
@@ -346,7 +388,7 @@ impl ToSam {
             ) {
             // Written once the aligned output order is known (below).
             Some(generate_header(
-                &db,
+                db,
                 self.header,
                 self.seqid,
                 &self.header_comment,
@@ -358,7 +400,7 @@ impl ToSam {
 
         // Build ref_name → ref_id map for BAM output.
         let ref_name_to_id = if output_mode == crate::record::OutputMode::Bam {
-            header_text.as_deref().map(|h| crate::header::build_ref_id_map(&db, h)).transpose()?
+            header_text.as_deref().map(|h| crate::header::build_ref_id_map(db, h)).transpose()?
         } else {
             None
         };
@@ -396,12 +438,12 @@ impl ToSam {
         let aligned_plan = if self.unaligned_spots_only {
             None
         } else {
-            Some(plan_aligned_tables(&db, &align_config)?)
+            Some(plan_aligned_tables(db, &align_config)?)
         };
         if let Some(header) = &header_text {
             write_header_for_output(
-                &db,
-                &mut writer,
+                db,
+                writer,
                 header,
                 aligned_plan.as_ref(),
                 ref_name_to_id.as_ref(),
@@ -409,22 +451,21 @@ impl ToSam {
         }
 
         if let Some(plan) = &aligned_plan {
-            process_aligned_plan(&db, plan, &mut writer, &align_config, PROGRESS_INTERVAL)?;
+            process_aligned_plan(db, plan, writer, &align_config, PROGRESS_INTERVAL)?;
         }
 
         // Unaligned reads (if requested).
         if self.unaligned || self.unaligned_spots_only {
             let unaligned_progress = ProgressLogger::new(0, PROGRESS_INTERVAL);
             process_unaligned_reads(
-                &db,
-                &mut writer,
+                db,
+                writer,
                 &opts,
                 self.unaligned_spots_only,
                 &unaligned_progress,
             )?;
         }
 
-        writer.finish()?;
         Ok(())
     }
 }
@@ -628,5 +669,59 @@ mod tests {
     fn test_missing_accession_fails() {
         let result = Cli::try_parse_from(["fg-sra", "tosam"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bam_with_several_accessions_is_rejected() {
+        for args in [
+            &["--output-format", "bam", "SRR1", "SRR2"][..],
+            &["--output-format", "bam", "--output-file", "out.bam", "SRR1", "SRR2"][..],
+            &["--output-format", "bam", "--gzip", "SRR1", "SRR2"][..],
+            &["--output-format", "bam", "--no-header", "SRR1", "SRR2"][..],
+        ] {
+            let err = parse(args).validate().unwrap_err();
+            assert!(err.to_string().contains("BAM output takes a single accession (2 given)"));
+        }
+    }
+
+    #[test]
+    fn test_sam_with_several_accessions_needs_no_header() {
+        for args in [&["SRR1", "SRR2"][..], &["--output-file", "out.sam", "SRR1", "SRR2"][..]] {
+            let err = parse(args).validate().unwrap_err();
+            assert!(err.to_string().contains("pass --no-header"), "{err}");
+        }
+        parse(&["--no-header", "--output-file", "out.sam", "SRR1", "SRR2"]).validate().unwrap();
+    }
+
+    #[test]
+    fn test_single_or_headerless_accessions_are_accepted() {
+        parse(&["--output-format", "bam", "--output-file", "out.bam", "SRR1"]).validate().unwrap();
+        parse(&["--output-file", "out.sam", "SRR1"]).validate().unwrap();
+        parse(&["--fastq", "--output-file", "out.fq", "SRR1", "SRR2"]).validate().unwrap();
+        parse(&["--fasta", "SRR1", "SRR2", "SRR3"]).validate().unwrap();
+    }
+
+    #[test]
+    fn test_unopenable_accession_leaves_existing_output_file_untouched() {
+        let dir = std::env::temp_dir().join(format!("fg-sra-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("existing.sam");
+        std::fs::write(&output, "keep me\n").unwrap();
+        let missing = dir.join("missing.sra");
+        let result = parse(&["--output-file", output.to_str().unwrap(), missing.to_str().unwrap()])
+            .execute();
+        let contents = std::fs::read_to_string(&output).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+        assert_eq!(contents, "keep me\n");
+    }
+
+    #[test]
+    fn test_output_mode() {
+        use crate::record::OutputMode;
+        assert_eq!(parse(&["SRR1"]).output_mode(), OutputMode::Sam);
+        assert_eq!(parse(&["--output-format", "bam", "SRR1"]).output_mode(), OutputMode::Bam);
+        assert_eq!(parse(&["--fasta", "SRR1"]).output_mode(), OutputMode::Fasta);
+        assert_eq!(parse(&["--fastq", "SRR1"]).output_mode(), OutputMode::Fastq);
     }
 }
