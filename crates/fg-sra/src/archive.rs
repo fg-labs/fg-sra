@@ -140,6 +140,12 @@ impl Archive {
         self.first_spot + self.spot_count as i64 - 1
     }
 
+    /// Open the archive's database with a fresh manager, e.g. for a reference loader;
+    /// fails for a flat table.
+    pub fn open_database(&self) -> Result<VDatabase> {
+        Ok(new_manager()?.open_db_read(&self.location)?)
+    }
+
     /// Open the reads table with a fresh manager.
     pub fn open_table(&self) -> Result<OpenTable> {
         let manager = new_manager()?;
@@ -149,6 +155,20 @@ impl Archive {
         };
         open_table(manager, database, &self.location, self.table.as_deref(), &self.location)
     }
+}
+
+/// Stack for each thread that calls libncbi-vdb, whose schema evaluation recurses deeply on
+/// some archives; fasterq-dump gives its threads 16 MiB after overflowing smaller ones. Rust's
+/// default is 2 MiB.
+pub const VDB_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether `table`'s metadata marks its bases as RNA (`RNA_FLAG` starting `1`, as the schema's
+/// `NCBI:SRA:useRnaFlag` reads it).
+pub fn marks_rna(table: &VTable) -> bool {
+    let Ok(metadata) = table.open_metadata_read() else { return false };
+    let Ok(node) = metadata.open_node_read("RNA_FLAG") else { return false };
+    let mut flag = [0u8; 1];
+    node.read(0, &mut flag).is_ok_and(|(read, _)| read == 1 && flag[0] == b'1')
 }
 
 /// A reads table opened with its own manager. Cursors on it may be used on other threads
@@ -252,7 +272,7 @@ pub fn default_table(tables: &[String]) -> &'static str {
 
 /// A local path made absolute, else the input as given. VDB tries a bare name without `/`
 /// as an accession first, asking the network, so local files must not be passed bare.
-fn vdb_location(input: &str) -> Result<String> {
+pub fn vdb_location(input: &str) -> Result<String> {
     let path = Path::new(input);
     if !path.exists() {
         return Ok(input.to_owned());

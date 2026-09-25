@@ -17,7 +17,7 @@ use crate::matecache::{MateCache, MateInfo};
 use crate::output::OutputWriter;
 use crate::progress::ProgressLogger;
 use crate::record::{AlignedColumns, FormatOptions, format_aligned_record};
-use crate::refstore::{ReferenceStore, preload_references, ref_window_len};
+use crate::refstore::{MAX_REFERENCE_LOADERS, ReferenceLoaders, ReferenceStore, ref_window_len};
 use crate::restore_read::restore_read;
 
 /// VDB table name for primary alignments.
@@ -41,6 +41,9 @@ pub struct AlignConfig<'a> {
     pub opts: &'a FormatOptions<'a>,
     /// Genomic regions to restrict output to. Empty means all references.
     pub regions: &'a [String],
+    /// Opens the database again, for each thread that preloads references in
+    /// parallel.
+    pub reopen: &'a (dyn Fn() -> Result<VDatabase> + Sync),
 }
 
 impl AlignConfig<'_> {
@@ -693,10 +696,9 @@ fn process_row_range(
 /// Default reference-preload budget: bound peak memory by processing work items
 /// in reference batches whose sequences sum to at most this many bytes.
 ///
-/// The budget counts the persisted (ASCII-mapped) reference bytes. Preloading a
-/// single reference also transiently holds its raw 4na buffer, so momentary peak
-/// RSS during a batch can exceed the budget by roughly the largest single
-/// reference in it.
+/// The budget counts the preloaded (ASCII-mapped) reference bytes; each reference
+/// is mapped in place as it is read, so it is never held twice. Loading on several
+/// threads adds each loader's own reference reader and its caches on top.
 const REF_PRELOAD_BUDGET_BYTES: usize = 1 << 30; // 1 GiB
 
 /// The reference-preload budget in bytes, overridable via the
@@ -928,11 +930,18 @@ pub fn process_aligned_plan(
     config: &AlignConfig<'_>,
     progress_interval: u64,
 ) -> Result<()> {
+    // One set of loaders serves every table and batch, so the archive is opened again
+    // at most once per loader.
+    let mut loaders =
+        ReferenceLoaders::new(config.num_threads.min(MAX_REFERENCE_LOADERS), config.reopen);
     for table in &plan.tables {
-        process_table_plan(db, table, writer, config, progress_interval)?;
+        process_table_plan(db, table, writer, config, &mut loaders, progress_interval)?;
     }
     Ok(())
 }
+
+/// Reference loaders reading through the archive reopened by [`AlignConfig::reopen`].
+type TosamLoaders<'a> = ReferenceLoaders<&'a (dyn Fn() -> Result<VDatabase> + Sync)>;
 
 /// Process one planned alignment table, preloading references batch by batch.
 fn process_table_plan(
@@ -940,6 +949,7 @@ fn process_table_plan(
     plan: &TablePlan,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
+    loaders: &mut TosamLoaders<'_>,
     progress_interval: u64,
 ) -> Result<()> {
     let TablePlan { table_name, reflist, work_items, .. } = plan;
@@ -985,7 +995,7 @@ fn process_table_plan(
     for range in batches {
         let batch = &work_items[range];
         let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
-        let store = preload_references(reflist, &ref_indices)?;
+        let store = loaders.preload(reflist, &ref_indices)?;
         // order_idx is globally contiguous, so the batch's first item's index
         // is the base the ordered collector starts from — no re-basing needed.
         let base_order = batch.first().map_or(0, |w| w.order_idx);
@@ -1367,6 +1377,7 @@ mod tests {
 
     use super::*;
     use crate::record::FormatOptions;
+    use crate::refstore::preload_references;
 
     /// Build an `AlignConfig` with the given thread count for testing.
     fn test_config(num_threads: usize) -> AlignConfig<'static> {
@@ -1389,6 +1400,7 @@ mod tests {
             pool_size_override: None,
             opts: &OPTS,
             regions: &[],
+            reopen: &|| anyhow::bail!("tests do not preload references"),
         }
     }
 

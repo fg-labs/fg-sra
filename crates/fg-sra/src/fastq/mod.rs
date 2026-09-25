@@ -20,7 +20,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bgzf::CompressionLevel;
 use clap::{ArgGroup, Parser, ValueEnum};
 use fg_sra_vdb::database::{VDatabase, VTable};
@@ -30,14 +30,11 @@ use fg_sra_vdb::reference::{ReferenceList, reflist_options};
 use crate::archive::{Archive, CONSENSUS_TABLE, QualitySource, default_accession};
 use crate::pending_file::{FileIdentity, PendingFile};
 use crate::progress::{ProgressLogger, format_count};
-use crate::refstore::{ReferenceRows, ReferenceStore, preload_references, split_by_length};
+use crate::refstore::{MAX_REFERENCE_LOADERS, ReferenceLoaders, ReferenceRows, ReferenceStore};
 use counts::FastqMetrics;
 use defline::Defline;
 use format::RecordFormatter;
-use pipeline::{
-    BATCH_SPOTS, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig,
-    VDB_THREAD_STACK_BYTES,
-};
+use pipeline::{BATCH_SPOTS, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig};
 use prefetch::PrefetchedReads;
 use reader::{ReadColumns, References, SpotSource, VdbSpotReader};
 use spot::{ReadFilter, SpotRouter};
@@ -50,9 +47,6 @@ const TECHNICAL_PLACEHOLDER: &str = "{i}";
 
 /// Spots between progress lines on stderr.
 const PROGRESS_INTERVAL: u64 = 10_000_000;
-
-/// At most this many threads load references, each with its own VDB manager.
-const MAX_REFERENCE_LOADERS: usize = 8;
 
 /// Convert an SRA archive to FASTQ (or FASTA), in spot order, with mates paired.
 ///
@@ -505,7 +499,8 @@ impl OutputCompression {
     }
 }
 
-/// Load every reference of `database`, `archive`'s, into memory on up to `threads` threads,
+/// Load every reference of `database`, `archive`'s, into memory on up to `threads` threads
+/// (at most [`MAX_REFERENCE_LOADERS`], and one when built against a system ncbi-vdb),
 /// and which `REFERENCE` rows each covers, before any worker reads alignments.
 ///
 /// A reference list and the references it opens aren't safe to share between threads, so each
@@ -521,52 +516,10 @@ fn load_references(
     let reflist = ReferenceList::make_database(database, reflist_options::READ_4NA, 0)
         .context("failed to list the archive's references")?;
     let rows = ReferenceRows::new(&reflist, reference_row_length(database)?)?;
-    let lengths = (0..reflist.count()?)
-        .map(|idx| Ok((idx, u64::from(reflist.get(idx)?.seq_length()?))))
-        .collect::<Result<Vec<_>>>()?;
-    let groups = split_by_length(&lengths, threads.min(MAX_REFERENCE_LOADERS));
-    let store = if groups.len() <= 1 {
-        preload_references(&reflist, &groups.concat())
-    } else {
-        let opened = groups.iter().map(|_| archive.open_table()).collect::<Result<Vec<_>>>()?;
-        std::thread::scope(|scope| {
-            let loaders = opened
-                .into_iter()
-                .zip(&groups)
-                .map(|(open, indices)| {
-                    std::thread::Builder::new().stack_size(VDB_THREAD_STACK_BYTES).spawn_scoped(
-                        scope,
-                        move || {
-                            let load = || -> Result<ReferenceStore> {
-                                let database =
-                                    open.database().context("the archive has no database")?;
-                                let reflist = ReferenceList::make_database(
-                                    database,
-                                    reflist_options::READ_4NA,
-                                    0,
-                                )?;
-                                preload_references(&reflist, indices)
-                            };
-                            (load(), open)
-                        },
-                    )
-                })
-                .collect::<std::io::Result<Vec<_>>>()
-                .context("failed to start a reference loader")?;
-            // Managers are released only once every loader has finished: in ncbi-vdb before
-            // VDB-6280 (the vendored copy is patched), releasing one frees a process-wide string
-            // that the other loaders' resolvers read.
-            let (stores, _managers): (Vec<_>, Vec<_>) = loaders
-                .into_iter()
-                .map(|loader| match loader.join() {
-                    Ok((store, open)) => (store, Some(open)),
-                    Err(_) => (Err(anyhow!("a reference loader panicked")), None),
-                })
-                .unzip();
-            stores.into_iter().collect::<Result<Vec<_>>>()
-        })
-        .map(ReferenceStore::merge)
-    };
+    let indices: Vec<u32> = (0..reflist.count()?).collect();
+    let store =
+        ReferenceLoaders::new(threads.min(MAX_REFERENCE_LOADERS), || archive.open_database())
+            .preload(&reflist, &indices);
     let store = store.context(
         "failed to load the archive's references; external ones must be available locally \
          (e.g. beside the archive, as `prefetch` puts them) or, without --offline, over the \

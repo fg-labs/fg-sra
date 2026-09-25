@@ -21,6 +21,7 @@ use super::counts::SpotCounts;
 use super::format::RecordFormatter;
 use super::reader::SpotSource;
 use super::spot::{SpotOutcome, SpotRouter};
+use crate::archive::VDB_THREAD_STACK_BYTES;
 use crate::pending_file::PendingFile;
 use crate::progress::ProgressLogger;
 
@@ -29,11 +30,6 @@ use crate::progress::ProgressLogger;
 /// identical at any thread count. A multiple of 8,192, the rows per blob in archives loaded
 /// from FASTQ, so that no blob is decoded by two workers.
 pub const BATCH_SPOTS: i64 = 16_384;
-
-/// Stack for each thread that calls libncbi-vdb, whose schema evaluation recurses deeply on
-/// some archives; fasterq-dump gives its threads 16 MiB after overflowing smaller ones. Rust's
-/// default is 2 MiB.
-pub const VDB_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Size of each writer's output buffer.
 const WRITE_BUFFER_BYTES: usize = 256 * 1024;

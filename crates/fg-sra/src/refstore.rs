@@ -1,26 +1,35 @@
-//! In-memory reference sequences, preloaded single-threaded, for reconstructing
-//! aligned reads on worker threads without touching the VDB `REFERENCE` table.
+//! In-memory reference sequences, preloaded before any worker starts, for
+//! reconstructing aligned reads on worker threads without touching the VDB
+//! `REFERENCE` table.
 //!
 //! Reading the virtual `READ` column makes libncbi-vdb reconstruct through an
 //! internal reference sub-cursor whose blob cache is not thread-safe. Instead we
-//! load every needed reference into memory once (on the main thread, via the
-//! serial [`ReferenceObj`] reader), converted to the `(ascii)READ` alphabet, and
-//! hand workers a `&ReferenceStore` (plain `Vec<u8>`s — `Sync`) to slice.
+//! load every needed reference into memory once, converted to the `(ascii)READ`
+//! alphabet, and hand workers a `&ReferenceStore` (plain `Vec<u8>`s — `Sync`) to
+//! slice. References are loaded through the [`ReferenceObj`] reader, on one thread
+//! ([`preload_references`]) or on several, each with its own reader
+//! ([`ReferenceLoaders`]).
 
 use std::fmt;
 
-use anyhow::{Context, Result};
-use fg_sra_vdb::reference::{ReferenceList, ReferenceObj};
+use anyhow::{Context, Result, anyhow};
+use fg_sra_vdb::database::VDatabase;
+use fg_sra_vdb::reference::{ReferenceList, ReferenceObj, reflist_options};
 use rustc_hash::FxHashMap;
 
 /// The `INSDC:4na:map:CHARSET`: index by 4na code (`0..=15`); code 0 renders `.`.
 pub(crate) const CHARSET_4NA: &[u8; 16] = b".ACMGRSVTWYHKDBN";
 
-/// Map `INSDC:4na:bin` codes to the CHARSET ASCII alphabet, in place into `dst`.
-pub fn map_4na_to_ascii(src: &[u8], dst: &mut Vec<u8>) {
-    dst.clear();
-    dst.reserve(src.len());
-    dst.extend(src.iter().map(|&b| CHARSET_4NA[(b & 0x0F) as usize]));
+/// [`CHARSET_4NA`] with `U` for `T`, as `READ` renders bases of a table marked as RNA (see
+/// [`crate::archive::marks_rna`]).
+pub(crate) const CHARSET_4NA_RNA: &[u8; 16] = b".ACMGRSVUWYHKDBN";
+
+/// Map `INSDC:4na:bin` codes to the CHARSET ASCII alphabet, in place (so a reference
+/// is never held twice).
+pub fn map_4na_to_ascii(bases: &mut [u8]) {
+    for base in bases {
+        *base = CHARSET_4NA[usize::from(*base & 0x0F)];
+    }
 }
 
 /// Reference window length used by `READ` reconstruction (`get_ref_len_2`):
@@ -228,7 +237,7 @@ impl ReferenceRows {
 /// Split references, given as `(index, length)`, into at most `groups` groups of similar total
 /// length, for loading in parallel: longest first, each to the group with the least so far.
 #[must_use]
-pub fn split_by_length(references: &[(u32, u64)], groups: usize) -> Vec<Vec<u32>> {
+fn split_by_length(references: &[(u32, u64)], groups: usize) -> Vec<Vec<u32>> {
     let mut by_length = references.to_vec();
     by_length.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut split: Vec<(u64, Vec<u32>)> =
@@ -249,26 +258,114 @@ pub fn split_by_length(references: &[(u32, u64)], groups: usize) -> Vec<Vec<u32>
 /// is loaded again per call.
 pub fn preload_references(reflist: &ReferenceList, ref_indices: &[u32]) -> Result<ReferenceStore> {
     let mut seqs: FxHashMap<u32, RefSeq> = FxHashMap::default();
-    let mut ascii = Vec::new();
     for &idx in ref_indices {
         if seqs.contains_key(&idx) {
             continue;
         }
         let obj = reflist.get(idx).with_context(|| format!("get reference {idx}"))?;
         let label = reference_label(&obj, idx);
-        let raw = obj.read_all().with_context(|| format!("failed to read reference {label}"))?;
+        let mut bases =
+            obj.read_all().with_context(|| format!("failed to read reference {label}"))?;
         let expected = obj.seq_length().with_context(|| format!("seq_length {label}"))? as usize;
         anyhow::ensure!(
-            raw.len() == expected,
+            bases.len() == expected,
             "reference {label}: read {} of {expected} bases",
-            raw.len()
+            bases.len()
         );
-        map_4na_to_ascii(&raw, &mut ascii);
+        map_4na_to_ascii(&mut bases);
         let wrap = obj.circular().with_context(|| format!("circular {label}"))?
             || !obj.external().with_context(|| format!("external {label}"))?;
-        seqs.insert(idx, RefSeq { bases: std::mem::take(&mut ascii), wrap });
+        seqs.insert(idx, RefSeq { bases, wrap });
     }
     Ok(ReferenceStore::from_parts(seqs))
+}
+
+/// Most threads to load references on: each opens the archive again.
+pub const MAX_REFERENCE_LOADERS: usize = 8;
+
+/// Reference loaders: threads that preload references in parallel, each reading through
+/// the archive opened again for it.
+///
+/// A reference list and the references it opens aren't safe to share between threads, so
+/// each loader reads through its own list on its own database from `open`. Loaders' lists
+/// read only bases (`READ_4NA`): list options choose which columns a reference's reader
+/// decodes, not which references there are or their order, so indices mean the same as in
+/// the list passed to [`Self::preload`].
+/// Databases are opened as a batch first needs them and kept for later batches, and are
+/// released together when the loaders are dropped: never while another loader is reading
+/// (in ncbi-vdb before VDB-6280, which the vendored copy is patched against, releasing a
+/// manager frees a process-wide string that other threads' resolvers read).
+///
+/// Loads on one thread when built against a system ncbi-vdb: only the vendored copy is
+/// patched against the reference reader's race.
+pub struct ReferenceLoaders<F> {
+    open: F,
+    opened: Vec<VDatabase>,
+    max_loaders: usize,
+}
+
+impl<F: FnMut() -> Result<VDatabase>> ReferenceLoaders<F> {
+    /// Up to `max_loaders` loaders, reading through databases that `open` opens.
+    pub fn new(max_loaders: usize, open: F) -> Self {
+        let max_loaders = if cfg!(feature = "vendored") { max_loaders } else { 1 };
+        Self { open, opened: Vec::new(), max_loaders }
+    }
+
+    /// Preload the distinct references in `ref_indices` of `reflist`, as
+    /// [`preload_references`] does, spread over the loaders by length.
+    pub fn preload(
+        &mut self,
+        reflist: &ReferenceList,
+        ref_indices: &[u32],
+    ) -> Result<ReferenceStore> {
+        let mut lengths = Vec::with_capacity(ref_indices.len());
+        let mut seen = rustc_hash::FxHashSet::default();
+        for &idx in ref_indices {
+            if seen.insert(idx) {
+                let obj = reflist.get(idx).with_context(|| format!("get reference {idx}"))?;
+                let len =
+                    obj.seq_length().with_context(|| format!("seq_length of reference {idx}"))?;
+                lengths.push((idx, u64::from(len)));
+            }
+        }
+        let groups = split_by_length(&lengths, self.max_loaders);
+        if groups.len() <= 1 {
+            return preload_references(reflist, &groups.concat());
+        }
+        while self.opened.len() < groups.len() {
+            self.opened.push((self.open)()?);
+        }
+        std::thread::scope(|scope| {
+            let loaders = self
+                .opened
+                .iter_mut()
+                .zip(&groups)
+                .map(|(open, indices)| {
+                    std::thread::Builder::new()
+                        .stack_size(crate::archive::VDB_THREAD_STACK_BYTES)
+                        .spawn_scoped(scope, move || -> Result<ReferenceStore> {
+                            let reflist =
+                                ReferenceList::make_database(open, reflist_options::READ_4NA, 0)?;
+                            preload_references(&reflist, indices)
+                        })
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+                .context("failed to start a reference loader")?;
+            loaders
+                .into_iter()
+                .map(|loader| {
+                    loader.join().unwrap_or_else(|_| Err(anyhow!("a reference loader panicked")))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .map(ReferenceStore::merge)
+    }
+
+    /// How many databases the loaders have opened.
+    #[cfg(test)]
+    fn num_opened(&self) -> usize {
+        self.opened.len()
+    }
 }
 
 /// A reference's accession and, when different, its name in the archive (e.g.
@@ -353,26 +450,25 @@ mod tests {
 
     #[test]
     fn charset_maps_common_codes() {
-        let mut dst = Vec::new();
-        map_4na_to_ascii(&[0, 1, 2, 4, 8, 15], &mut dst);
-        assert_eq!(dst, b".ACGTN");
+        let mut bases = vec![0, 1, 2, 4, 8, 15];
+        map_4na_to_ascii(&mut bases);
+        assert_eq!(bases, b".ACGTN");
     }
 
     #[test]
     fn charset_maps_every_code_including_iupac() {
         // Pin the whole 4na alphabet (INSDC:4na:map:CHARSET), so a transposition
         // of any IUPAC ambiguity code is caught, not just A/C/G/T/N.
-        let all: Vec<u8> = (0u8..16).collect();
-        let mut dst = Vec::new();
-        map_4na_to_ascii(&all, &mut dst);
-        assert_eq!(dst, b".ACMGRSVTWYHKDBN");
+        let mut all: Vec<u8> = (0u8..16).collect();
+        map_4na_to_ascii(&mut all);
+        assert_eq!(all, b".ACMGRSVTWYHKDBN");
     }
 
     #[test]
     fn charset_masks_high_bits() {
-        let mut dst = Vec::new();
-        map_4na_to_ascii(&[0x11, 0x12], &mut dst); // & 0x0F => 1, 2
-        assert_eq!(dst, b"AC");
+        let mut bases = vec![0x11, 0x12]; // & 0x0F => 1, 2
+        map_4na_to_ascii(&mut bases);
+        assert_eq!(bases, b"AC");
     }
 
     #[rstest]
@@ -456,5 +552,32 @@ mod tests {
             store.window(0, 1, 5, &mut scratch),
             Err(WindowError::WindowTooLong { requested: 5, max: 4 })
         );
+    }
+
+    #[test]
+    fn loaders_open_the_archive_once_and_match_a_one_thread_preload() {
+        use fg_sra_vdb::manager::VdbManager;
+        use fg_sra_vdb::reference::reflist_options::READ_4NA;
+
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+        let open = || -> Result<VDatabase> {
+            Ok(VdbManager::make_read()?.open_db_read(archive.to_str().unwrap())?)
+        };
+        let db = open().unwrap();
+        let reflist = ReferenceList::make_database(&db, READ_4NA, 0).unwrap();
+        let indices: Vec<u32> = (0..reflist.count().unwrap()).collect();
+        assert!(indices.len() >= 2, "the test archive has several references");
+        let expected = preload_references(&reflist, &indices).unwrap();
+
+        let mut loaders = ReferenceLoaders::new(4, open);
+        for _ in 0..3 {
+            let store = loaders.preload(&reflist, &indices).unwrap();
+            assert_eq!(store.num_references(), expected.num_references());
+            assert_eq!(store.total_bases(), expected.total_bases());
+        }
+        if cfg!(feature = "vendored") {
+            assert_eq!(loaders.num_opened(), indices.len().min(4), "opened once, then reused");
+        }
     }
 }

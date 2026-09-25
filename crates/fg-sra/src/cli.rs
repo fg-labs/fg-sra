@@ -330,10 +330,10 @@ impl ToSam {
         // accession that cannot be opened does not truncate an existing file.
         let first_db = open_database(first)?;
         let mut writer = self.create_writer()?;
-        self.process_database(&first_db, &mut writer)?;
+        self.process_database(first, &first_db, &mut writer)?;
         drop(first_db);
         for accession in rest {
-            self.process_database(&open_database(accession)?, &mut writer)?;
+            self.process_database(accession, &open_database(accession)?, &mut writer)?;
         }
         writer.finish()
     }
@@ -394,9 +394,10 @@ impl ToSam {
         })
     }
 
-    /// Convert a single opened SRA database, writing to `writer`.
+    /// Convert `accession`, whose database `db` is open, writing to `writer`.
     fn process_database(
         &self,
+        accession: &str,
         db: &VDatabase,
         writer: &mut crate::output::OutputWriter,
     ) -> Result<()> {
@@ -448,6 +449,9 @@ impl ToSam {
             ref_name_to_id: ref_name_to_id.as_ref(),
         };
 
+        // Loaders reopen what the accession resolved to, as `fastq`'s do.
+        let location = crate::archive::vdb_location(accession)?;
+        let reopen = || open_database(&location);
         let align_config = AlignConfig {
             use_seqid: self.seqid,
             use_long_cigar: self.cigar_long,
@@ -459,6 +463,7 @@ impl ToSam {
             pool_size_override: self.pool_size,
             opts: &opts,
             regions: &self.aligned_region,
+            reopen: &reopen,
         };
 
         // Plan the aligned reads (unless --unaligned-spots-only) before writing the
