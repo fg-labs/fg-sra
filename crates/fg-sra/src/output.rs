@@ -1,15 +1,15 @@
 //! Output dispatch for SAM, BAM, FASTA, and FASTQ formats.
 //!
-//! Manages the output pipeline including optional gzip/bzip2 compression
-//! and BGZF for BAM output.
+//! Manages the output pipeline including optional gzip (as BGZF) or bzip2
+//! compression, and BGZF for BAM output, compressed on several threads.
 
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use bzip2::write::BzEncoder;
-use flate2::write::GzEncoder;
 
+use crate::bgzf_writer::ParallelBgzfWriter;
 use crate::pending_file::PendingFile;
 
 /// Default buffer size for the text output writer (256 KB).
@@ -19,14 +19,16 @@ const OUTPUT_BUF_SIZE: usize = 256 * 1024;
 #[derive(Clone, Copy)]
 pub enum CompressionMode {
     None,
+    /// BGZF: gzip that any gzip reader reads, compressed on several threads.
     Gzip,
     Bzip2,
 }
 
 /// Abstraction over output destinations (stdout or file, with optional compression).
 ///
-/// For SAM/FASTA/FASTQ text output, uses a `BufWriter` with optional gzip/bzip2
-/// compression. For BAM output, uses a BGZF writer that handles block compression.
+/// For SAM/FASTA/FASTQ text output, uses a `BufWriter` with optional gzip (BGZF)
+/// or bzip2 compression. For BAM output, uses a BGZF writer. BGZF blocks are
+/// compressed on several threads.
 pub struct OutputWriter {
     inner: WriterInner,
     /// For file output, the temporary file being written and its final path.
@@ -39,18 +41,17 @@ pub struct OutputWriter {
 /// can end a compressed stream and report errors writing its final block and
 /// trailer, which the encoders' `Drop` would silently discard.
 enum TextSink {
-    Plain(Box<dyn Write>),
-    Gzip(GzEncoder<Box<dyn Write>>),
-    Bzip2(BzEncoder<Box<dyn Write>>),
+    Plain(Box<dyn Write + Send>),
+    Gzip(ParallelBgzfWriter),
+    Bzip2(BzEncoder<Box<dyn Write + Send>>),
 }
 
 impl TextSink {
-    fn new(raw: Box<dyn Write>, mode: CompressionMode) -> Self {
+    /// A sink writing to `raw`, compressing gzip on `threads` threads.
+    fn new(raw: Box<dyn Write + Send>, mode: CompressionMode, threads: usize) -> Self {
         match mode {
             CompressionMode::None => Self::Plain(raw),
-            CompressionMode::Gzip => {
-                Self::Gzip(GzEncoder::new(raw, flate2::Compression::default()))
-            }
+            CompressionMode::Gzip => Self::Gzip(ParallelBgzfWriter::new(raw, threads)),
             CompressionMode::Bzip2 => {
                 Self::Bzip2(BzEncoder::new(raw, bzip2::Compression::default()))
             }
@@ -61,7 +62,7 @@ impl TextSink {
     fn finish(self) -> io::Result<()> {
         match self {
             Self::Plain(mut w) => w.flush(),
-            Self::Gzip(w) => w.finish()?.flush(),
+            Self::Gzip(w) => w.finish(),
             Self::Bzip2(w) => w.finish()?.flush(),
         }
     }
@@ -88,40 +89,46 @@ impl Write for TextSink {
 /// Internal writer variant: text (buffered) or BAM (BGZF-compressed).
 enum WriterInner {
     Text(BufWriter<TextSink>),
-    Bgzf(noodles_bgzf::io::Writer<Box<dyn Write>>),
+    Bgzf(ParallelBgzfWriter),
 }
 
 impl OutputWriter {
-    /// Create a text writer to stdout with the given compression.
-    pub fn stdout_with_compression(mode: CompressionMode) -> Self {
-        let sink = TextSink::new(Box::new(io::stdout().lock()), mode);
+    /// Create a text writer to stdout with the given compression, compressing on
+    /// `threads` threads.
+    pub fn stdout_with_compression(mode: CompressionMode, threads: usize) -> Self {
+        let sink = TextSink::new(Box::new(io::stdout()), mode, threads);
         Self {
             inner: WriterInner::Text(BufWriter::with_capacity(OUTPUT_BUF_SIZE, sink)),
             pending: None,
         }
     }
 
-    /// Create a text writer to a file with the given compression.
-    pub fn from_path_with_compression(path: &Path, mode: CompressionMode) -> Result<Self> {
+    /// Create a text writer to a file with the given compression, compressing on
+    /// `threads` threads.
+    pub fn from_path_with_compression(
+        path: &Path,
+        mode: CompressionMode,
+        threads: usize,
+    ) -> Result<Self> {
         let (file, pending) = PendingFile::create(path)?;
-        let sink = TextSink::new(Box::new(file), mode);
+        let sink = TextSink::new(Box::new(file), mode, threads);
         Ok(Self {
             inner: WriterInner::Text(BufWriter::with_capacity(OUTPUT_BUF_SIZE, sink)),
             pending,
         })
     }
 
-    /// Create a BAM writer to stdout (BGZF-compressed).
-    pub fn bam_stdout() -> Self {
-        let raw: Box<dyn Write> = Box::new(io::stdout().lock());
-        Self { inner: WriterInner::Bgzf(noodles_bgzf::io::Writer::new(raw)), pending: None }
+    /// Create a BAM writer to stdout, compressing on `threads` threads.
+    pub fn bam_stdout(threads: usize) -> Self {
+        let bgzf = ParallelBgzfWriter::new(Box::new(io::stdout()), threads);
+        Self { inner: WriterInner::Bgzf(bgzf), pending: None }
     }
 
-    /// Create a BAM writer to a file (BGZF-compressed).
-    pub fn bam_from_path(path: &Path) -> Result<Self> {
+    /// Create a BAM writer to a file, compressing on `threads` threads.
+    pub fn bam_from_path(path: &Path, threads: usize) -> Result<Self> {
         let (file, pending) = PendingFile::create(path)?;
-        let raw: Box<dyn Write> = Box::new(file);
-        Ok(Self { inner: WriterInner::Bgzf(noodles_bgzf::io::Writer::new(raw)), pending })
+        let bgzf = ParallelBgzfWriter::new(Box::new(file), threads);
+        Ok(Self { inner: WriterInner::Bgzf(bgzf), pending })
     }
 
     /// Write a SAM header (text mode) or BAM header (BAM mode).
@@ -278,7 +285,7 @@ mod tests {
         let path = dir.join("out.sam");
         let tmp = PendingFile::tmp_path_for(&path);
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"record\n").unwrap();
         assert!(!path.exists(), "final path must not exist before finish");
         assert!(tmp.exists());
@@ -294,7 +301,7 @@ mod tests {
         let dir = test_dir("unfinished");
         let path = dir.join("out.bam");
         {
-            let mut writer = OutputWriter::bam_from_path(&path).unwrap();
+            let mut writer = OutputWriter::bam_from_path(&path, 2).unwrap();
             writer.write_header("@HD\tVN:1.6\n").unwrap();
             // Dropped without finish, as on an error.
         }
@@ -310,13 +317,13 @@ mod tests {
         std::fs::write(&path, b"old\n").unwrap();
         {
             let mut writer =
-                OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+                OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
             writer.write_bytes(b"new\n").unwrap();
         }
         assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
 
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"new\n").unwrap();
         writer.finish().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
@@ -333,7 +340,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let mut writer =
-            OutputWriter::from_path_with_compression(&link, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&link, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"new\n").unwrap();
         writer.finish().unwrap();
 
@@ -352,7 +359,7 @@ mod tests {
         let tmp = PendingFile::tmp_path_for(&path);
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
 
-        let result = OutputWriter::from_path_with_compression(&path, CompressionMode::None);
+        let result = OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2);
         assert!(result.is_err(), "a file already at the temporary path is refused");
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
@@ -370,7 +377,7 @@ mod tests {
         ];
         let dir = test_dir("bam");
         let path = dir.join("out.bam");
-        let mut writer = OutputWriter::bam_from_path(&path).unwrap();
+        let mut writer = OutputWriter::bam_from_path(&path, 2).unwrap();
         writer.write_header("@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n").unwrap();
         writer.finish().unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -384,14 +391,19 @@ mod tests {
         let dir = test_dir("gzip");
         let path = dir.join("out.sam.gz");
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::Gzip).unwrap();
-        writer.write_bytes(b"record\n").unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::Gzip, 2).unwrap();
+        // Several BGZF blocks, so a lost or reordered later block would show.
+        let mut records = String::new();
+        for i in 0..30_000 {
+            std::fmt::Write::write_fmt(&mut records, format_args!("record {i}\n")).unwrap();
+        }
+        writer.write_bytes(records.as_bytes()).unwrap();
         writer.finish().unwrap();
         let mut decoded = String::new();
-        flate2::read::GzDecoder::new(File::open(&path).unwrap())
+        flate2::read::MultiGzDecoder::new(File::open(&path).unwrap())
             .read_to_string(&mut decoded)
             .unwrap();
-        assert_eq!(decoded, "record\n");
+        assert!(decoded == records, "decoded output is not what was written");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -401,7 +413,7 @@ mod tests {
         let dir = test_dir("bzip2");
         let path = dir.join("out.sam.bz2");
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::Bzip2).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::Bzip2, 2).unwrap();
         writer.write_bytes(b"record\n").unwrap();
         writer.finish().unwrap();
         let mut decoded = String::new();
@@ -434,16 +446,16 @@ mod tests {
 
     #[test]
     fn test_text_sink_finish_reports_trailer_write_error() {
-        // The disk fills after the 10-byte gzip header; the compressed data and
-        // trailer are written in finish(), whose error must be reported, not
-        // dropped as the encoders' Drop would.
+        // The disk fills 10 bytes in; the compressed data and trailer are written
+        // by finish(), whose error must be reported, not dropped as an encoder's
+        // Drop would.
         for mode in [CompressionMode::Gzip, CompressionMode::Bzip2] {
-            let mut sink = TextSink::new(Box::new(FailAfter { left: 10 }), mode);
+            let mut sink = TextSink::new(Box::new(FailAfter { left: 10 }), mode, 2);
             sink.write_all(b"record\n").unwrap();
             let err = sink.finish().unwrap_err();
             assert_eq!(err.to_string(), "disk full");
         }
-        let mut plain = TextSink::new(Box::new(FailAfter { left: 10 }), CompressionMode::None);
+        let mut plain = TextSink::new(Box::new(FailAfter { left: 10 }), CompressionMode::None, 2);
         plain.write_all(b"record\n").unwrap();
         plain.finish().unwrap();
     }
@@ -457,7 +469,7 @@ mod tests {
         std::fs::write(&path, b"old\n").unwrap();
         std::fs::hard_link(&path, &other).unwrap();
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"new\n").unwrap();
         writer.finish().unwrap();
         assert_eq!(std::fs::read(&other).unwrap(), b"new\n");
@@ -467,9 +479,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_writing_to_dev_null_is_direct() {
-        let mut writer =
-            OutputWriter::from_path_with_compression(Path::new("/dev/null"), CompressionMode::None)
-                .unwrap();
+        let mut writer = OutputWriter::from_path_with_compression(
+            Path::new("/dev/null"),
+            CompressionMode::None,
+            2,
+        )
+        .unwrap();
         assert!(writer.pending.is_none());
         writer.write_bytes(b"record\n").unwrap();
         writer.finish().unwrap();
@@ -478,10 +493,10 @@ mod tests {
     #[test]
     fn test_directory_output_path_is_rejected_up_front() {
         let dir = test_dir("dir-path");
-        let err = OutputWriter::bam_from_path(&dir).err().expect("directory must be rejected");
+        let err = OutputWriter::bam_from_path(&dir, 2).err().expect("directory must be rejected");
         assert!(err.to_string().contains("output path is a directory"), "{err}");
         let trailing = PathBuf::from(format!("{}/out.bam/", dir.display()));
-        let err = OutputWriter::bam_from_path(&trailing).err().expect("trailing slash rejected");
+        let err = OutputWriter::bam_from_path(&trailing, 2).err().expect("trailing slash rejected");
         assert!(err.to_string().contains("output path is a directory"), "{err}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing may be created");
         std::fs::remove_dir_all(&dir).ok();
@@ -496,7 +511,7 @@ mod tests {
         std::fs::write(&path, b"old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"new\n").unwrap();
         writer.finish().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -519,7 +534,7 @@ mod tests {
         };
         std::os::unix::fs::chown(&path, None, Some(other_gid)).unwrap();
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"new\n").unwrap();
         writer.finish().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
@@ -545,7 +560,7 @@ mod tests {
         let path = dir.join("out.sam");
         std::fs::write(&path, b"old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let result = OutputWriter::from_path_with_compression(&path, CompressionMode::None);
+        let result = OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2);
         // Root bypasses file permissions, so only check when they apply.
         if std::fs::OpenOptions::new().write(true).open(&path).is_err() {
             let err = result.err().expect("read-only output must be rejected");
@@ -565,7 +580,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let result = (|| -> Result<()> {
             let mut writer =
-                OutputWriter::from_path_with_compression(&path, CompressionMode::None)?;
+                OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2)?;
             writer.write_bytes(b"new\n")?;
             writer.finish()
         })();
@@ -581,7 +596,7 @@ mod tests {
         let path = dir.join("out.sam");
         let tmp = PendingFile::tmp_path_for(&path);
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         writer.write_bytes(b"record\n").unwrap();
         // A non-empty directory now occupies the final path, so the rename fails.
         std::fs::create_dir(&path).unwrap();
@@ -599,7 +614,7 @@ mod tests {
         // Fits the usual 255-byte file name limit, but not with the temp suffix.
         let path = dir.join(format!("{}.sam", "x".repeat(246)));
         let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         assert!(writer.pending.is_none());
         writer.write_bytes(b"record\n").unwrap();
         writer.finish().unwrap();
@@ -613,12 +628,12 @@ mod tests {
         let path = dir.join("out.sam");
         let tmp = PendingFile::tmp_path_for(&path);
         let writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
+            OutputWriter::from_path_with_compression(&path, CompressionMode::None, 2).unwrap();
         assert!(signal_cleanup::is_tracked(&tmp));
         writer.finish().unwrap();
         assert!(!signal_cleanup::is_tracked(&tmp));
 
-        let writer = OutputWriter::bam_from_path(&path).unwrap();
+        let writer = OutputWriter::bam_from_path(&path, 2).unwrap();
         assert!(signal_cleanup::is_tracked(&tmp));
         drop(writer);
         assert!(!signal_cleanup::is_tracked(&tmp));

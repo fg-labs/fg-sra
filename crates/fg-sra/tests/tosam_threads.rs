@@ -49,5 +49,14 @@ fn output_is_identical_at_any_thread_count() {
         assert!(!one.is_empty(), "{extension}: no output");
         assert!(one == eight, "{extension}: output differs between 1 and 8 threads");
     }
+    // The compressed outputs hold the SAM itself.
+    let sam = std::fs::read(dir.join("t1.sam")).unwrap();
+    let mut gunzipped = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(dir.join("t1.sam.gz")).unwrap()),
+        &mut gunzipped,
+    )
+    .unwrap();
+    assert!(gunzipped == sam, "gzip output is not the SAM output");
     std::fs::remove_dir_all(&dir).ok();
 }

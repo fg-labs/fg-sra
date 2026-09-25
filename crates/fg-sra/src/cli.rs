@@ -103,7 +103,7 @@ pub struct ToSam {
     #[arg(long = "output-format", default_value = "sam")]
     pub output_format: OutputFormat,
 
-    /// Compress SAM output with gzip.
+    /// Compress SAM output with gzip, as BGZF (compressed on `--threads` threads).
     #[arg(long = "gzip")]
     pub gzip: bool,
 
@@ -372,13 +372,20 @@ impl ToSam {
         }
     }
 
+    /// Worker threads to use: `--threads`, or by default the available cores.
+    fn num_threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)
+        })
+    }
+
     /// Open the output (`--output-file` or stdout) for the selected format.
     fn create_writer(&self) -> Result<crate::output::OutputWriter> {
         use crate::output::{CompressionMode, OutputWriter};
         if self.output_mode() == crate::record::OutputMode::Bam {
             return Ok(match &self.output_file {
-                Some(path) => OutputWriter::bam_from_path(path)?,
-                None => OutputWriter::bam_stdout(),
+                Some(path) => OutputWriter::bam_from_path(path, self.num_threads())?,
+                None => OutputWriter::bam_stdout(self.num_threads()),
             });
         }
         let compression = if self.gzip {
@@ -389,8 +396,10 @@ impl ToSam {
             CompressionMode::None
         };
         Ok(match &self.output_file {
-            Some(path) => OutputWriter::from_path_with_compression(path, compression)?,
-            None => OutputWriter::stdout_with_compression(compression),
+            Some(path) => {
+                OutputWriter::from_path_with_compression(path, compression, self.num_threads())?
+            }
+            None => OutputWriter::stdout_with_compression(compression, self.num_threads()),
         })
     }
 
@@ -457,9 +466,7 @@ impl ToSam {
             use_long_cigar: self.cigar_long,
             primary_only: self.primary,
             min_mapq: self.min_mapq,
-            num_threads: self.threads.unwrap_or_else(|| {
-                std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)
-            }),
+            num_threads: self.num_threads(),
             pool_size_override: self.pool_size,
             opts: &opts,
             regions: &self.aligned_region,

@@ -33,7 +33,7 @@ processes references in parallel for high throughput.
 Key features:
 - **Multi-threaded** reference processing with ordered output
 - **SAM and BAM** output (BAM via multi-threaded BGZF compression)
-- **gzip/bzip2** compression for SAM output
+- **gzip/bzip2** compression for SAM output (gzip as multi-threaded BGZF, readable by any gzip reader)
 - **FASTA/FASTQ** output modes
 - **Region filtering** by genomic coordinates
 - **Quality quantization**

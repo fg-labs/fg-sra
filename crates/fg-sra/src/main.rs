@@ -2,6 +2,7 @@
 
 mod aligned;
 mod archive;
+mod bgzf_writer;
 mod cigar;
 mod cli;
 mod fastq;
