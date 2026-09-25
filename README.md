@@ -39,6 +39,7 @@ Key features:
 - **Quality quantization**
 - **Reference cache warming** via `cache-refs` to avoid resolver failures under load
 - **Mate cache** for proper SAM flag and mate-pair information
+- **Archive descriptions** via `info`: kind, totals, qualities, names and read layout
 - **Paired FASTQ** via `fastq`: spot order, mates paired, multi-threaded BGZF, byte-identical at any thread count, checked against the archive's stored totals, for unaligned and aligned (cSRA) archives
 
 For aligned runs, `fg-sra` reconstructs each read from the stored alignment
@@ -154,6 +155,30 @@ Porting from sra-tools:
 | `--gzip`, pigz | a `.gz` output path |
 
 Aligned (cSRA) archives are converted too. Their references are loaded into memory first (about a byte per reference base, e.g. ~3 GB for a human genome), and each aligned read is rebuilt from its stored alignment, thread-safely, rather than through libncbi-vdb's virtual `READ` column. External references must be available locally (e.g. beside the archive, as `prefetch` puts them) or over the network; `--offline` turns network access off entirely. SRA Lite archives are converted with a warning, since their qualities are synthesised. Colour-space (SOLiD) runs are written in base space, as `fasterq-dump` writes them; `fastq-dump` needs `-B` for the same. PacBio and Oxford Nanopore native databases that have a `CONSENSUS` table are read from it by default (`--table auto`), as `fasterq-dump` reads them, rather than from `SEQUENCE`, which holds each molecule's subreads or strands as separate reads; `--table SEQUENCE` reads those instead, and `fastq-dump` needs `--table CONSENSUS` for the same.
+
+### Describing an Archive
+
+`fg-sra info` describes one or more archives: kind (flat table or database, aligned or not), platform, loader, stored totals, whether qualities and original read names were kept, spot groups, alignments and references, and the read layout of the first spots (10,000 by default; `--layout-spots` sets how many), so a layout that changes later in a run isn't seen. The layout lists each read slot's type and lengths, and how many biological and technical reads spots have, which shows the `fg-sra fastq` outputs an archive needs and which technical read is which.
+
+```bash
+fg-sra info SRR000001.sra
+```
+
+```
+SRR000001
+  kind              flat table
+  platform          454
+  ...
+  read layout       first 10,000 of 470,985 spots only (--layout-spots samples more)
+    slot  type           non-empty     empty     min     mean     max
+    1     technical         10,000         0       4      4.0       4
+    2     biological        10,000         0       1    168.8     685
+    3     technical          5,648     4,352      44     44.0      44
+    4     biological         5,634     4,366       1    110.0     392
+  reads per spot    4: 10,000 spots
+  biological reads  2 (pairs): 5,634 spots; 1 (unpaired): 4,366 spots
+  technical reads   2: 5,648 spots; 1: 4,352 spots
+```
 
 ### Pre-caching References
 

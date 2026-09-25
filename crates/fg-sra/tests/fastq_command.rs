@@ -3,7 +3,8 @@
 //! Tests that need a real archive are opt-in, so no test data is committed. Set:
 //! - `FG_SRA_TEST_PAIRED_SRA` to an unaligned paired-end SRA file, e.g. SRR2584863;
 //! - `FG_SRA_TEST_ALIGNED_SRA` to an aligned (cSRA) SRA file whose references are available
-//!   locally, e.g. SRR390728 fetched with `prefetch SRR390728`, which puts them beside it;
+//!   locally, e.g. SRR390728 fetched with `prefetch SRR390728`, which puts them beside it (the
+//!   missing-reference test needs one with external references, and skips others);
 //! - `FG_SRA_TEST_COLOR_SPACE_SRA` to a colour-space run stored as `CSREAD` with no physical
 //!   `READ`, e.g. ERR048905.
 //!
@@ -162,18 +163,43 @@ fn aligned_archive_is_converted_offline_from_its_local_references() {
     assert!(bases_are_dna, "{}", &text[..text.len().min(400)]);
 }
 
+/// The number of references `fg-sra info` reports as external (not embedded) for `sra`.
+fn external_references(sra: &str) -> u32 {
+    let output = Command::new(env!("CARGO_BIN_EXE_fg-sra"))
+        .args(["info", sra, "--layout-spots", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (_, after) = text.split_once(" references (").expect(&text);
+    let (external, _) = after.split_once(" external)").expect(&text);
+    external.parse().unwrap()
+}
+
 #[test]
 fn aligned_archive_without_its_references_names_the_missing_one_offline() {
     let Some(sra) = archive_from_env("FG_SRA_TEST_ALIGNED_SRA") else { return };
+    if external_references(&sra) == 0 {
+        eprintln!("skipping: {sra} embeds all its references, so none can be missing");
+        return;
+    }
     let dir = scratch_dir("aligned-no-references");
     let alone = dir.join("alone.sra");
     if std::fs::hard_link(&sra, &alone).is_err() {
         std::fs::copy(&sra, &alone).unwrap();
     }
-    let output = fastq(&[alone.to_str().unwrap(), "-u", &path(&dir, "u.fq"), "--offline"]);
+    // Run where no reference can be found: a home (and so reference cache) and working
+    // directory of the scratch directory alone.
+    let output = Command::new(env!("CARGO_BIN_EXE_fg-sra"))
+        .args(["fastq", alone.to_str().unwrap(), "-u", &path(&dir, "u.fq"), "--offline"])
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .env_remove("NCBI_SETTINGS")
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     let message = stderr(&output);
-    assert!(message.contains("failed to read reference N"), "{message}");
+    assert!(message.contains("failed to read reference "), "{message}");
 }
 
 #[test]

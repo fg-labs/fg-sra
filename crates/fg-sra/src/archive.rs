@@ -24,6 +24,8 @@ pub struct Archive {
     pub location: String,
     /// Reads table within a database; `None` for a flat table.
     pub table: Option<String>,
+    /// The database's tables; empty for a flat table.
+    pub tables: Vec<String>,
     /// Whether the archive has alignments (a `PRIMARY_ALIGNMENT` table).
     pub aligned: bool,
     /// Whether the reads table stores bases directly (a physical `READ` column).
@@ -33,6 +35,8 @@ pub struct Archive {
     pub stores_cmp_read: bool,
     /// Sequencing platform of the first spot, e.g. `ILLUMINA`.
     pub platform: Option<&'static str>,
+    /// The loader that made the archive, e.g. `fastq-load.2.5.2 (2.5.2, Jun 19 2015)`.
+    pub loader: Option<String>,
     /// First spot (row) id.
     pub first_spot: i64,
     /// Number of spots (rows).
@@ -115,9 +119,11 @@ impl Archive {
             location,
             table: table_name,
             aligned: tables.iter().any(|t| t == ALIGNMENT_TABLE),
+            tables,
             stores_bases: has(&physical, "READ"),
             stores_cmp_read: has(&physical, "CMP_READ"),
             platform,
+            loader: loader(&top_metadata),
             first_spot,
             spot_count,
             quality_source,
@@ -340,6 +346,15 @@ fn platform_name(id: u8) -> Option<&'static str> {
         "SALUS",
     ];
     NAMES.get(usize::from(id)).copied().filter(|&name| name != "UNDEFINED")
+}
+
+/// The loader that made the archive, from `SOFTWARE/loader`'s attributes.
+fn loader(metadata: &KMetadata) -> Option<String> {
+    let node = metadata.open_node_read("SOFTWARE/loader").ok()?;
+    let name = node.read_attr("name").ok()?;
+    let details: Vec<String> =
+        ["vers", "date"].iter().filter_map(|attr| node.read_attr(attr).ok()).collect();
+    Some(if details.is_empty() { name } else { format!("{name} ({})", details.join(", ")) })
 }
 
 /// Whether the metadata carries SRA Lite's marker, `SOFTWARE/delite@name = "delite"`.

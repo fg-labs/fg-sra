@@ -271,6 +271,16 @@ impl ReadFilter {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// The value's name, as `--read-filter` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Reject => "reject",
+            Self::Criteria => "criteria",
+            Self::Redacted => "redacted",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -627,5 +637,13 @@ pub(crate) mod tests {
         assert_eq!(ReadFilter::from_raw(2), Some(ReadFilter::Criteria));
         assert_eq!(ReadFilter::from_raw(3), Some(ReadFilter::Redacted));
         assert_eq!(ReadFilter::from_raw(4), None);
+    }
+
+    #[test]
+    fn read_filter_names_are_the_values_read_filter_takes() {
+        use clap::ValueEnum;
+        for filter in ReadFilter::ALL {
+            assert_eq!(ReadFilter::from_str(filter.name(), false), Ok(filter));
+        }
     }
 }
