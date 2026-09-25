@@ -84,6 +84,41 @@ fn read_bam_header(db: &VDatabase) -> Result<Option<String>> {
     if content.is_empty() { Ok(None) } else { Ok(Some(content)) }
 }
 
+/// If the header's `@HD` line claims coordinate order (`SO:coordinate`, or a
+/// `SS:coordinate:...` sub-sort), return the header with `SO:unsorted` and no
+/// such sub-sort; otherwise `None`. Only the `@HD` line is rewritten; the rest
+/// of the header is kept byte for byte.
+///
+/// For output whose records are not in coordinate order: a stored `BAM_HEADER`
+/// (or a `--header-file` header) describes the order of the BAM it came from,
+/// not the order fg-sra writes records in, and downstream tools trust
+/// `SO:coordinate` (e.g. to index or merge).
+pub fn demote_coordinate_sort_order(header: &str) -> Option<String> {
+    // The @HD line, if any, is the first line.
+    let line_end = header.find('\n').unwrap_or(header.len());
+    let (hd, rest) = header.split_at(line_end);
+    let (hd, cr) = hd.strip_suffix('\r').map_or((hd, ""), |h| (h, "\r"));
+    if !hd.starts_with("@HD\t") {
+        return None;
+    }
+    let mut changed = false;
+    let fields: Vec<&str> = hd
+        .split('\t')
+        .filter_map(|field| match field {
+            "SO:coordinate" => {
+                changed = true;
+                Some("SO:unsorted")
+            }
+            f if f.starts_with("SS:coordinate:") => {
+                changed = true;
+                None
+            }
+            f => Some(f),
+        })
+        .collect();
+    changed.then(|| format!("{}{cr}{rest}", fields.join("\t")))
+}
+
 /// A reference's name, sequence ID and length, from the `ReferenceList`.
 struct RefNames {
     name: String,
@@ -212,6 +247,43 @@ mod tests {
                 length,
             })
             .collect()
+    }
+
+    #[test]
+    fn test_demote_coordinate_sort_order() {
+        let cases = [
+            (
+                "@HD\tVN:1.4\tGO:none\tSO:coordinate\n@SQ\tSN:1\tLN:100\n",
+                "@HD\tVN:1.4\tGO:none\tSO:unsorted\n@SQ\tSN:1\tLN:100\n",
+            ),
+            // A coordinate sub-sort is dropped with it.
+            (
+                "@HD\tVN:1.6\tSO:coordinate\tSS:coordinate:queryname\n@SQ\tSN:1\tLN:100\n",
+                "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:1\tLN:100\n",
+            ),
+            // No trailing newline, and CRLF line endings kept as they are.
+            ("@HD\tVN:1.4\tSO:coordinate", "@HD\tVN:1.4\tSO:unsorted"),
+            (
+                "@HD\tVN:1.4\tSO:coordinate\r\n@SQ\tSN:1\tLN:100\r\n",
+                "@HD\tVN:1.4\tSO:unsorted\r\n@SQ\tSN:1\tLN:100\r\n",
+            ),
+        ];
+        for (header, expected) in cases {
+            assert_eq!(demote_coordinate_sort_order(header).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_demote_coordinate_sort_order_leaves_other_orders() {
+        for header in [
+            "@HD\tVN:1.4\tSO:unsorted\n",
+            "@HD\tVN:1.4\tSO:queryname\tSS:queryname:natural\n",
+            "@HD\tVN:1.4\n",
+            "@SQ\tSN:1\tLN:100\n@CO\tSO:coordinate\n",
+            "",
+        ] {
+            assert_eq!(demote_coordinate_sort_order(header), None, "{header:?}");
+        }
     }
 
     #[test]

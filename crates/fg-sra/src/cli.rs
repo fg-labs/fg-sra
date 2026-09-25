@@ -1,5 +1,6 @@
 //! Command-line argument definitions for fg-sra.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -61,7 +62,8 @@ pub struct ToSam {
     #[arg(short = 'r', long = "header")]
     pub header: bool,
 
-    /// Use external header file.
+    /// Use external header file. As with the stored header, an `@HD SO:coordinate`
+    /// in it is written as `SO:unsorted` when the output is not coordinate-sorted.
     #[arg(long = "header-file")]
     pub header_file: Option<PathBuf>,
 
@@ -169,6 +171,52 @@ impl Cli {
     }
 }
 
+/// Write `header`, demoting its coordinate sort order (see
+/// [`crate::header::demote_coordinate_sort_order`]) when the planned aligned
+/// output (`None` when no aligned reads are output) is not in coordinate order
+/// with respect to its `@SQ` lines. `ref_name_to_id` is the header's reference
+/// id map when already built (BAM output); otherwise it is built only if needed.
+fn write_header_for_output(
+    db: &VDatabase,
+    writer: &mut crate::output::OutputWriter,
+    header: &str,
+    aligned_plan: Option<&crate::aligned::AlignedPlan>,
+    ref_name_to_id: Option<&HashMap<String, i32>>,
+) -> Result<()> {
+    let demoted = header_for_output(header, || {
+        let Some(plan) = aligned_plan else {
+            return Ok(true); // No aligned records: only unaligned ones, at the end.
+        };
+        Ok(match ref_name_to_id {
+            Some(ids) => plan.is_coordinate_sorted(ids),
+            None => plan.is_coordinate_sorted(&crate::header::build_ref_id_map(db, header)?),
+        })
+    })?;
+    match demoted {
+        Some(demoted) => {
+            eprintln!(
+                "[header] output is not coordinate-sorted; writing @HD SO:unsorted instead of \
+                 SO:coordinate"
+            );
+            writer.write_header(&demoted)
+        }
+        None => writer.write_header(header),
+    }
+}
+
+/// The header to write in place of `header`, or `None` to write it unchanged:
+/// demoted when it claims coordinate order and `is_sorted` (only evaluated
+/// then) says the output is not coordinate-sorted.
+fn header_for_output(
+    header: &str,
+    is_sorted: impl FnOnce() -> Result<bool>,
+) -> Result<Option<String>> {
+    match crate::header::demote_coordinate_sort_order(header) {
+        Some(demoted) if !is_sorted()? => Ok(Some(demoted)),
+        _ => Ok(None),
+    }
+}
+
 /// Open a VDB database for reading from an accession or file path.
 ///
 /// Creates a VDB manager, disables the pagemap thread (best-effort), and
@@ -243,9 +291,22 @@ impl ToSam {
         Ok(())
     }
 
+    /// The record format selected by the output options.
+    fn output_mode(&self) -> crate::record::OutputMode {
+        if self.output_format == OutputFormat::Bam {
+            crate::record::OutputMode::Bam
+        } else if self.fasta {
+            crate::record::OutputMode::Fasta
+        } else if self.fastq {
+            crate::record::OutputMode::Fastq
+        } else {
+            crate::record::OutputMode::Sam
+        }
+    }
+
     /// Process a single SRA accession or file path.
     fn process_accession(&self, accession: &str) -> Result<()> {
-        use crate::aligned::{AlignConfig, process_aligned_table};
+        use crate::aligned::{AlignConfig, plan_aligned_tables, process_aligned_plan};
         use crate::header::generate_header;
         use crate::output::OutputWriter;
         use crate::progress::ProgressLogger;
@@ -256,15 +317,7 @@ impl ToSam {
 
         let db = open_database(accession)?;
 
-        let output_mode = if self.output_format == OutputFormat::Bam {
-            crate::record::OutputMode::Bam
-        } else if self.fasta {
-            crate::record::OutputMode::Fasta
-        } else if self.fastq {
-            crate::record::OutputMode::Fastq
-        } else {
-            crate::record::OutputMode::Sam
-        };
+        let output_mode = self.output_mode();
 
         let mut writer = if output_mode == crate::record::OutputMode::Bam {
             match &self.output_file {
@@ -291,15 +344,14 @@ impl ToSam {
                 output_mode,
                 crate::record::OutputMode::Sam | crate::record::OutputMode::Bam
             ) {
-            let h = generate_header(
+            // Written once the aligned output order is known (below).
+            Some(generate_header(
                 &db,
                 self.header,
                 self.seqid,
                 &self.header_comment,
                 self.header_file.as_deref(),
-            )?;
-            writer.write_header(&h)?;
-            Some(h)
+            )?)
         } else {
             None
         };
@@ -337,9 +389,27 @@ impl ToSam {
             regions: &self.aligned_region,
         };
 
-        // Aligned reads (unless --unaligned-spots-only).
-        if !self.unaligned_spots_only {
-            process_aligned_table(&db, &mut writer, &align_config, PROGRESS_INTERVAL)?;
+        // Plan the aligned reads (unless --unaligned-spots-only) before writing the
+        // header, whose @HD SO must not claim coordinate order the output lacks.
+        // Unaligned records (RNAME `*`) follow all aligned ones, as coordinate
+        // order requires, so they never affect it.
+        let aligned_plan = if self.unaligned_spots_only {
+            None
+        } else {
+            Some(plan_aligned_tables(&db, &align_config)?)
+        };
+        if let Some(header) = &header_text {
+            write_header_for_output(
+                &db,
+                &mut writer,
+                header,
+                aligned_plan.as_ref(),
+                ref_name_to_id.as_ref(),
+            )?;
+        }
+
+        if let Some(plan) = &aligned_plan {
+            process_aligned_plan(&db, plan, &mut writer, &align_config, PROGRESS_INTERVAL)?;
         }
 
         // Unaligned reads (if requested).
@@ -532,6 +602,26 @@ mod tests {
     fn test_missing_subcommand_fails() {
         let result = Cli::try_parse_from(["fg-sra"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_header_for_output_demotes_only_unsorted_coordinate_claims() {
+        let coordinate = "@HD\tVN:1.4\tSO:coordinate\n";
+        let demoted = header_for_output(coordinate, || Ok(false)).unwrap();
+        assert_eq!(demoted.as_deref(), Some("@HD\tVN:1.4\tSO:unsorted\n"));
+        assert_eq!(header_for_output(coordinate, || Ok(true)).unwrap(), None);
+        // Errors deciding sortedness propagate.
+        assert!(header_for_output(coordinate, || anyhow::bail!("no REFERENCE")).is_err());
+    }
+
+    #[test]
+    fn test_header_for_output_checks_order_only_for_coordinate_claims() {
+        // Without a coordinate claim, sortedness (which may need the database) is
+        // never evaluated, so a failing check cannot fail the run.
+        for header in ["@HD\tVN:1.4\tSO:unsorted\n", "@HD\tVN:1.3\n", ""] {
+            let result = header_for_output(header, || panic!("must not be evaluated"));
+            assert_eq!(result.unwrap(), None);
+        }
     }
 
     #[test]

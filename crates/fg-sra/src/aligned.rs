@@ -4,7 +4,7 @@
 //! processing. Each worker directly iterates rows from a VDB cursor,
 //! making parallelism independent of the number of references.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 
 use anyhow::{Context, Result};
@@ -795,6 +795,8 @@ struct TablePlan {
     /// the parallel worker phases.
     reflist: ReferenceList,
     work_items: Vec<RowRangeWorkItem>,
+    /// Names of references whose alignments span several sorted row ranges.
+    split_references: HashSet<String>,
 }
 
 /// Plan the conversion of one alignment table: discover its reference runs,
@@ -831,27 +833,103 @@ fn plan_table(
         return Ok(None);
     }
     assign_bam_ref_ids(&mut work_items, config.opts.ref_name_to_id)?;
-    Ok(Some(TablePlan { table_name, reflist, work_items }))
+    let split_references = layout.split_references.into_iter().collect();
+    Ok(Some(TablePlan { table_name, reflist, work_items, split_references }))
 }
 
-/// Process all aligned reads, writing SAM/BAM records.
-///
-/// Plans every alignment table first (so a table that cannot be converted fails
-/// before any record is written), then processes each table's work items
-/// sequentially or in parallel.
-pub fn process_aligned_table(
+/// The planned conversion of every alignment table that has output.
+pub struct AlignedPlan {
+    tables: Vec<TablePlan>,
+}
+
+impl AlignedPlan {
+    /// Whether the aligned records will be written in coordinate order with
+    /// respect to a header whose `@SQ` order is `header_ref_ids` (reference
+    /// name to `@SQ` index, e.g. from [`crate::header::build_ref_id_map`]).
+    ///
+    /// Conservative: true only when a single table has output and its work
+    /// items are coordinate-sorted (see [`work_items_are_coordinate_sorted`]).
+    pub fn is_coordinate_sorted(&self, header_ref_ids: &HashMap<String, i32>) -> bool {
+        tables_are_coordinate_sorted(
+            self.tables.iter().map(|t| (&t.split_references, t.work_items.as_slice())),
+            header_ref_ids,
+        )
+    }
+}
+
+/// See [`AlignedPlan::is_coordinate_sorted`]; `tables` yields each planned
+/// table's `(split_references, work_items)`.
+fn tables_are_coordinate_sorted<'a>(
+    mut tables: impl Iterator<Item = (&'a HashSet<String>, &'a [RowRangeWorkItem])>,
+    header_ref_ids: &HashMap<String, i32>,
+) -> bool {
+    match (tables.next(), tables.next()) {
+        (None, _) => true,
+        (Some((split_references, work_items)), None) => {
+            work_items_are_coordinate_sorted(work_items, split_references, header_ref_ids)
+        }
+        _ => false, // Secondary alignments follow all primary alignments.
+    }
+}
+
+/// Whether `work_items` emit records in coordinate order: no item covers a
+/// reference in `split_references` (whose runs are grouped, not merged), each
+/// reference's items are contiguous and visit rows in strictly increasing order
+/// (within one sorted run rows are ordered by position; a repeated or
+/// overlapping region revisits rows), and references appear in strictly
+/// increasing `@SQ` order. A reference missing from `header_ref_ids` makes the
+/// order unknown (false).
+fn work_items_are_coordinate_sorted(
+    work_items: &[RowRangeWorkItem],
+    split_references: &HashSet<String>,
+    header_ref_ids: &HashMap<String, i32>,
+) -> bool {
+    let mut prev: Option<(i32, i64)> = None; // (header ref id, end_row)
+    for item in work_items {
+        if split_references.contains(&item.ref_name) {
+            return false;
+        }
+        let Some(&ref_id) = header_ref_ids.get(&item.ref_name) else {
+            return false;
+        };
+        if let Some((prev_ref_id, prev_end)) = prev {
+            let in_order = if ref_id == prev_ref_id {
+                item.start_row > prev_end
+            } else {
+                ref_id > prev_ref_id
+            };
+            if !in_order {
+                return false;
+            }
+        }
+        prev = Some((ref_id, item.end_row));
+    }
+    true
+}
+
+/// Plan every alignment table that will be output (PRIMARY, then SECONDARY
+/// unless `primary_only`), so a table that cannot be converted fails before any
+/// output is written and the output order is known in advance.
+pub fn plan_aligned_tables(db: &VDatabase, config: &AlignConfig<'_>) -> Result<AlignedPlan> {
+    let mut tables = Vec::new();
+    tables.extend(plan_table(db, PRIMARY_ALIGNMENT_TABLE, config)?);
+    if !config.primary_only && db.has_table(SECONDARY_ALIGNMENT_TABLE) {
+        tables.extend(plan_table(db, SECONDARY_ALIGNMENT_TABLE, config)?);
+    }
+    Ok(AlignedPlan { tables })
+}
+
+/// Process all aligned reads planned by [`plan_aligned_tables`], writing SAM/BAM
+/// records, one table after another.
+pub fn process_aligned_plan(
     db: &VDatabase,
+    plan: &AlignedPlan,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
     progress_interval: u64,
 ) -> Result<()> {
-    let mut plans = Vec::new();
-    plans.extend(plan_table(db, PRIMARY_ALIGNMENT_TABLE, config)?);
-    if !config.primary_only && db.has_table(SECONDARY_ALIGNMENT_TABLE) {
-        plans.extend(plan_table(db, SECONDARY_ALIGNMENT_TABLE, config)?);
-    }
-    for plan in &plans {
-        process_table_plan(db, plan, writer, config, progress_interval)?;
+    for table in &plan.tables {
+        process_table_plan(db, table, writer, config, progress_interval)?;
     }
     Ok(())
 }
@@ -864,7 +942,7 @@ fn process_table_plan(
     config: &AlignConfig<'_>,
     progress_interval: u64,
 ) -> Result<()> {
-    let TablePlan { table_name, reflist, work_items } = plan;
+    let TablePlan { table_name, reflist, work_items, .. } = plan;
     let table_name = *table_name;
 
     // Reference lengths for the distinct references, to size preload batches.
@@ -2015,6 +2093,92 @@ mod tests {
             collect_row_range_region_work_items(&boundaries, &["chrZ".into()], seqid_to_idx, 1)
                 .unwrap_err();
         assert!(err.to_string().contains("reference not found: chrZ"), "{err}");
+    }
+
+    /// A work item for `chr{ref_idx}` covering rows `start..=end`.
+    fn item(ref_idx: u32, start_row: i64, end_row: i64) -> RowRangeWorkItem {
+        let mut w = wi(ref_idx);
+        w.ref_name = format!("chr{ref_idx}");
+        w.start_row = start_row;
+        w.end_row = end_row;
+        w
+    }
+
+    /// Header `@SQ` ids for `chr0..chr{n-1}` in that order.
+    fn header_ids(n: u32) -> HashMap<String, i32> {
+        (0..n).map(|i| (format!("chr{i}"), i as i32)).collect()
+    }
+
+    #[test]
+    fn test_work_items_are_coordinate_sorted() {
+        let ids = header_ids(3);
+        let none = HashSet::new();
+        let sorted = [item(0, 1, 10), item(0, 11, 20), item(2, 21, 30)];
+        assert!(work_items_are_coordinate_sorted(&sorted, &none, &ids));
+        assert!(work_items_are_coordinate_sorted(&[], &none, &ids));
+        // Rows revisited within a reference (overlapping or repeated regions),
+        // including by a single row at the boundary.
+        for repeated in [[item(0, 1, 10), item(0, 5, 10)], [item(0, 1, 10), item(0, 10, 12)]] {
+            assert!(!work_items_are_coordinate_sorted(&repeated, &none, &ids));
+        }
+        // References go against header order, or a reference is revisited.
+        let header_swapped = HashMap::from([("chr0".to_string(), 1), ("chr1".to_string(), 0)]);
+        let items = [item(0, 1, 10), item(1, 11, 20)];
+        assert!(!work_items_are_coordinate_sorted(&items, &none, &header_swapped));
+        let revisit = [item(0, 1, 10), item(1, 11, 20), item(0, 21, 30)];
+        assert!(!work_items_are_coordinate_sorted(&revisit, &none, &ids));
+        // A reference missing from the header makes the order unknown.
+        assert!(!work_items_are_coordinate_sorted(&[item(5, 1, 10)], &none, &ids));
+    }
+
+    #[test]
+    fn test_split_references_break_order_only_when_output() {
+        let ids = header_ids(3);
+        let split = HashSet::from(["chr1".to_string()]);
+        // chr1's two runs are grouped: rows increase but positions restart.
+        let with_split = [item(0, 1, 10), item(1, 11, 20), item(1, 31, 40), item(2, 21, 30)];
+        assert!(!work_items_are_coordinate_sorted(&with_split, &split, &ids));
+        // An --aligned-region excluding chr1 is sorted despite chr1 being split.
+        let without_split = [item(0, 1, 10), item(2, 21, 30)];
+        assert!(work_items_are_coordinate_sorted(&without_split, &split, &ids));
+    }
+
+    #[test]
+    fn test_planned_work_items_of_reordered_batches_are_sorted() {
+        // Two batches covering disjoint references, stored out of order. The
+        // planner groups them into reference order, which is coordinate order
+        // even though rows no longer increase across references.
+        let runs = vec![boundary(2, 1, 10), boundary(0, 11, 20), boundary(1, 21, 30)];
+        let (grouped, split) = group_runs_by_reference(runs);
+        let items = collect_row_range_work_items(&grouped, 1);
+        let split: HashSet<String> = split.into_iter().collect();
+        assert!(work_items_are_coordinate_sorted(&items, &split, &header_ids(3)));
+    }
+
+    #[test]
+    fn test_planned_region_work_items_classification() {
+        let boundaries = boundaries_for(3);
+        let classify = |regions: &[&str]| {
+            let regions: Vec<String> = regions.iter().map(ToString::to_string).collect();
+            let items = collect_row_range_region_work_items(&boundaries, &regions, seqid_to_idx, 1)
+                .unwrap();
+            work_items_are_coordinate_sorted(&items, &HashSet::new(), &header_ids(3))
+        };
+        assert!(classify(&["chr0", "chr2"]));
+        assert!(!classify(&["chr2", "chr0"]), "regions out of @SQ order");
+        assert!(!classify(&["chr1:1-5", "chr1:3-9"]), "overlapping regions");
+    }
+
+    #[test]
+    fn test_tables_are_coordinate_sorted() {
+        let ids = header_ids(2);
+        let none = HashSet::new();
+        let items = [item(0, 1, 10), item(1, 11, 20)];
+        assert!(tables_are_coordinate_sorted(std::iter::empty(), &ids));
+        assert!(tables_are_coordinate_sorted([(&none, &items[..])].into_iter(), &ids));
+        // Secondary alignments follow all primary alignments.
+        let two = [(&none, &items[..]), (&none, &items[..])];
+        assert!(!tables_are_coordinate_sorted(two.into_iter(), &ids));
     }
 
     #[test]
