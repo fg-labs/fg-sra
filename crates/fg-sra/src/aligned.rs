@@ -231,6 +231,8 @@ struct RefLayout {
     /// Names of references whose alignments span more than one run. Output for
     /// these references is grouped but not coordinate-sorted.
     split_references: Vec<String>,
+    /// The table's rows: its first row id and number of rows.
+    rows: (i64, u64),
 }
 
 /// A row's sort key in a sorted alignment table: `(REF_ID, REF_POS)`.
@@ -415,6 +417,7 @@ fn find_ref_boundaries(
             boundaries: Vec::new(),
             num_sorted_segments: 0,
             split_references: Vec::new(),
+            rows: (first_row, 0),
         });
     }
     let last_row = first_row + total_count as i64 - 1;
@@ -444,7 +447,40 @@ fn find_ref_boundaries(
     }
     let (boundaries, split_references) = group_runs_by_reference(boundaries);
 
-    Ok(RefLayout { boundaries, num_sorted_segments: segments.len(), split_references })
+    Ok(RefLayout {
+        boundaries,
+        num_sorted_segments: segments.len(),
+        split_references,
+        rows: (first_row, total_count),
+    })
+}
+
+/// Check that `ranges` (inclusive row ranges, in any order) cover the table's
+/// `rows` (first row id, row count) exactly once each: a plan that dropped or
+/// repeated rows would silently lose or duplicate alignments.
+fn check_rows_covered(
+    table_name: &str,
+    mut ranges: Vec<(i64, i64)>,
+    (first_row, row_count): (i64, u64),
+) -> Result<()> {
+    ranges.sort_unstable();
+    let mut next = first_row;
+    for (start, end) in ranges {
+        anyhow::ensure!(
+            start == next && end >= start,
+            "{table_name}: planned rows {start}..={end} where row {next} was expected; the \
+             plan would drop or repeat alignments"
+        );
+        next = end + 1;
+    }
+    let end = first_row + row_count as i64;
+    anyhow::ensure!(
+        next == end,
+        "{table_name}: planned {} of {row_count} alignment rows; the plan would {}",
+        next - first_row,
+        if next < end { "drop alignments" } else { "read rows past the end of the table" }
+    );
+    Ok(())
 }
 
 /// The BAM `ref_id` of an output reference: its index among the output header's
@@ -817,7 +853,10 @@ fn plan_table(
         eprintln!("[layout] {}", split_layout_warning(table_name, &layout));
     }
     let mut work_items = if config.regions.is_empty() {
-        collect_row_range_work_items(&layout.boundaries, config.num_threads)
+        let items = collect_row_range_work_items(&layout.boundaries, config.num_threads);
+        let ranges = items.iter().map(|w| (w.start_row, w.end_row)).collect();
+        check_rows_covered(table_name, ranges, layout.rows)?;
+        items
     } else {
         let ref_idx_of = |name: &str| -> Result<u32> {
             let ref_obj =
@@ -2194,11 +2233,31 @@ mod tests {
     }
 
     #[test]
+    fn test_check_rows_covered() {
+        check_rows_covered("T", vec![(6, 10), (1, 5), (11, 11)], (1, 11)).unwrap();
+        check_rows_covered("T", vec![], (1, 0)).unwrap();
+        let gap = check_rows_covered("T", vec![(1, 5), (7, 11)], (1, 11)).unwrap_err();
+        assert!(gap.to_string().contains("row 6 was expected"), "{gap}");
+        let overlap = check_rows_covered("T", vec![(1, 6), (6, 11)], (1, 11)).unwrap_err();
+        assert!(overlap.to_string().contains("drop or repeat"), "{overlap}");
+        let short = check_rows_covered("T", vec![(1, 10)], (1, 11)).unwrap_err();
+        assert!(short.to_string().contains("planned 10 of 11"), "{short}");
+        let inverted = check_rows_covered("T", vec![(1, 5), (6, 5), (6, 11)], (1, 11));
+        assert!(inverted.is_err(), "an inverted range must not let row 6 repeat");
+        let past = check_rows_covered("T", vec![(1, 12)], (1, 11)).unwrap_err();
+        assert!(past.to_string().contains("planned 12 of 11"), "{past}");
+        assert!(past.to_string().contains("past the end"), "{past}");
+        let late = check_rows_covered("T", vec![(2, 11)], (1, 11)).unwrap_err();
+        assert!(late.to_string().contains("row 1 was expected"), "{late}");
+    }
+
+    #[test]
     fn test_split_layout_warning() {
         let layout = |split: &[&str]| RefLayout {
             boundaries: Vec::new(),
             num_sorted_segments: 3,
             split_references: split.iter().map(ToString::to_string).collect(),
+            rows: (1, 0),
         };
         assert_eq!(
             split_layout_warning("T", &layout(&["1", "2"])),
