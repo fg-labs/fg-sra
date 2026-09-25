@@ -10,6 +10,7 @@ mod info;
 mod matecache;
 mod md_tag;
 mod output;
+mod pending_file;
 mod progress;
 mod quality;
 mod record;
