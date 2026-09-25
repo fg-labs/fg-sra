@@ -1,3 +1,5 @@
 [submodule "vendor/ncbi-vdb"]
 	path = vendor/ncbi-vdb
 	url = https://github.com/ncbi/ncbi-vdb.git
+	# The build patches this checkout in place with vendor/patches/ncbi-vdb.
+	ignore = dirty

@@ -6,6 +6,9 @@
 //! 1. `VDB_INCDIR` / `VDB_LIBDIR` env vars — use a pre-built ncbi-vdb
 //! 2. `vendored` cargo feature — build ncbi-vdb from the git submodule via cmake
 //! 3. Neither — fail with a helpful error message
+//!
+//! The vendored source is first patched, in place, with `vendor/patches/ncbi-vdb/*.patch`: fixes
+//! not yet in an ncbi-vdb release.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -84,6 +87,8 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
              Run: git submodule update --init --recursive",
         );
 
+    apply_patches(&vdb_src, &vdb_src.join("../patches/ncbi-vdb"));
+
     let dst =
         cmake::Config::new(&vdb_src).define("LIBS_ONLY", "ON").build_target("ncbi-vdb").build();
 
@@ -117,6 +122,46 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
     println!("cargo:rerun-if-changed={}", vdb_src.display());
 
     (inc_dir, final_lib_dir)
+}
+
+/// Apply each `*.patch` in `patch_dir` to the ncbi-vdb source at `vdb_src`, in name order,
+/// skipping those already applied: the source is patched in place, so later builds find them
+/// there. The options used mean the same to GNU patch and to macOS's BSD patch.
+#[cfg(feature = "vendored")]
+fn apply_patches(vdb_src: &Path, patch_dir: &Path) {
+    use std::process::Command;
+
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(patch_dir)
+        .expect("vendor/patches/ncbi-vdb")
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+        .collect();
+    patches.sort();
+    for patch in &patches {
+        println!("cargo:rerun-if-changed={}", patch.display());
+        let run = |extra: &[&str]| {
+            Command::new("patch")
+                .args(["-p1", "-f", "-s", "-F0", "-d"])
+                .arg(vdb_src)
+                .args(extra)
+                .arg("-i")
+                .arg(patch)
+                .output()
+                .expect("failed to run patch")
+        };
+        // A patch that reverses cleanly is already applied.
+        if run(&["-R", "--dry-run"]).status.success() {
+            continue;
+        }
+        let applied = run(&[]);
+        assert!(
+            applied.status.success(),
+            "failed to apply {} to {}:\n{}",
+            patch.display(),
+            vdb_src.display(),
+            String::from_utf8_lossy(&applied.stdout)
+        );
+    }
 }
 
 /// Returns the OS-specific include directory for ncbi-vdb headers.
