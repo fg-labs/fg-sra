@@ -109,7 +109,7 @@ fn format_duration(d: Duration) -> String {
 }
 
 /// Format a `u64` with thousands separators: 1234567 -> "1,234,567".
-fn format_count(n: u64) -> String {
+pub(crate) fn format_count(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }

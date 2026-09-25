@@ -1,8 +1,10 @@
 //! fg-sra: High-performance SRA toolkit.
 
 mod aligned;
+mod archive;
 mod cigar;
 mod cli;
+mod fastq;
 mod header;
 mod matecache;
 mod md_tag;

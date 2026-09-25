@@ -39,6 +39,7 @@ Key features:
 - **Quality quantization**
 - **Reference cache warming** via `cache-refs` to avoid resolver failures under load
 - **Mate cache** for proper SAM flag and mate-pair information
+- **Paired FASTQ** via `fastq`: spot order, mates paired, multi-threaded BGZF, byte-identical at any thread count, checked against the archive's stored totals, for unaligned and aligned (cSRA) archives
 
 For aligned runs, `fg-sra` reconstructs each read from the stored alignment
 deltas rather than reading the virtual `READ` column: it preloads each aligned
@@ -116,6 +117,44 @@ For full usage, run:
 fg-sra tosam --help
 ```
 
+### Converting to FASTQ
+
+`fg-sra fastq` writes an archive's reads in spot order, with mates paired. Each spot's non-empty biological reads decide where it goes: two go to `--r1`/`--r2` (or `--interleaved`), and one goes to `--unpaired`. Spots with no biological reads or more than two are dropped and counted, as are spots whose output wasn't given; it is an error if nothing at all is written. Outputs ending `.gz` or `.bgz` are BGZF-compressed, and any output may be `-` for stdout.
+
+```bash
+# Pairs only, BGZF-compressed, with a metrics TSV
+fg-sra fastq SRR13232999.sra -1 r1.fq.gz -2 r2.fq.gz -m metrics.tsv
+
+# fasterq-dump/ENA-shaped output: pairs plus orphans and single-end reads
+fg-sra fastq SRR000001.sra -1 SRR000001_1.fastq.gz -2 SRR000001_2.fastq.gz -u SRR000001.fastq.gz
+
+# Stream interleaved pairs to an aligner
+fg-sra fastq SRR2584863.sra -p - | bwa mem -p ref.fa -
+
+# Technical reads (e.g. barcodes and indexes), one file per technical read, in step with the biological reads
+fg-sra fastq SRR13450125.sra -1 r1.fq.gz -2 r2.fq.gz --technical 'tech.{i}.fq.gz'
+
+# Original read names, fasterq-dump style, for the first million spots
+fg-sra fastq SRR2584863.sra --defline '$ac.$si $sn length=$rl' --max-spot-id 1000000 -1 a.fq -2 b.fq
+```
+
+Reads are named `<accession>.<spot>` by default, identically in every file. `--defline` takes a template with `$ac` (accession), `$si` (spot id), `$sn` (original name), `$sg` (spot group), `$ri` (read number within its type) and `$rl` (read length); the `+` line is always bare. `--min-read-len` and `--read-filter` test biological reads and drop the whole spot, so the outputs never go out of step. Runs loaded from BAM mark duplicates `criteria` and QC failures `reject`, so `--read-filter pass` drops duplicates too.
+
+Porting from sra-tools:
+
+| sra-tools | fg-sra fastq |
+|---|---|
+| `fasterq-dump` (split-3) | `-1 X_1.fq -2 X_2.fq -u X.fq` |
+| `--split-spot -Z` | `-p -` for pairs only: single-read spots need their own `-u X.fq`, since only one output can be stdout |
+| `--split-files --include-technical` | `-1`/`-2` or `-u`, plus `--technical 'X_tech{i}.fq'` |
+| `-M N` | `--min-read-len N` |
+| `-R pass` | `--read-filter pass` |
+| `-N A -X B` | `--min-spot-id A --max-spot-id B` |
+| `--seq-defline T --qual-defline '+'` | `--defline T` |
+| `--gzip`, pigz | a `.gz` output path |
+
+Aligned (cSRA) archives are converted too. Their references are loaded into memory first (about a byte per reference base, e.g. ~3 GB for a human genome), and each aligned read is rebuilt from its stored alignment, thread-safely, rather than through libncbi-vdb's virtual `READ` column. External references must be available locally (e.g. beside the archive, as `prefetch` puts them) or over the network; `--offline` turns network access off entirely. SRA Lite archives are converted with a warning, since their qualities are synthesised. Colour-space (SOLiD) runs are written in base space, as `fasterq-dump` writes them; `fastq-dump` needs `-B` for the same. PacBio and Oxford Nanopore native databases that have a `CONSENSUS` table are read from it by default (`--table auto`), as `fasterq-dump` reads them, rather than from `SEQUENCE`, which holds each molecule's subreads or strands as separate reads; `--table SEQUENCE` reads those instead, and `fastq-dump` needs `--table CONSENSUS` for the same.
+
 ### Pre-caching References
 
 When running many `fg-sra tosam` conversions concurrently, the VDB reference
@@ -139,6 +178,8 @@ reference sequence dependencies via VDB and caching them locally. Subsequent
 SRR20022182 converted to coordinate-sorted BAM (piped through `samtools sort`)
 completes in ~5s wall-clock time with ~400 MB peak memory. Use `--threads` to
 enable multi-threaded aligned read processing.
+
+`fg-sra fastq` converts SRR13232999 (9.5M paired spots, 2.9 Gbases, unaligned) to BGZF R1 and R2 at level 1 in ~3 s wall-clock with 8 threads on an Apple-silicon laptop; `fasterq-dump` takes ~7 s to write the same reads uncompressed. On the aligned SRR1574798 (26M spots, 5.3 Gbases, 39 embedded references) it takes ~13 s and 3.2 GB, against ~25 s and 4.3 GB for `fasterq-dump`, with identical output. At 16 threads on an M4 Max, ERR17774045 (69.8M paired spots, 14.1 Gbases, unaligned) takes ~7.3 s, against ~99 s for `fasterq-dump` writing uncompressed, and SRR7107873 (70.3M spots, 14.1 Gbases, aligned to 39 external RefSeq references) takes ~25 s and 5.5 GB, against ~53 s and 6.3 GB.
 
 ## Workspace Structure
 

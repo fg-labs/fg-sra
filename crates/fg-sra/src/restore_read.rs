@@ -24,6 +24,40 @@
 
 use std::fmt;
 
+use anyhow::{Result, bail, ensure};
+
+use crate::refstore::CHARSET_4NA;
+
+/// `READ_TYPE` bit (`INSDC:SRA:xread_type`) of a read aligned in sequencing orientation.
+const READ_TYPE_FORWARD: u8 = 2;
+
+/// `READ_TYPE` bit of a read aligned reverse-complemented.
+const READ_TYPE_REVERSE: u8 = 4;
+
+/// The complement of each `INSDC:dna:text` base: its 4na code bit-reversed (as the `map`
+/// in `seq-restore-read.c`) and mapped back through CHARSET, so `A`↔`T`, `C`↔`G`, `M`↔`K`,
+/// `R`↔`Y`, `V`↔`B`, `H`↔`D`, and `S`, `W`, `N` and `.` are their own. Other bytes are
+/// left as they are.
+static COMPLEMENT: [u8; 256] = complement_table();
+
+/// Build [`COMPLEMENT`] at compile time.
+const fn complement_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = byte as u8;
+        byte += 1;
+    }
+    let mut code = 0;
+    while code < 16 {
+        let reversed =
+            ((code & 1) << 3) | ((code & 2) << 1) | ((code & 4) >> 1) | ((code & 8) >> 3);
+        table[CHARSET_4NA[code] as usize] = CHARSET_4NA[reversed];
+        code += 1;
+    }
+    table
+}
+
 /// Error reconstructing a read; each variant mirrors an `rcInconsistent` return
 /// in the C implementation.
 #[derive(Debug, PartialEq, Eq)]
@@ -147,6 +181,76 @@ pub fn restore_read(
     Ok(())
 }
 
+/// Rebuild a spot's bases, as a cSRA `SEQUENCE.READ`, into `out` — a port of libncbi-vdb's
+/// `seq_restore_read_impl` (`libs/axf/seq-restore-read.c`, public domain like
+/// `align-restore-read.c` above).
+///
+/// - `cmp_read`: `CMP_READ`, the bases of the spot's unaligned reads, end to end.
+/// - `align_ids`: each read's `PRIMARY_ALIGNMENT_ID`; 0 for an unaligned read.
+/// - `read_lens`, `read_types`: each read's `READ_LEN` and `READ_TYPE`.
+/// - `aligned_read(id, buf)`: fills `buf` with alignment `id`'s bases in reference
+///   orientation, as `PRIMARY_ALIGNMENT.READ` would give them.
+///
+/// Reads go in slot order. An unaligned read takes the next bases of `cmp_read`. An aligned
+/// read must be exactly `READ_LEN` long, and is copied if its type has the FORWARD bit or
+/// reverse-complemented back to sequencing orientation if it has REVERSE; neither is an
+/// error. As in the C code, when `cmp_read` holds every base of the spot it is used as is.
+pub fn restore_spot(
+    cmp_read: &[u8],
+    align_ids: &[i64],
+    read_lens: &[u32],
+    read_types: &[u8],
+    mut aligned_read: impl FnMut(i64, &mut Vec<u8>) -> Result<()>,
+    aligned: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    let total: usize = read_lens.iter().map(|&len| len as usize).sum();
+    if total == cmp_read.len() {
+        out.extend_from_slice(cmp_read);
+        return Ok(());
+    }
+    ensure!(
+        align_ids.len() == read_lens.len() && read_types.len() == read_lens.len(),
+        "PRIMARY_ALIGNMENT_ID has {} values, READ_TYPE {} and READ_LEN {}",
+        align_ids.len(),
+        read_types.len(),
+        read_lens.len()
+    );
+    out.reserve(total);
+    let mut unaligned = cmp_read;
+    for ((&align_id, &len), &read_type) in align_ids.iter().zip(read_lens).zip(read_types) {
+        let len = len as usize;
+        if align_id <= 0 {
+            ensure!(
+                unaligned.len() >= len,
+                "CMP_READ has {} bases left but the next unaligned read has {len}",
+                unaligned.len()
+            );
+            let (read, rest) = unaligned.split_at(len);
+            out.extend_from_slice(read);
+            unaligned = rest;
+            continue;
+        }
+        aligned_read(align_id, aligned)?;
+        ensure!(
+            aligned.len() == len,
+            "alignment {align_id} has {} bases but its read has {len}",
+            aligned.len()
+        );
+        if read_type & READ_TYPE_FORWARD != 0 {
+            out.extend_from_slice(aligned);
+        } else if read_type & READ_TYPE_REVERSE != 0 {
+            out.extend(aligned.iter().rev().map(|&base| COMPLEMENT[usize::from(base)]));
+        } else {
+            bail!(
+                "alignment {align_id}'s read has neither orientation bit (READ_TYPE {read_type})"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -212,6 +316,70 @@ mod tests {
         let err = restore_read(b"AC", has_mismatch, b"", has_ref_offset, ref_offset, &[], &mut out)
             .expect_err("reconstruction should fail");
         assert_eq!(err, expected);
+    }
+
+    const B_FWD: u8 = 1 | READ_TYPE_FORWARD;
+    const B_REV: u8 = 1 | READ_TYPE_REVERSE;
+
+    /// Restore a spot whose alignment `id` has bases `"ACGGT"` followed by `id - 1` `N`s.
+    fn restore(cmp_read: &[u8], align_ids: &[i64], lens: &[u32], types: &[u8]) -> Result<Vec<u8>> {
+        let aligned_read = |id: i64, buf: &mut Vec<u8>| {
+            buf.clear();
+            buf.extend_from_slice(b"ACGGT");
+            buf.extend(std::iter::repeat_n(b'N', (id - 1) as usize));
+            Ok(())
+        };
+        let (mut aligned, mut out) = (Vec::new(), Vec::new());
+        restore_spot(cmp_read, align_ids, lens, types, aligned_read, &mut aligned, &mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn complement_follows_the_4na_bit_reversal() {
+        let complemented: Vec<u8> =
+            CHARSET_4NA.iter().map(|&b| COMPLEMENT[usize::from(b)]).collect();
+        assert_eq!(complemented, b".TGKCYSBAWRDMHVN");
+    }
+
+    #[test]
+    fn spot_of_unaligned_reads_is_cmp_read() {
+        let out = restore(b"AAAACC", &[0, 0], &[4, 2], &[B_FWD, B_REV]).unwrap();
+        assert_eq!(out, b"AAAACC");
+    }
+
+    #[test]
+    fn forward_aligned_read_is_copied() {
+        let out = restore(b"", &[1], &[5], &[B_FWD]).unwrap();
+        assert_eq!(out, b"ACGGT");
+    }
+
+    #[test]
+    fn reverse_aligned_read_is_reverse_complemented() {
+        let out = restore(b"", &[1], &[5], &[B_REV]).unwrap();
+        assert_eq!(out, b"ACCGT");
+    }
+
+    #[test]
+    fn aligned_and_unaligned_reads_are_spliced_in_slot_order() {
+        let out = restore(b"TTT", &[0, 1], &[3, 5], &[B_FWD, B_REV]).unwrap();
+        assert_eq!(out, b"TTTACCGT");
+        let out = restore(b"TTT", &[1, 0], &[5, 3], &[B_FWD, B_REV]).unwrap();
+        assert_eq!(out, b"ACGGTTTT");
+    }
+
+    #[test]
+    fn aligned_read_of_the_wrong_length_is_an_error() {
+        assert!(restore(b"", &[2], &[5], &[B_FWD]).is_err());
+    }
+
+    #[test]
+    fn aligned_read_without_an_orientation_is_an_error() {
+        assert!(restore(b"", &[1], &[5], &[1]).is_err());
+    }
+
+    #[test]
+    fn cmp_read_too_short_for_the_unaligned_reads_is_an_error() {
+        assert!(restore(b"TT", &[0, 1], &[3, 5], &[B_FWD, B_FWD]).is_err());
     }
 
     #[test]
