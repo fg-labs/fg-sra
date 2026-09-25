@@ -15,6 +15,7 @@
 #include <vdb/database.h>
 #include <vdb/table.h>
 #include <vdb/cursor.h>
+#include <vdb/blob.h>
 #include <vdb/vdb-priv.h>
 
 /* VFS resolver (remote access control) */

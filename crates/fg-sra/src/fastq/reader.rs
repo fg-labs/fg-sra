@@ -1,7 +1,9 @@
 //! Reading spots from an archive's reads table.
 
+use std::ops::RangeInclusive;
+
 use anyhow::{Context, Result, anyhow};
-use fg_sra_vdb::cursor::VCursor;
+use fg_sra_vdb::cursor::{BlobColumn, VCursor};
 use fg_sra_vdb::database::VTable;
 use fg_sra_vdb::error::VdbError;
 
@@ -10,10 +12,9 @@ use super::spot::Spot;
 use crate::refstore::{CHARSET_4NA, ReferenceRows, ReferenceStore, ref_window_len};
 use crate::restore_read::{restore_read, restore_spot};
 
-/// Bytes of VDB blob cache for each alignment cursor. Spots visit their alignments out of
-/// the alignment table's order, so a cache saves re-decoding blobs that neighbouring spots
-/// revisit.
-const ALIGNMENT_CURSOR_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Bytes of VDB blob cache for each alignment cursor. Each batch's alignments are read in
+/// ascending order, so little is revisited, but without a cache 2-9% more bytes are read.
+const ALIGNMENT_CURSOR_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// [`CHARSET_4NA`] with `U` for `T`, as the schema's text `READ` gives the bases of a table
 /// whose metadata marks them as RNA.
@@ -21,6 +22,11 @@ const CHARSET_4NA_RNA: &[u8; 16] = b".ACMGRSVUWYHKDBN";
 
 /// Something spots can be read from by id; each worker thread has its own.
 pub trait SpotSource {
+    /// Prepare to read the spots `ids`, which are read next, in order.
+    fn start_batch(&mut self, _ids: RangeInclusive<i64>) -> Result<()> {
+        Ok(())
+    }
+
     /// Read spot `id`. The spot borrows from the source until the next read.
     fn read(&mut self, id: i64) -> Result<Spot<'_>>;
 }
@@ -83,6 +89,7 @@ impl<'a> VdbSpotReader<'a> {
         let aligned = AlignedReads {
             alignments: AlignmentReader::new(alignments, references)?,
             prefetched,
+            batch: BatchReads::default(),
             cmp_read: Vec::new(),
             aligned: Vec::new(),
         };
@@ -96,9 +103,14 @@ impl<'a> VdbSpotReader<'a> {
         columns: ReadColumns,
         aligned: Option<AlignedReads<'a>>,
     ) -> Result<Self> {
+        // Uncached, as blob reads (`BlobColumn`) require; spots are read in row order, so the
+        // one blob each column holds serves its whole run of rows.
         let cursor = table.create_cursor_read()?;
         let add = |name: &str| {
-            cursor.add_column(name).with_context(|| format!("failed to read column {name}"))
+            cursor
+                .add_column(name)
+                .map(BlobColumn::new)
+                .with_context(|| format!("failed to read column {name}"))
         };
         let optional = |wanted: bool, name: &str| wanted.then(|| add(name)).transpose();
         // Bases are read as 4na codes and mapped to text here, which is cheaper than
@@ -113,7 +125,7 @@ impl<'a> VdbSpotReader<'a> {
             ("READ", CHARSET_4NA)
         };
         let (bases, charset) = match cursor.add_column(&format!("(INSDC:4na:bin){name}")) {
-            Ok(column) => (column, Some(charset)),
+            Ok(column) => (BlobColumn::new(column), Some(charset)),
             Err(_) => (add(&format!("(INSDC:dna:text){name}"))?, None),
         };
         let columns = ColumnIds {
@@ -135,38 +147,45 @@ impl<'a> VdbSpotReader<'a> {
     /// Copy spot `id`'s cells into the buffers; optional columns not read are left empty.
     /// For an aligned archive, the bases read are `CMP_READ`, still to be restored.
     fn read_cells(&mut self, id: i64) -> Result<(), VdbError> {
-        let (cursor, columns, buffers) = (&self.cursor, &self.columns, &mut self.buffers);
-        let read_optional = |column: Option<u32>, buffer: &mut Vec<u8>| {
+        let (cursor, columns, buffers) = (&self.cursor, &mut self.columns, &mut self.buffers);
+        let read_optional = |column: &mut Option<BlobColumn>, buffer: &mut Vec<u8>| {
             if let Some(column) = column {
-                cursor.read_u8_slice_into(id, column, buffer)
+                column.read_u8_slice_into(cursor, id, buffer)
             } else {
                 buffer.clear();
                 Ok(())
             }
         };
-        cursor.read_u8_slice_into(id, columns.bases, &mut buffers.bases)?;
+        columns.bases.read_u8_slice_into(cursor, id, &mut buffers.bases)?;
         if let Some(charset) = columns.charset {
             for base in &mut buffers.bases {
                 *base = charset[usize::from(*base & 0x0F)];
             }
         }
-        read_optional(columns.qualities, &mut buffers.qualities)?;
-        cursor.read_i32_slice_into(id, columns.read_starts, &mut buffers.read_starts)?;
-        cursor.read_u32_slice_into(id, columns.read_lens, &mut buffers.read_lens)?;
-        cursor.read_u8_slice_into(id, columns.read_types, &mut buffers.read_types)?;
-        cursor.read_u8_slice_into(id, columns.read_filters, &mut buffers.read_filters)?;
-        read_optional(columns.names, &mut buffers.name)?;
-        read_optional(columns.spot_groups, &mut buffers.spot_group)?;
+        read_optional(&mut columns.qualities, &mut buffers.qualities)?;
+        columns.read_starts.read_i32_slice_into(cursor, id, &mut buffers.read_starts)?;
+        columns.read_lens.read_u32_slice_into(cursor, id, &mut buffers.read_lens)?;
+        columns.read_types.read_u8_slice_into(cursor, id, &mut buffers.read_types)?;
+        columns.read_filters.read_u8_slice_into(cursor, id, &mut buffers.read_filters)?;
+        read_optional(&mut columns.names, &mut buffers.name)?;
+        read_optional(&mut columns.spot_groups, &mut buffers.spot_group)?;
         truncate_at_nul(&mut buffers.name);
         truncate_at_nul(&mut buffers.spot_group);
-        if let Some(column) = columns.align_ids {
-            cursor.read_i64_slice_into(id, column, &mut buffers.align_ids)?;
+        if let Some(column) = &mut columns.align_ids {
+            column.read_i64_slice_into(cursor, id, &mut buffers.align_ids)?;
         }
         Ok(())
     }
 }
 
 impl SpotSource for VdbSpotReader<'_> {
+    fn start_batch(&mut self, ids: RangeInclusive<i64>) -> Result<()> {
+        match (&mut self.aligned, &mut self.columns.align_ids) {
+            (Some(aligned), Some(column)) => aligned.restore_batch(&self.cursor, column, ids),
+            _ => Ok(()),
+        }
+    }
+
     fn read(&mut self, id: i64) -> Result<Spot<'_>> {
         self.read_cells(id).with_context(|| format!("failed to read spot {id}"))?;
         if let Some(aligned) = &mut self.aligned {
@@ -189,11 +208,13 @@ impl SpotSource for VdbSpotReader<'_> {
     }
 }
 
-/// Rebuilds an aligned archive's aligned reads for a reader: from the prefetched reads when
-/// they hold one, and otherwise through its own alignment cursor.
+/// Rebuilds an aligned archive's aligned reads for a reader: from the prefetched reads or the
+/// batch's when they hold one, and otherwise through its own alignment cursor.
 struct AlignedReads<'a> {
     alignments: AlignmentReader<'a>,
     prefetched: Option<&'a PrefetchedReads>,
+    /// The current batch's aligned reads that weren't prefetched.
+    batch: BatchReads,
     /// The spot's `CMP_READ`.
     cmp_read: Vec<u8>,
     /// The aligned read being rebuilt, in reference orientation.
@@ -201,12 +222,49 @@ struct AlignedReads<'a> {
 }
 
 impl AlignedReads<'_> {
+    /// Rebuild the aligned reads of spots `ids` that weren't prefetched, in alignment order,
+    /// reading the spots' `PRIMARY_ALIGNMENT_ID` through `column` of `cursor`.
+    ///
+    /// Some archives number their spots far out of alignment order, so a batch's spots, taken
+    /// in turn, revisit hundreds of blobs of the alignment columns: more than the cursor's
+    /// cache holds. In alignment order each blob is decoded once per batch.
+    fn restore_batch(
+        &mut self,
+        cursor: &VCursor,
+        column: &mut BlobColumn,
+        ids: RangeInclusive<i64>,
+    ) -> Result<()> {
+        let Self { alignments, prefetched, batch, .. } = self;
+        batch.clear();
+        for spot in ids {
+            column
+                .read_i64_slice_into(cursor, spot, &mut batch.cell)
+                .with_context(|| format!("failed to read spot {spot}'s alignment ids"))?;
+            let not_prefetched = |id: &i64| prefetched.is_none_or(|p| p.get(*id).is_none());
+            batch
+                .ids
+                .extend(batch.cell.iter().copied().filter(|&id| id > 0).filter(not_prefetched));
+        }
+        batch.ids.sort_unstable();
+        batch.ids.dedup();
+        let BatchReads { ids, starts, bases, read, .. } = batch;
+        for &id in ids.iter() {
+            alignments.restore(id, read)?;
+            starts.push(bases.len());
+            bases.extend_from_slice(read);
+        }
+        starts.push(bases.len());
+        Ok(())
+    }
+
     /// Replace `spot.bases`, which holds the spot's `CMP_READ`, with all of its bases.
     fn restore(&mut self, spot: &mut SpotBuffers) -> Result<()> {
-        let Self { alignments, prefetched, cmp_read, aligned } = self;
+        let Self { alignments, prefetched, batch, cmp_read, aligned } = self;
         std::mem::swap(&mut spot.bases, cmp_read);
         let aligned_read = |align_id: i64, out: &mut Vec<u8>| -> Result<()> {
-            if let Some(bases) = prefetched.and_then(|p| p.get(align_id)) {
+            if let Some(bases) =
+                prefetched.and_then(|p| p.get(align_id)).or_else(|| batch.get(align_id))
+            {
                 out.clear();
                 out.extend_from_slice(bases);
                 return Ok(());
@@ -222,6 +280,35 @@ impl AlignedReads<'_> {
             aligned,
             &mut spot.bases,
         )
+    }
+}
+
+/// Aligned reads rebuilt for one batch, looked up by alignment id; reused from batch to batch.
+#[derive(Default)]
+struct BatchReads {
+    /// Alignment ids, ascending.
+    ids: Vec<i64>,
+    /// `bases[starts[i]..starts[i + 1]]` is alignment `ids[i]`'s read, in reference orientation.
+    starts: Vec<usize>,
+    bases: Vec<u8>,
+    /// Scratch for a spot's `PRIMARY_ALIGNMENT_ID` cell.
+    cell: Vec<i64>,
+    /// Scratch for the read being rebuilt.
+    read: Vec<u8>,
+}
+
+impl BatchReads {
+    /// Forget the previous batch's reads.
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.starts.clear();
+        self.bases.clear();
+    }
+
+    /// Alignment `id`'s read, in reference orientation, if it was rebuilt for the batch.
+    fn get(&self, id: i64) -> Option<&[u8]> {
+        let index = self.ids.binary_search(&id).ok()?;
+        Some(&self.bases[self.starts[index]..self.starts[index + 1]])
     }
 }
 
@@ -291,20 +378,21 @@ impl<'a> AlignmentReader<'a> {
     }
 }
 
-/// Cursor column indices; `None` for optional columns not read.
+/// The reads table's columns, each holding its current blob; `None` for optional columns not
+/// read.
 struct ColumnIds {
-    bases: u32,
+    bases: BlobColumn,
     /// The text of each 4na code, when `bases` gives 4na codes rather than text.
     charset: Option<&'static [u8; 16]>,
-    qualities: Option<u32>,
-    read_starts: u32,
-    read_lens: u32,
-    read_types: u32,
-    read_filters: u32,
-    names: Option<u32>,
-    spot_groups: Option<u32>,
+    qualities: Option<BlobColumn>,
+    read_starts: BlobColumn,
+    read_lens: BlobColumn,
+    read_types: BlobColumn,
+    read_filters: BlobColumn,
+    names: Option<BlobColumn>,
+    spot_groups: Option<BlobColumn>,
     /// `PRIMARY_ALIGNMENT_ID`, for an aligned archive.
-    align_ids: Option<u32>,
+    align_ids: Option<BlobColumn>,
 }
 
 /// One spot's cells, reused from spot to spot.

@@ -104,7 +104,7 @@ impl VTable {
         let mut curs: *const fg_sra_vdb_sys::VCursor = ptr::null();
         let rc = unsafe { fg_sra_vdb_sys::VTableCreateCursorRead(self.ptr, &raw mut curs) };
         check_rc(rc)?;
-        Ok(VCursor::from_raw(curs))
+        Ok(VCursor::from_raw(curs, false))
     }
 
     /// Create a cached read cursor with the given cache capacity in bytes.
@@ -114,7 +114,7 @@ impl VTable {
             fg_sra_vdb_sys::VTableCreateCachedCursorRead(self.ptr, &raw mut curs, capacity)
         };
         check_rc(rc)?;
-        Ok(VCursor::from_raw(curs))
+        Ok(VCursor::from_raw(curs, capacity > 0))
     }
 
     /// List readable column names.

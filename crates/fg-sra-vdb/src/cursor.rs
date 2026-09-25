@@ -1,8 +1,10 @@
 //! Safe wrapper for `VCursor` with typed column reads.
 //!
 //! Provides methods for adding columns, opening the cursor, and reading
-//! typed cell data via `VCursorCellDataDirect`.
+//! typed cell data via `VCursorCellDataDirect`, or through each column's
+//! blobs with [`BlobColumn`].
 
+use std::ops::RangeInclusive;
 use std::ptr;
 use std::slice;
 
@@ -29,13 +31,15 @@ fn check_elem_bits(actual: u32, expected: u32) -> Result<(), VdbError> {
 /// `VCursorCellDataDirect` (zero-copy access into VDB page cache).
 pub struct VCursor {
     ptr: *const fg_sra_vdb_sys::VCursor,
+    /// Whether the cursor keeps a cache of recently read blobs.
+    cached: bool,
 }
 
 unsafe impl Send for VCursor {}
 
 impl VCursor {
-    pub(crate) fn from_raw(ptr: *const fg_sra_vdb_sys::VCursor) -> Self {
-        Self { ptr }
+    pub(crate) fn from_raw(ptr: *const fg_sra_vdb_sys::VCursor, cached: bool) -> Self {
+        Self { ptr, cached }
     }
 
     /// Add a column to an unopened cursor.
@@ -95,12 +99,7 @@ impl VCursor {
         col_idx: u32,
         expected_bits: u32,
     ) -> Result<T, VdbError> {
-        let data = self.cell_data_direct(row_id, col_idx)?;
-        if data.row_len == 0 {
-            return Ok(T::default());
-        }
-        check_elem_bits(data.elem_bits, expected_bits)?;
-        Ok(unsafe { *data.base.cast::<T>() })
+        self.cell_data_direct(row_id, col_idx)?.scalar(expected_bits)
     }
 
     /// Read a slice of values from a multi-element cell.
@@ -130,15 +129,7 @@ impl VCursor {
         expected_bits: u32,
         buf: &mut Vec<T>,
     ) -> Result<(), VdbError> {
-        buf.clear();
-        let data = self.cell_data_direct(row_id, col_idx)?;
-        if data.row_len == 0 {
-            return Ok(());
-        }
-        check_elem_bits(data.elem_bits, expected_bits)?;
-        let values = unsafe { slice::from_raw_parts(data.base.cast::<T>(), data.row_len as usize) };
-        buf.extend_from_slice(values);
-        Ok(())
+        self.cell_data_direct(row_id, col_idx)?.copy_into(expected_bits, buf)
     }
 
     /// Read a single `i64` value from a cell.
@@ -300,6 +291,37 @@ impl VCursor {
         })
     }
 
+    /// The blob of column `col_idx` holding row `row_id`, or `None` for a row the column has no
+    /// value for.
+    ///
+    /// Refused on a cursor with a blob cache: there `VCursorGetBlobDirect` hands out one
+    /// reference too many whenever the blob was not already cached (`VCursorReadColumnDirectInt`
+    /// passes on the blob it produced without releasing it, then `VTableCursorGetBlobDirect`
+    /// adds its own), so the blob would never be freed.
+    pub(crate) fn blob_direct(&self, row_id: i64, col_idx: u32) -> Result<Option<VBlob>, VdbError> {
+        if self.cached {
+            return Err(VdbError::BlobReadOnCachedCursor);
+        }
+        let mut blob: *const fg_sra_vdb_sys::VBlob = ptr::null();
+        let rc = unsafe {
+            fg_sra_vdb_sys::VCursorGetBlobDirect(self.ptr, &raw mut blob, row_id, col_idx)
+        };
+        check_rc(rc)?;
+        if blob.is_null() {
+            return Ok(None);
+        }
+        let mut first: i64 = 0;
+        let mut count: u64 = 0;
+        let rc = unsafe { fg_sra_vdb_sys::VBlobIdRange(blob, &raw mut first, &raw mut count) };
+        match check_rc(rc).and_then(|()| blob_rows(row_id, first, count)) {
+            Ok(rows) => Ok(Some(VBlob { ptr: blob, rows })),
+            Err(e) => {
+                unsafe { fg_sra_vdb_sys::VBlobRelease(blob) };
+                Err(e)
+            }
+        }
+    }
+
     /// Get the raw cursor pointer (for passing to `PlacementIterator` creation).
     pub(crate) fn as_ptr(&self) -> *const fg_sra_vdb_sys::VCursor {
         self.ptr
@@ -314,12 +336,159 @@ impl Drop for VCursor {
     }
 }
 
-/// Raw cell data from `VCursorCellDataDirect`.
+/// Reads one column's cells through its blobs, keeping the blob of the last row read so that
+/// rows of the same blob are served from it directly rather than through the cursor's column
+/// production chain, which `VCursorCellDataDirect` walks on every call.
+///
+/// Reads fail with [`VdbError::BlobReadOnCachedCursor`] on a cursor made with a blob cache.
+pub struct BlobColumn {
+    col_idx: u32,
+    blob: Option<VBlob>,
+}
+
+impl BlobColumn {
+    /// A reader of the column at `col_idx` of the cursor it is later read through.
+    #[must_use]
+    pub fn new(col_idx: u32) -> Self {
+        Self { col_idx, blob: None }
+    }
+
+    /// Read a slice of `u8` values from row `row_id`'s cell into `buf`, replacing its contents.
+    pub fn read_u8_slice_into(
+        &mut self,
+        cursor: &VCursor,
+        row_id: i64,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), VdbError> {
+        self.cell(cursor, row_id)?.copy_into(8, buf)
+    }
+
+    /// Read a slice of `i32` values from row `row_id`'s cell into `buf`, replacing its contents.
+    pub fn read_i32_slice_into(
+        &mut self,
+        cursor: &VCursor,
+        row_id: i64,
+        buf: &mut Vec<i32>,
+    ) -> Result<(), VdbError> {
+        self.cell(cursor, row_id)?.copy_into(32, buf)
+    }
+
+    /// Read a slice of `u32` values from row `row_id`'s cell into `buf`, replacing its contents.
+    pub fn read_u32_slice_into(
+        &mut self,
+        cursor: &VCursor,
+        row_id: i64,
+        buf: &mut Vec<u32>,
+    ) -> Result<(), VdbError> {
+        self.cell(cursor, row_id)?.copy_into(32, buf)
+    }
+
+    /// Read a slice of `i64` values from row `row_id`'s cell into `buf`, replacing its contents.
+    pub fn read_i64_slice_into(
+        &mut self,
+        cursor: &VCursor,
+        row_id: i64,
+        buf: &mut Vec<i64>,
+    ) -> Result<(), VdbError> {
+        self.cell(cursor, row_id)?.copy_into(64, buf)
+    }
+
+    /// Row `row_id`'s cell, from the blob held if it has the row and otherwise from the blob
+    /// `cursor` gives for the row, which is then held. An empty cell stands for a row the
+    /// column has no value for.
+    fn cell(&mut self, cursor: &VCursor, row_id: i64) -> Result<CellData, VdbError> {
+        if !self.blob.as_ref().is_some_and(|blob| blob.rows.contains(&row_id)) {
+            self.blob = cursor.blob_direct(row_id, self.col_idx)?;
+        }
+        match &self.blob {
+            Some(blob) => blob.cell_data(row_id),
+            None => Ok(CellData::EMPTY),
+        }
+    }
+}
+
+/// The rows of a blob reported to start at row `first` and hold `count` rows, which must
+/// include `row_id`, the row it was read for.
+fn blob_rows(row_id: i64, first: i64, count: u64) -> Result<RangeInclusive<i64>, VdbError> {
+    let last = i64::try_from(count).ok().and_then(|count| first.checked_add(count - 1));
+    match last {
+        Some(last) if (first..=last).contains(&row_id) => Ok(first..=last),
+        _ => Err(VdbError::BlobMissesRow { row: row_id, first, count }),
+    }
+}
+
+/// A reference to one of a column's blobs: the cells of a run of rows, decoded.
+pub(crate) struct VBlob {
+    ptr: *const fg_sra_vdb_sys::VBlob,
+    /// The rows the blob holds.
+    rows: RangeInclusive<i64>,
+}
+
+// A blob is reference-counted data that libncbi-vdb no longer touches once handed out, so it
+// can move to the thread that reads it, like the cursor it came from.
+unsafe impl Send for VBlob {}
+
+impl VBlob {
+    /// Raw cell data of row `row_id`, which must be one of the blob's rows.
+    fn cell_data(&self, row_id: i64) -> Result<CellData, VdbError> {
+        let mut elem_bits: u32 = 0;
+        let mut base: *const std::ffi::c_void = ptr::null();
+        let mut boff: u32 = 0;
+        let mut row_len: u32 = 0;
+        let rc = unsafe {
+            fg_sra_vdb_sys::VBlobCellData(
+                self.ptr,
+                row_id,
+                &raw mut elem_bits,
+                &raw mut base,
+                &raw mut boff,
+                &raw mut row_len,
+            )
+        };
+        check_rc(rc)?;
+        Ok(CellData { elem_bits, base, _boff: boff, row_len })
+    }
+}
+
+impl Drop for VBlob {
+    fn drop(&mut self) {
+        unsafe { fg_sra_vdb_sys::VBlobRelease(self.ptr) };
+    }
+}
+
+/// Raw cell data from `VCursorCellDataDirect` or `VBlobCellData`.
 struct CellData {
     elem_bits: u32,
     base: *const std::ffi::c_void,
     _boff: u32,
     row_len: u32,
+}
+
+impl CellData {
+    /// The cell of a row a column has no value for.
+    const EMPTY: Self = Self { elem_bits: 0, base: ptr::null(), _boff: 0, row_len: 0 };
+
+    /// The cell's first value as `T`, whose width is `expected_bits`; the default for an
+    /// empty cell.
+    fn scalar<T: Copy + Default>(&self, expected_bits: u32) -> Result<T, VdbError> {
+        if self.row_len == 0 {
+            return Ok(T::default());
+        }
+        check_elem_bits(self.elem_bits, expected_bits)?;
+        Ok(unsafe { *self.base.cast::<T>() })
+    }
+
+    /// Replace `buf`'s contents with the cell's values as `T`, whose width is `expected_bits`.
+    fn copy_into<T: Copy>(&self, expected_bits: u32, buf: &mut Vec<T>) -> Result<(), VdbError> {
+        buf.clear();
+        if self.row_len == 0 {
+            return Ok(());
+        }
+        check_elem_bits(self.elem_bits, expected_bits)?;
+        let values = unsafe { slice::from_raw_parts(self.base.cast::<T>(), self.row_len as usize) };
+        buf.extend_from_slice(values);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +508,22 @@ mod tests {
             check_elem_bits(8, 32),
             Err(VdbError::ElemBitsMismatch { expected: 32, actual: 8 })
         );
+    }
+
+    #[test]
+    fn blob_rows_run_from_the_first_row_for_the_count_given() {
+        assert_eq!(blob_rows(12, 10, 5), Ok(10..=14));
+        assert_eq!(blob_rows(7, 7, 1), Ok(7..=7));
+    }
+
+    #[test]
+    fn blob_without_the_row_read_is_refused() {
+        let misses = |row, first, count| Err(VdbError::BlobMissesRow { row, first, count });
+        assert_eq!(blob_rows(10, 10, 0), misses(10, 10, 0));
+        assert_eq!(blob_rows(15, 10, 5), misses(15, 10, 5));
+        assert_eq!(blob_rows(9, 10, 5), misses(9, 10, 5));
+        assert_eq!(blob_rows(i64::MAX, 2, u64::MAX), misses(i64::MAX, 2, u64::MAX));
+        assert_eq!(blob_rows(i64::MAX, i64::MAX, 2), misses(i64::MAX, i64::MAX, 2));
     }
 
     #[test]

@@ -326,6 +326,7 @@ fn convert_batch<S: SpotSource>(
     let layout = &config.layout;
     let formatter = &config.formatter;
     let mut tally = WorkerTally::default();
+    source.start_batch(ids.clone())?;
     for id in ids {
         let spot = source.read(id)?;
         spot.validate(config.with_qualities)?;
@@ -456,6 +457,7 @@ fn write_output(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::fastq::defline::Defline;
@@ -490,6 +492,28 @@ mod tests {
             let stack = std::hint::black_box([1u8; 8 << 20]);
             assert_eq!(stack[stack.len() - 1], 1);
             self.0.read(id)
+        }
+    }
+
+    /// A source that logs each batch it is told of, and fails a read outside that batch.
+    struct BatchLoggingSource {
+        source: TestSource,
+        batch: Option<RangeInclusive<i64>>,
+        log: Arc<Mutex<Vec<RangeInclusive<i64>>>>,
+    }
+
+    impl SpotSource for BatchLoggingSource {
+        fn start_batch(&mut self, ids: RangeInclusive<i64>) -> Result<()> {
+            self.log.lock().unwrap().push(ids.clone());
+            self.batch = Some(ids);
+            Ok(())
+        }
+
+        fn read(&mut self, id: i64) -> Result<Spot<'_>> {
+            if !self.batch.as_ref().is_some_and(|batch| batch.contains(&id)) {
+                anyhow::bail!("spot {id} read outside the batch started, {:?}", self.batch);
+            }
+            self.source.read(id)
         }
     }
 
@@ -600,6 +624,21 @@ mod tests {
         let sources: Vec<_> = sources(3, 2).into_iter().map(DeepStackSource).collect();
         run_to(sources, 1..=3, &outputs, &config(paired_layout())).unwrap();
         assert_eq!(names(&read_text(&dir.join("r1.fq"))), ["@T.1/1"]);
+    }
+
+    #[test]
+    fn each_batch_is_started_before_its_spots_are_read() {
+        let dir = scratch_dir("batches");
+        let outputs = ["r1.fq", "r2.fq", "u.fq"].map(|n| output(&dir, n, Encoding::Plain));
+        let log = Arc::default();
+        let sources: Vec<_> = sources(10, 3)
+            .into_iter()
+            .map(|source| BatchLoggingSource { source, batch: None, log: Arc::clone(&log) })
+            .collect();
+        run_to(sources, 1..=10, &outputs, &config(paired_layout())).unwrap();
+        let mut batches = log.lock().unwrap().clone();
+        batches.sort_by_key(|batch| *batch.start());
+        assert_eq!(batches, [1..=4, 5..=8, 9..=10]);
     }
 
     #[test]

@@ -204,7 +204,7 @@ SRR20022182 converted to coordinate-sorted BAM (piped through `samtools sort`)
 completes in ~5s wall-clock time with ~400 MB peak memory. Use `--threads` to
 enable multi-threaded aligned read processing.
 
-`fg-sra fastq` converts SRR13232999 (9.5M paired spots, 2.9 Gbases, unaligned) to BGZF R1 and R2 at level 1 in ~3 s wall-clock with 8 threads on an Apple-silicon laptop; `fasterq-dump` takes ~7 s to write the same reads uncompressed. On the aligned SRR1574798 (26M spots, 5.3 Gbases, 39 embedded references) it takes ~13 s and 3.2 GB, against ~25 s and 4.3 GB for `fasterq-dump`, with identical output. At 16 threads on an M4 Max, ERR17774045 (69.8M paired spots, 14.1 Gbases, unaligned) takes ~7.3 s, against ~99 s for `fasterq-dump` writing uncompressed, and SRR7107873 (70.3M spots, 14.1 Gbases, aligned to 39 external RefSeq references) takes ~25 s and 5.5 GB, against ~53 s and 6.3 GB.
+`fg-sra fastq` converts SRR13232999 (9.5M paired spots, 2.9 Gbases, unaligned) to BGZF R1 and R2 at level 1 in ~2.8 s wall-clock with 8 threads on an Apple-silicon laptop; `fasterq-dump` takes ~7 s to write the same reads uncompressed. On the aligned SRR1574798 (26M spots, 5.3 Gbases, 39 embedded references) it takes ~11.4 s and 3.8 GB, against ~25 s and 4.3 GB for `fasterq-dump`, with identical output. At 16 threads on an M4 Max, ERR17774045 (69.8M paired spots, 14.1 Gbases, unaligned) takes ~6.8 s, against ~99 s for `fasterq-dump` writing uncompressed, and SRR7107873 (70.3M spots, 14.1 Gbases, aligned to 39 external RefSeq references) takes ~20 s and 5.2 GB, against ~53 s and 6.3 GB.
 
 ## Workspace Structure
 

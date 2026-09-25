@@ -264,6 +264,11 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("VCursorOpen")
         .allowlist_function("VCursorCellDataDirect")
         .allowlist_function("VCursorIdRange")
+        .allowlist_function("VCursorGetBlobDirect")
+        // VBlob
+        .allowlist_function("VBlobIdRange")
+        .allowlist_function("VBlobCellData")
+        .allowlist_function("VBlobRelease")
         .allowlist_function("VCursorRelease")
         // KMetadata / KMDataNode
         .allowlist_function("KMetadataRelease")

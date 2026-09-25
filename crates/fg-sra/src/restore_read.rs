@@ -129,6 +129,17 @@ pub fn restore_read(
         });
     }
     let dst_len = has_mismatch.len();
+    // Most reads have no reference offsets and lie within their window; they are the reference
+    // bases with the mismatches patched in, which the general loop below finds one base at a
+    // time. A read that overhangs its window is left to the loop, which reports the first
+    // position that needs a reference base outside it.
+    if ref_offset.is_empty()
+        && read_len.is_empty()
+        && dst_len <= ref_read.len()
+        && all_zero(has_ref_offset)
+    {
+        return restore_ungapped(ref_read, has_mismatch, mismatch, out);
+    }
     out.clear();
     out.reserve(dst_len);
 
@@ -179,6 +190,46 @@ pub fn restore_read(
     }
 
     Ok(())
+}
+
+/// Rebuild a read without reference offsets, whose window `ref_read` holds at least
+/// `has_mismatch.len()` bases: the first bases of the window, with each mismatch written over
+/// the position of its set `has_mismatch` flag. Gives what [`restore_read`]'s general loop
+/// gives for the same input, including its error for too few mismatches.
+fn restore_ungapped(
+    ref_read: &[u8],
+    has_mismatch: &[u8],
+    mismatch: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), RestoreReadError> {
+    out.clear();
+    out.extend_from_slice(&ref_read[..has_mismatch.len()]);
+    let mut next_mismatch = 0;
+    let mut pos = 0;
+    for flags in has_mismatch.chunks(8) {
+        if all_zero(flags) {
+            pos += flags.len();
+            continue;
+        }
+        for &flag in flags {
+            if flag != 0 {
+                let &base = mismatch
+                    .get(next_mismatch)
+                    .ok_or(RestoreReadError::MismatchExhausted { pos })?;
+                out[pos] = base;
+                next_mismatch += 1;
+            }
+            pos += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Whether every byte of `flags` is zero, tested eight bytes at a time.
+fn all_zero(flags: &[u8]) -> bool {
+    let mut words = flags.chunks_exact(8);
+    let whole = words.by_ref().all(|word| word.iter().fold(0, |acc, &b| acc | b) == 0);
+    whole && words.remainder().iter().all(|&b| b == 0)
 }
 
 /// Rebuild a spot's bases, as a cSRA `SEQUENCE.READ`, into `out` — a port of libncbi-vdb's
@@ -388,5 +439,69 @@ mod tests {
         let err = restore_read(b"AC", &[1, 0, 0, 0], b"", &[0, 0, 0, 0], &[], &[], &mut out)
             .expect_err("reconstruction should fail");
         assert_eq!(err, RestoreReadError::MismatchExhausted { pos: 0 });
+    }
+
+    /// A 40-base reference window of `A`s, and `has_mismatch` flags set at `positions`.
+    fn ungapped_input(positions: &[usize]) -> (Vec<u8>, Vec<u8>) {
+        let mut has_mismatch = vec![0u8; 40];
+        for &pos in positions {
+            has_mismatch[pos] = 1;
+        }
+        (vec![b'A'; 40], has_mismatch)
+    }
+
+    #[test]
+    fn ungapped_read_without_mismatches_is_the_reference_window() {
+        let (reference, has_mismatch) = ungapped_input(&[]);
+        let mut out = Vec::new();
+        restore_read(&reference[..37], &has_mismatch[..37], b"", &[0; 37], &[], &[], &mut out)
+            .unwrap();
+        assert_eq!(out, vec![b'A'; 37]);
+    }
+
+    #[test]
+    fn ungapped_mismatches_are_patched_at_their_flags() {
+        let (reference, has_mismatch) = ungapped_input(&[0, 7, 8, 15, 16, 39]);
+        let mut out = Vec::new();
+        restore_read(&reference, &has_mismatch, b"CGTCGT", &[0; 40], &[], &[], &mut out).unwrap();
+        let mut expected = vec![b'A'; 40];
+        for (pos, base) in [0, 7, 8, 15, 16, 39].into_iter().zip(b"CGTCGT") {
+            expected[pos] = *base;
+        }
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn ungapped_read_shorter_than_its_window_takes_the_first_bases() {
+        let mut out = Vec::new();
+        restore_read(b"ACGTACGT", &[0, 1, 0], b"T", &[0, 0, 0], &[], &[], &mut out).unwrap();
+        assert_eq!(out, b"ATG");
+    }
+
+    #[test]
+    fn ungapped_read_reports_mismatch_shortage_at_its_flag() {
+        let (reference, has_mismatch) = ungapped_input(&[3, 20]);
+        let mut out = Vec::new();
+        let err = restore_read(&reference, &has_mismatch, b"C", &[0; 40], &[], &[], &mut out)
+            .expect_err("one mismatch for two flags");
+        assert_eq!(err, RestoreReadError::MismatchExhausted { pos: 20 });
+    }
+
+    #[test]
+    fn ungapped_read_reuses_the_output_buffer() {
+        let mut out = b"stale".to_vec();
+        restore_read(b"ACGT", &[0, 0], b"", &[0, 0], &[], &[], &mut out).unwrap();
+        assert_eq!(out, b"AC");
+    }
+
+    #[test]
+    fn all_zero_tests_every_byte() {
+        assert!(all_zero(&[]));
+        assert!(all_zero(&[0; 17]));
+        for pos in [0, 7, 8, 15, 16] {
+            let mut flags = [0u8; 17];
+            flags[pos] = 1;
+            assert!(!all_zero(&flags), "flag at {pos}");
+        }
     }
 }

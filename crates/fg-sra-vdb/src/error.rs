@@ -33,6 +33,20 @@ pub enum VdbError {
         /// Bits per element the cell actually stores.
         actual: u32,
     },
+    /// Cells were read through their blobs on a cursor with a blob cache. libncbi-vdb hands
+    /// out one reference too many for each blob it has to add to the cache, which would never
+    /// be freed, so blob reads are refused on cached cursors.
+    BlobReadOnCachedCursor,
+    /// The blob libncbi-vdb gave for a row does not hold that row, e.g. it reports no rows or
+    /// a range past the largest row id.
+    BlobMissesRow {
+        /// The row the blob was read for.
+        row: i64,
+        /// The blob's first row, as reported.
+        first: i64,
+        /// The blob's row count, as reported.
+        count: u64,
+    },
 }
 
 /// The `rcDone` state value, indicating iteration is complete (not an error).
@@ -82,7 +96,11 @@ impl VdbError {
     pub fn rc(&self) -> Option<u32> {
         match self {
             Self::Rc(rc) => Some(*rc),
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => None,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => None,
         }
     }
 
@@ -91,7 +109,11 @@ impl VdbError {
     pub fn state(&self) -> u32 {
         match self {
             Self::Rc(rc) => rc & 0x3F,
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => 0,
         }
     }
 
@@ -100,7 +122,11 @@ impl VdbError {
     pub fn object(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 6) & 0xFF,
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => 0,
         }
     }
 
@@ -109,7 +135,11 @@ impl VdbError {
     pub fn context(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 14) & 0x7F,
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => 0,
         }
     }
 
@@ -118,7 +148,11 @@ impl VdbError {
     pub fn target(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 21) & 0x3F,
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => 0,
         }
     }
 
@@ -127,7 +161,11 @@ impl VdbError {
     pub fn module(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 27) & 0x1F,
-            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte
+            | Self::PercentInPath
+            | Self::ElemBitsMismatch { .. }
+            | Self::BlobReadOnCachedCursor
+            | Self::BlobMissesRow { .. } => 0,
         }
     }
 }
@@ -156,6 +194,13 @@ impl fmt::Display for VdbError {
             Self::ElemBitsMismatch { expected, actual } => write!(
                 f,
                 "VDB error: cell element width {actual} bits does not match expected {expected} bits"
+            ),
+            Self::BlobReadOnCachedCursor => {
+                write!(f, "VDB error: blob reads need a cursor without a blob cache")
+            }
+            Self::BlobMissesRow { row, first, count } => write!(
+                f,
+                "VDB error: the blob read for row {row} holds {count} rows from row {first}"
             ),
         }
     }

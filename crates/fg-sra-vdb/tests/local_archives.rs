@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use fg_sra_vdb::cursor::{BlobColumn, VCursor};
 use fg_sra_vdb::database::VTable;
 use fg_sra_vdb::error::VdbError;
 use fg_sra_vdb::manager::{PathType, VdbManager};
@@ -39,6 +40,35 @@ fn row_count(table: &VTable) -> u64 {
 
 fn manager() -> VdbManager {
     VdbManager::make_read().unwrap()
+}
+
+/// Rows read by the blob-read tests: enough to span several blobs of any column.
+const BLOB_TEST_ROWS: std::ops::RangeInclusive<i64> = 1..=20_000;
+
+/// Asserts that reading `column` of `table` through its blobs, at each of `rows` in turn, gives
+/// the cells that reading it cell by cell does. Each way reads through its own cursor.
+fn assert_blob_reads_match_cell_reads<T: PartialEq + std::fmt::Debug>(
+    table: &VTable,
+    column: &str,
+    rows: impl Iterator<Item = i64>,
+    cell_read: impl Fn(&VCursor, i64, u32, &mut Vec<T>) -> Result<(), VdbError>,
+    blob_read: impl Fn(&mut BlobColumn, &VCursor, i64, &mut Vec<T>) -> Result<(), VdbError>,
+) {
+    let open = || {
+        let cursor = table.create_cursor_read().unwrap();
+        let col = cursor.add_column(column).unwrap();
+        cursor.open().unwrap();
+        (cursor, col)
+    };
+    let (cell_cursor, cell_col) = open();
+    let (blob_cursor, blob_col) = open();
+    let mut blobs = BlobColumn::new(blob_col);
+    let (mut expected, mut actual) = (Vec::new(), Vec::new());
+    for row in rows {
+        cell_read(&cell_cursor, row, cell_col, &mut expected).unwrap();
+        blob_read(&mut blobs, &blob_cursor, row, &mut actual).unwrap();
+        assert_eq!(actual, expected, "{column} row {row}");
+    }
 }
 
 #[test]
@@ -156,4 +186,83 @@ fn aligned_sequence_spot_count_statistic_matches_its_row_count() {
     let meta = sequence.open_metadata_read().unwrap();
     let spot_count = meta.open_node_read("STATS/TABLE/SPOT_COUNT").unwrap().read_u64().unwrap();
     assert_eq!(spot_count, row_count(&sequence));
+}
+
+#[test]
+fn flat_table_blob_reads_match_cell_reads() {
+    let Some(sra) = archive_from_env("FG_SRA_TEST_TABLE_SRA") else { return };
+    let table = manager().open_table_read(&sra).unwrap();
+    for column in
+        ["(INSDC:4na:bin)READ", "(INSDC:quality:phred)QUALITY", "(INSDC:SRA:xread_type)READ_TYPE"]
+    {
+        assert_blob_reads_match_cell_reads(
+            &table,
+            column,
+            BLOB_TEST_ROWS,
+            VCursor::read_u8_slice_into,
+            BlobColumn::read_u8_slice_into,
+        );
+    }
+    assert_blob_reads_match_cell_reads(
+        &table,
+        "(INSDC:coord:zero)READ_START",
+        BLOB_TEST_ROWS,
+        VCursor::read_i32_slice_into,
+        BlobColumn::read_i32_slice_into,
+    );
+    assert_blob_reads_match_cell_reads(
+        &table,
+        "(INSDC:coord:len)READ_LEN",
+        BLOB_TEST_ROWS,
+        VCursor::read_u32_slice_into,
+        BlobColumn::read_u32_slice_into,
+    );
+}
+
+#[test]
+fn blob_reads_in_descending_row_order_match_cell_reads() {
+    let Some(sra) = archive_from_env("FG_SRA_TEST_TABLE_SRA") else { return };
+    let table = manager().open_table_read(&sra).unwrap();
+    assert_blob_reads_match_cell_reads(
+        &table,
+        "(INSDC:quality:phred)QUALITY",
+        BLOB_TEST_ROWS.rev(),
+        VCursor::read_u8_slice_into,
+        BlobColumn::read_u8_slice_into,
+    );
+}
+
+#[test]
+fn aligned_sequence_blob_reads_match_cell_reads() {
+    let Some(sra) = archive_from_env("FG_SRA_TEST_ALIGNED_SRA") else { return };
+    let db = manager().open_db_read(&sra).unwrap();
+    let sequence = db.open_table_read("SEQUENCE").unwrap();
+    assert_blob_reads_match_cell_reads(
+        &sequence,
+        "(INSDC:4na:bin)CMP_READ",
+        BLOB_TEST_ROWS,
+        VCursor::read_u8_slice_into,
+        BlobColumn::read_u8_slice_into,
+    );
+    assert_blob_reads_match_cell_reads(
+        &sequence,
+        "(I64)PRIMARY_ALIGNMENT_ID",
+        BLOB_TEST_ROWS,
+        VCursor::read_i64_slice_into,
+        BlobColumn::read_i64_slice_into,
+    );
+}
+
+#[test]
+fn blob_reads_are_refused_on_a_cached_cursor() {
+    let Some(sra) = archive_from_env("FG_SRA_TEST_TABLE_SRA") else { return };
+    let table = manager().open_table_read(&sra).unwrap();
+    let cursor = table.create_cached_cursor_read(1 << 20).unwrap();
+    let mut blobs = BlobColumn::new(cursor.add_column("(INSDC:coord:len)READ_LEN").unwrap());
+    cursor.open().unwrap();
+    let mut cell = Vec::new();
+    assert_eq!(
+        blobs.read_u32_slice_into(&cursor, 1, &mut cell).err(),
+        Some(VdbError::BlobReadOnCachedCursor)
+    );
 }
