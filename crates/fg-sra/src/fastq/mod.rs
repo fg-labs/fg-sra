@@ -17,7 +17,6 @@ pub mod spot;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -651,17 +650,12 @@ fn refuse_outputs_naming_one_file<'a>(paths: impl IntoIterator<Item = &'a Path>)
     Ok(())
 }
 
-/// Fail if an output is the input archive itself, however it is named (another spelling, a
-/// symbolic or a hard link): writing it, in place or by renaming into place, would destroy
-/// the archive.
+/// Fail if an output is the input archive itself (see
+/// [`crate::pending_file::refuse_overwriting_input`]).
 fn refuse_overwriting_input(outputs: &[Output], input: &Path) -> Result<()> {
-    let Ok(input_meta) = std::fs::metadata(input) else { return Ok(()) };
     for output in outputs {
-        if let OutputTarget::Path(path) = &output.target
-            && let Ok(meta) = std::fs::metadata(path)
-            && (meta.dev(), meta.ino()) == (input_meta.dev(), input_meta.ino())
-        {
-            bail!("{} is the input archive, which would be overwritten", path.display());
+        if let OutputTarget::Path(path) = &output.target {
+            crate::pending_file::refuse_overwriting_input(path, input)?;
         }
     }
     Ok(())

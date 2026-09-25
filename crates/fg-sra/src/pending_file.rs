@@ -405,6 +405,19 @@ pub(crate) mod signal_cleanup {
     fn install() {}
 }
 
+/// Fail if `output` is `input` itself, however it is named (another spelling, a
+/// symbolic or a hard link): writing it, in place or by renaming into place,
+/// would destroy the input. Paths that don't exist yet are never the input.
+pub(crate) fn refuse_overwriting_input(output: &Path, input: &Path) -> Result<()> {
+    let exists = |path: &Path| std::fs::metadata(path).is_ok();
+    anyhow::ensure!(
+        !(exists(output) && exists(input) && FileIdentity::of(output) == FileIdentity::of(input)),
+        "{} is the input archive, which would be overwritten",
+        output.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +502,29 @@ mod tests {
             assert_eq!(id(&existing), id(&link));
         }
         assert!(FileIdentity::of(&dir.join("missing-dir").join("a.fq")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_refuse_overwriting_input() {
+        let dir = test_dir("input");
+        let input = dir.join("in.sra");
+        std::fs::write(&input, b"archive").unwrap();
+        let err = refuse_overwriting_input(&input, &input).unwrap_err();
+        assert!(err.to_string().contains("is the input archive"), "{err}");
+        let respelled = dir.join(".").join("in.sra");
+        assert!(refuse_overwriting_input(&respelled, &input).is_err());
+        refuse_overwriting_input(&dir.join("out.sam"), &input).unwrap();
+        refuse_overwriting_input(&input, &dir.join("missing.sra")).unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.sam");
+            std::os::unix::fs::symlink(&input, &link).unwrap();
+            assert!(refuse_overwriting_input(&link, &input).is_err(), "symbolic link");
+            let hard = dir.join("hard.sam");
+            std::fs::hard_link(&input, &hard).unwrap();
+            assert!(refuse_overwriting_input(&hard, &input).is_err(), "hard link");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

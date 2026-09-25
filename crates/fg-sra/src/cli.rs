@@ -1,7 +1,7 @@
 //! Command-line argument definitions for fg-sra.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -317,6 +317,11 @@ impl ToSam {
         self.validate()?;
         if self.offline {
             disable_remote_access().context("failed to turn off remote access")?;
+        }
+        if let Some(output) = &self.output_file {
+            for accession in &self.accessions {
+                crate::pending_file::refuse_overwriting_input(output, Path::new(accession))?;
+            }
         }
         let Some((first, rest)) = self.accessions.split_first() else {
             anyhow::bail!("no accessions given");
@@ -749,6 +754,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(result.is_err());
         assert_eq!(contents, "keep me\n");
+    }
+
+    #[test]
+    fn test_output_that_is_an_input_archive_is_refused() {
+        let dir = std::env::temp_dir().join(format!("fg-sra-cli-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("in.sra");
+        std::fs::write(&archive, b"archive").unwrap();
+        let other = dir.join("other.sra");
+        let result = parse(&[
+            "--no-header",
+            "--output-file",
+            archive.to_str().unwrap(),
+            other.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .execute();
+        let contents = std::fs::read(&archive).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("is the input archive"), "{err:#}");
+        assert_eq!(contents, b"archive");
     }
 
     #[test]
