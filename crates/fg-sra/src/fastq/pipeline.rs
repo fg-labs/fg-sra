@@ -482,14 +482,16 @@ mod tests {
         }
     }
 
-    /// A source whose every read first uses 8 MiB of stack, as libncbi-vdb can.
+    /// A source whose every read first uses 4 MiB of stack, twice Rust's default for a thread;
+    /// libncbi-vdb can need more. (Debug builds may copy the array, so it is kept well under
+    /// the 16 MiB given.)
     struct DeepStackSource(TestSource);
 
     impl SpotSource for DeepStackSource {
         // A large stack frame is the point.
         #[allow(clippy::large_stack_arrays)]
         fn read(&mut self, id: i64) -> Result<Spot<'_>> {
-            let stack = std::hint::black_box([1u8; 8 << 20]);
+            let stack = std::hint::black_box([1u8; 4 << 20]);
             assert_eq!(stack[stack.len() - 1], 1);
             self.0.read(id)
         }

@@ -321,12 +321,13 @@ mod tests {
         assert_eq!(doubled, (0..100).map(|i| i * 2).collect::<Vec<_>>());
     }
 
-    // A large stack frame is the point.
+    // A large stack frame is the point: 4 MiB is twice Rust's default for a thread, and well
+    // under the 16 MiB given even if a debug build copies the array.
     #[allow(clippy::large_stack_arrays)]
     #[test]
     fn parallel_chunks_threads_have_room_for_deep_library_stacks() {
         let doubled = parallel_chunks(&[1, 2, 3], vec![(), ()], |(), item: i32| {
-            let stack = std::hint::black_box([1u8; 8 << 20]);
+            let stack = std::hint::black_box([1u8; 4 << 20]);
             Ok(item * 2 * i32::from(stack[stack.len() - 1]))
         });
         assert_eq!(doubled.unwrap(), [2, 4, 6]);
