@@ -15,7 +15,7 @@ pub mod prefetch;
 pub mod reader;
 pub mod spot;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -29,13 +29,14 @@ use fg_sra_vdb::manager::disable_remote_access;
 use fg_sra_vdb::reference::{ReferenceList, reflist_options};
 
 use crate::archive::{Archive, CONSENSUS_TABLE, QualitySource, default_accession};
+use crate::pending_file::{FileIdentity, PendingFile};
 use crate::progress::{ProgressLogger, format_count};
 use crate::refstore::{ReferenceRows, ReferenceStore, preload_references, split_by_length};
 use counts::FastqMetrics;
 use defline::Defline;
 use format::RecordFormatter;
 use pipeline::{
-    BATCH_SPOTS, CreatedFiles, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig,
+    BATCH_SPOTS, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig,
     VDB_THREAD_STACK_BYTES,
 };
 use prefetch::PrefetchedReads;
@@ -227,6 +228,11 @@ impl Fastq {
         let technical_paths = self.technical_paths(&table.table, *spots.start(), columns)?;
         let (outputs, layout) = self.outputs(&technical_paths);
         refuse_overwriting_input(&outputs, Path::new(&archive.location))?;
+        // Again now that `--technical` is expanded to its paths.
+        refuse_outputs_naming_one_file(outputs.iter().filter_map(|o| match &o.target {
+            OutputTarget::Path(path) => Some(path.as_path()),
+            OutputTarget::Stdout => None,
+        }))?;
 
         let config = PipelineConfig {
             router: self.router(layout.technical.len()),
@@ -271,13 +277,10 @@ impl Fastq {
             })
             .collect::<Result<Vec<_>>>()?;
         let progress = ProgressLogger::new(0, PROGRESS_INTERVAL);
-        let created = CreatedFiles::default();
-        let result = pipeline::run(sources, spots.clone(), &outputs, &created, &config, &progress)
-            .and_then(|summary| self.finish(&archive, &accession, &spots, &summary));
-        if result.is_err() {
-            created.remove();
-        }
-        result
+        let (summary, pending) =
+            pipeline::run(sources, spots.clone(), &outputs, &config, &progress)?;
+        self.finish(&archive, &accession, &spots, &summary)?;
+        commit_outputs(&summary, pending)
     }
 
     /// Check the outputs requested make sense together, before opening the archive.
@@ -315,7 +318,7 @@ impl Fastq {
         if let Some(duplicate) = paths.iter().find(|&&p| p != Path::new("-") && !seen.insert(p)) {
             bail!("{} is given as more than one output", duplicate.display());
         }
-        Ok(())
+        refuse_outputs_naming_one_file(paths.iter().copied())
     }
 
     /// Warn about synthesised or constant qualities; fail if FASTQ needs qualities there are
@@ -603,6 +606,22 @@ fn prefetch_far_reads(
     Ok(reads)
 }
 
+/// Rename the run's outputs, written under temporary names, into place: only a run that
+/// converted every spot requested does, so a failed run leaves no partial file and keeps any
+/// existing one. A run stopped early because an output's reader went away is an error when
+/// it had file outputs, since they were not written.
+fn commit_outputs(summary: &pipeline::PipelineSummary, pending: Vec<PendingFile>) -> Result<()> {
+    if summary.stopped_early {
+        anyhow::ensure!(
+            pending.is_empty(),
+            "an output's reader went away, so conversion stopped early and the output files \
+             were not written; any existing files are unchanged"
+        );
+        return Ok(());
+    }
+    PendingFile::commit_all(pending)
+}
+
 /// Bases per row of the `REFERENCE` table (`MAX_SEQ_LEN`, read from its first row, as the
 /// schema's `REF_POS` reads it), or 0 when the table has no such column.
 fn reference_row_length(database: &VDatabase) -> Result<u32> {
@@ -617,8 +636,24 @@ fn reference_row_length(database: &VDatabase) -> Result<u32> {
     cursor.read_u32(1, column).context("failed to read REFERENCE.MAX_SEQ_LEN")
 }
 
+/// Fail if two of `paths` name the same file by another spelling or a link: both outputs
+/// would write it, and renaming one into place would discard the other's reads. `-` (stdout)
+/// is skipped.
+fn refuse_outputs_naming_one_file<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+    let mut seen: HashMap<FileIdentity, &Path> = HashMap::new();
+    for path in paths.into_iter().filter(|&p| p != Path::new("-")) {
+        if let Some(identity) = FileIdentity::of(path)
+            && let Some(first) = seen.insert(identity, path)
+        {
+            bail!("{} names the same file as {}", path.display(), first.display());
+        }
+    }
+    Ok(())
+}
+
 /// Fail if an output is the input archive itself, however it is named (another spelling, a
-/// symbolic or a hard link): writing it would truncate the archive, and a failed run removes it.
+/// symbolic or a hard link): writing it, in place or by renaming into place, would destroy
+/// the archive.
 fn refuse_overwriting_input(outputs: &[Output], input: &Path) -> Result<()> {
     let Ok(input_meta) = std::fs::metadata(input) else { return Ok(()) };
     for output in outputs {
@@ -702,6 +737,59 @@ mod tests {
     #[test]
     fn zero_threads_is_a_parse_error() {
         assert!(parse(&["SRR1.sra", "-u", "r.fq", "-t", "0"]).is_err());
+    }
+
+    /// A fresh directory for one test's files.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fg_sra_fastq_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn outputs_naming_the_same_file_are_refused() {
+        let dir = scratch_dir("same-file");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        // `Path` equality ignores `.` components, but not `..`.
+        let (a, a_again) = (dir.join("a.fq"), dir.join("sub").join("..").join("a.fq"));
+        let cmd =
+            parse(&["S.sra", "-1", a.to_str().unwrap(), "-2", a_again.to_str().unwrap()]).unwrap();
+        let err = cmd.check_outputs().unwrap_err();
+        assert!(err.to_string().contains("names the same file"), "{err}");
+        let b = dir.join("b.fq");
+        let cmd = parse(&["S.sra", "-1", a.to_str().unwrap(), "-2", b.to_str().unwrap()]).unwrap();
+        assert!(cmd.check_outputs().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A summary, and one pending output for `path` holding `contents`.
+    fn summary_writing(
+        path: &Path,
+        contents: &[u8],
+        stopped_early: bool,
+    ) -> (pipeline::PipelineSummary, Vec<PendingFile>) {
+        let (mut file, pending) = PendingFile::create(path).unwrap();
+        std::io::Write::write_all(&mut file, contents).unwrap();
+        let summary = pipeline::PipelineSummary { stopped_early, ..Default::default() };
+        (summary, vec![pending.expect("written under a temporary name")])
+    }
+
+    #[test]
+    fn outputs_of_a_run_stopped_early_are_not_written() {
+        let dir = scratch_dir("stopped-early");
+        let path = dir.join("r2.fq");
+        std::fs::write(&path, b"complete\n").unwrap();
+        let (summary, pending) = summary_writing(&path, b"partial\n", true);
+        let err = commit_outputs(&summary, pending).unwrap_err();
+        assert!(err.to_string().contains("were not written"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete\n");
+        let (summary, pending) = summary_writing(&path, b"new\n", false);
+        commit_outputs(&summary, pending).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 1, "no temporary files are left behind");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

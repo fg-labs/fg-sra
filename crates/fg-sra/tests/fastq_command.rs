@@ -145,7 +145,7 @@ fn failed_run_keeps_an_existing_output_it_could_not_open() {
     }
     let output = fastq(&[&vendored_archive(), "-1", &r1, "-2", &r2, "-u", &unpaired]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("failed to create"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("cannot write"), "{}", stderr(&output));
     assert!(!Path::new(&r1).exists());
     assert!(!Path::new(&r2).exists());
     assert_eq!(std::fs::read_to_string(&unpaired).unwrap(), "kept\n");

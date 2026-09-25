@@ -352,14 +352,11 @@ mod tests {
         let tmp = PendingFile::tmp_path_for(&path);
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
 
-        let mut writer =
-            OutputWriter::from_path_with_compression(&path, CompressionMode::None).unwrap();
-        writer.write_bytes(b"new\n").unwrap();
-        writer.finish().unwrap();
+        let result = OutputWriter::from_path_with_compression(&path, CompressionMode::None);
+        assert!(result.is_err(), "a file already at the temporary path is refused");
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
-        assert!(std::fs::symlink_metadata(&path).unwrap().is_file(), "output must not be a link");
-        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert!(!path.exists());
         assert!(std::fs::symlink_metadata(&tmp).unwrap().is_symlink(), "not ours to remove");
         std::fs::remove_dir_all(&dir).ok();
     }

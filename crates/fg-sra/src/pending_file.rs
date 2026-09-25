@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 /// (an error) or the process receives SIGINT, SIGTERM or SIGHUP (unless the
 /// signal is ignored); a SIGKILL leaves it behind. If the final rename fails,
 /// the completed temporary file is kept and named in the error.
+#[derive(Debug)]
 pub(crate) struct PendingFile {
     tmp_path: PathBuf,
     final_path: PathBuf,
@@ -36,13 +37,14 @@ impl PendingFile {
     /// Open the file to write for `final_path`, returning the pending temporary
     /// file when the output will be renamed into place (see [`write_mode`]).
     ///
-    /// Fails before any output is produced if `final_path` names a directory or
-    /// is an existing file that is not writable. A temporary file copies the
-    /// permissions of an existing output file. `final_path` is written directly
-    /// instead when the temporary file cannot be created (e.g. a writable file
-    /// in a read-only directory, a name too long for the suffix, or something
-    /// already at the temporary path) or would have a different owner or group
-    /// than the existing file (the rename would change them).
+    /// Fails before any output is produced if `final_path` names a directory, is
+    /// an existing file that is not writable, or its temporary path already
+    /// exists (another output of this run names the same file, or an earlier run
+    /// left it). A temporary file copies the permissions of an existing output
+    /// file. `final_path` is written directly instead when the temporary file
+    /// cannot otherwise be created (e.g. a writable file in a read-only
+    /// directory, or a name too long for the suffix) or would have a different
+    /// owner or group than the existing file (the rename would change them).
     pub(crate) fn create(final_path: &Path) -> Result<(File, Option<Self>)> {
         let is_dir = final_path.as_os_str().as_encoded_bytes().ends_with(b"/")
             || std::fs::metadata(final_path).is_ok_and(|m| m.is_dir());
@@ -79,6 +81,16 @@ impl PendingFile {
         }
         let file = match options.open(&tmp_path) {
             Ok(file) => file,
+            // The name holds this process's id, so another output of this run names the
+            // same file (e.g. by case on a case-insensitive filesystem), or an earlier
+            // process with the same id left it. Writing in place would have the other
+            // output's rename discard this one's contents.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+                "{} already exists: another output names the same file as {}, or the \
+                 temporary file is left from an earlier run (remove it)",
+                tmp_path.display(),
+                final_path.display()
+            ),
             Err(e) => {
                 eprintln!(
                     "[output] cannot create temporary file {} ({e}); writing {} in place",
@@ -116,13 +128,51 @@ impl PendingFile {
     ///
     /// If the rename fails, the temporary file (the complete output) is kept and
     /// the error names it.
-    pub(crate) fn commit(mut self) -> Result<()> {
+    pub(crate) fn commit(self) -> Result<()> {
+        self.sync()?;
+        self.rename_into_place()
+    }
+
+    /// Commit several outputs of one run: flush every one to disk before
+    /// renaming any, so a failure to flush leaves every final path as it was.
+    ///
+    /// A failed rename leaves the outputs renamed before it in place, and keeps
+    /// the complete temporary files of those after it; the error names both.
+    pub(crate) fn commit_all(pending: Vec<Self>) -> Result<()> {
+        for file in &pending {
+            file.sync()?;
+        }
+        let mut renamed: Vec<PathBuf> = Vec::new();
+        let mut pending = pending.into_iter();
+        while let Some(file) = pending.next() {
+            let final_path = file.final_path.clone();
+            if let Err(e) = file.rename_into_place() {
+                let kept: Vec<PathBuf> = pending
+                    .map(|mut rest| {
+                        rest.keep = true;
+                        rest.tmp_path.clone()
+                    })
+                    .collect();
+                return Err(e.context(commit_all_failure(&renamed, &kept)));
+            }
+            renamed.push(final_path);
+        }
+        Ok(())
+    }
+
+    /// Flush the temporary file to disk.
+    fn sync(&self) -> Result<()> {
         // A write handle: on Windows `sync_all` fails on a read-only one.
         std::fs::OpenOptions::new()
             .write(true)
             .open(&self.tmp_path)
             .and_then(|f| f.sync_all())
-            .with_context(|| format!("failed to sync {}", self.tmp_path.display()))?;
+            .with_context(|| format!("failed to sync {}", self.tmp_path.display()))
+    }
+
+    /// Rename the (flushed) temporary file to the final path, keeping it and
+    /// naming it in the error if that fails.
+    fn rename_into_place(mut self) -> Result<()> {
         if let Err(e) = std::fs::rename(&self.tmp_path, &self.final_path) {
             self.keep = true;
             return Err(e).with_context(|| {
@@ -135,8 +185,7 @@ impl PendingFile {
             });
         }
         // Persist the rename itself (best-effort: not every platform can sync a
-        // directory).
-        // A bare file name's parent is empty: the current directory.
+        // directory). A bare file name's parent is empty: the current directory.
         let dir = match self.final_path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
@@ -145,6 +194,22 @@ impl PendingFile {
         Ok(())
         // `self` drops here; its temporary path no longer exists after a
         // successful rename, so the cleanup in `drop` is a no-op.
+    }
+}
+
+/// What a failed [`PendingFile::commit_all`] left: outputs already `renamed`
+/// into place, and complete temporary files `kept` for outputs not renamed.
+fn commit_all_failure(renamed: &[PathBuf], kept: &[PathBuf]) -> String {
+    let list = |paths: &[PathBuf]| {
+        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    };
+    let replaced = match renamed {
+        [] => String::from("no output was replaced"),
+        done => format!("{} already replaced", list(done)),
+    };
+    match kept {
+        [] => replaced,
+        kept => format!("{replaced}; the other completed outputs were left at {}", list(kept)),
     }
 }
 
@@ -169,6 +234,66 @@ fn same_owner(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         let _ = (a, b);
         true
     }
+}
+
+/// What an output path would write to, to tell whether two paths name the same
+/// file: an existing file's identity (so links and other spellings match), or
+/// else the canonical directory and name of the file to be created.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FileIdentity {
+    /// An existing file: its device and inode.
+    #[cfg(unix)]
+    Existing { dev: u64, ino: u64 },
+    /// An existing file: its canonical path.
+    #[cfg(not(unix))]
+    Existing(PathBuf),
+    /// A file to be created: its canonical directory, joined with its name.
+    New(PathBuf),
+}
+
+impl FileIdentity {
+    /// The identity of `path`, or `None` if neither it nor its directory can be resolved.
+    /// A dangling symbolic link is the file its target chain would create.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let path = &resolve_dangling_link(path);
+        if let Ok(meta) = std::fs::metadata(path) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Some(Self::Existing { dev: meta.dev(), ino: meta.ino() });
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                return std::fs::canonicalize(path).ok().map(Self::Existing);
+            }
+        }
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        Some(Self::New(std::fs::canonicalize(dir).ok()?.join(path.file_name()?)))
+    }
+}
+
+/// Where writing through `path` would create a file: `path` itself, or, for a
+/// dangling symbolic link, the end of its chain of targets (followed at most 40
+/// links, as the kernel does).
+fn resolve_dangling_link(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        let is_dangling_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink())
+            && std::fs::metadata(&path).is_err();
+        let Some(target) = is_dangling_link.then(|| std::fs::read_link(&path).ok()).flatten()
+        else {
+            break;
+        };
+        path = match path.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target,
+        };
+    }
+    path
 }
 
 /// How to write `path`: write a temporary file and rename it into place, unless
@@ -326,5 +451,94 @@ mod tests {
         assert!(signal_cleanup::is_ignored(signal));
         unsafe { libc::signal(signal, libc::SIG_DFL) };
         assert!(!signal_cleanup::is_ignored(signal));
+    }
+
+    #[test]
+    fn test_commit_all_renames_every_output() {
+        let dir = test_dir("commit-all");
+        let paths = [dir.join("a.fq"), dir.join("b.fq")];
+        std::fs::write(&paths[0], b"old\n").unwrap();
+        let mut pending = Vec::new();
+        for path in &paths {
+            let (mut file, file_pending) = PendingFile::create(path).unwrap();
+            std::io::Write::write_all(&mut file, b"new\n").unwrap();
+            pending.push(file_pending.expect("written under a temporary name"));
+        }
+        PendingFile::commit_all(pending).unwrap();
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), b"new\n");
+            assert!(!PendingFile::tmp_path_for(path).exists());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_file_identity() {
+        let dir = test_dir("identity");
+        let existing = dir.join("a.fq");
+        std::fs::write(&existing, b"x").unwrap();
+        let id = |p: &Path| FileIdentity::of(p).unwrap();
+        assert_eq!(id(&existing), id(&dir.join(".").join("a.fq")));
+        assert_eq!(id(&dir.join("new.fq")), id(&dir.join(".").join("new.fq")));
+        assert_ne!(id(&existing), id(&dir.join("new.fq")));
+        assert_ne!(id(&dir.join("new.fq")), id(&dir.join("other.fq")));
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.fq");
+            std::os::unix::fs::symlink(&existing, &link).unwrap();
+            assert_eq!(id(&existing), id(&link));
+        }
+        assert!(FileIdentity::of(&dir.join("missing-dir").join("a.fq")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_second_output_with_the_same_temporary_name_is_refused() {
+        let dir = test_dir("tmp-clash");
+        let path = dir.join("a.fq");
+        let (_file, pending) = PendingFile::create(&path).unwrap();
+        assert!(pending.is_some());
+        let err = PendingFile::create(&path).unwrap_err();
+        assert!(err.to_string().contains("another output names the same file"), "{err}");
+        drop(pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_failed_commit_all_keeps_the_outputs_it_did_not_rename() {
+        let dir = test_dir("commit-all-fails");
+        let paths = [dir.join("a.fq"), dir.join("b.fq"), dir.join("c.fq")];
+        let mut pending = Vec::new();
+        for path in &paths {
+            let (mut file, file_pending) = PendingFile::create(path).unwrap();
+            std::io::Write::write_all(&mut file, b"new\n").unwrap();
+            pending.push(file_pending.unwrap());
+        }
+        // A non-empty directory now occupies b.fq, so its rename fails.
+        std::fs::create_dir_all(paths[1].join("occupied")).unwrap();
+        let err = PendingFile::commit_all(pending).unwrap_err();
+        let message = format!("{err:#}");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"new\n");
+        assert!(message.contains(&format!("{} already replaced", paths[0].display())), "{message}");
+        let kept = PendingFile::tmp_path_for(&paths[2]);
+        assert_eq!(std::fs::read(&kept).unwrap(), b"new\n", "c.fq's complete output is kept");
+        assert!(message.contains(&kept.display().to_string()), "{message}");
+        assert!(PendingFile::tmp_path_for(&paths[1]).exists(), "b.fq's output is kept");
+        assert!(!paths[2].exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_identity_follows_dangling_links_to_their_target() {
+        let dir = test_dir("identity-dangling");
+        let id = |p: &Path| FileIdentity::of(p).unwrap();
+        let target = dir.join("t.fq");
+        std::os::unix::fs::symlink("m.fq", dir.join("l.fq")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("m.fq")).unwrap();
+        assert_eq!(id(&dir.join("m.fq")), id(&target));
+        assert_eq!(id(&dir.join("l.fq")), id(&target), "a chain of dangling links");
+        assert_ne!(id(&dir.join("l.fq")), id(&dir.join("other.fq")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
