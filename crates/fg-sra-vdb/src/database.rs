@@ -6,7 +6,7 @@ use std::ptr;
 
 use crate::cursor::VCursor;
 use crate::dependencies::VdbDependencies;
-use crate::error::{VdbError, check_rc, to_cstring};
+use crate::error::{LITERAL_FORMAT, VdbError, check_rc, to_cstring};
 
 /// Safe wrapper around the VDB `VDatabase` opaque type.
 ///
@@ -27,8 +27,15 @@ impl VDatabase {
     pub fn open_table_read(&self, name: &str) -> Result<VTable, VdbError> {
         let c_name = to_cstring(name)?;
         let mut tbl: *const fg_sra_vdb_sys::VTable = ptr::null();
+        // Safety: VDatabaseOpenTableRead is printf-style variadic; the name is the single
+        // argument to a literal "%s" format.
         let rc = unsafe {
-            fg_sra_vdb_sys::VDatabaseOpenTableRead(self.ptr, &raw mut tbl, c_name.as_ptr())
+            fg_sra_vdb_sys::VDatabaseOpenTableRead(
+                self.ptr,
+                &raw mut tbl,
+                LITERAL_FORMAT.as_ptr(),
+                c_name.as_ptr(),
+            )
         };
         check_rc(rc)?;
         Ok(VTable::from_raw(tbl))
@@ -144,8 +151,15 @@ impl KMetadata {
     pub fn open_node_read(&self, path: &str) -> Result<KMDataNode, VdbError> {
         let c_path = to_cstring(path)?;
         let mut node: *const fg_sra_vdb_sys::KMDataNode = ptr::null();
+        // Safety: KMetadataOpenNodeRead is printf-style variadic; the path is the single
+        // argument to a literal "%s" format.
         let rc = unsafe {
-            fg_sra_vdb_sys::KMetadataOpenNodeRead(self.ptr, &raw mut node, c_path.as_ptr())
+            fg_sra_vdb_sys::KMetadataOpenNodeRead(
+                self.ptr,
+                &raw mut node,
+                LITERAL_FORMAT.as_ptr(),
+                c_path.as_ptr(),
+            )
         };
         check_rc(rc)?;
         Ok(KMDataNode { ptr: node })

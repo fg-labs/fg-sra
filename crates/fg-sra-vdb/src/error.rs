@@ -19,6 +19,10 @@ pub enum VdbError {
     Rc(u32),
     /// A string argument contained an interior nul byte.
     InvalidNulByte,
+    /// A path contained `%`. ncbi-vdb reuses a path as a printf format while resolving it
+    /// (e.g. in `VFSManagerCheckEnvAndAd`), which crashes or reads the wrong path, so such
+    /// paths are refused up front.
+    PercentInPath,
     /// A cell's element width did not match the width expected by a typed read.
     ///
     /// Reinterpreting the cell as the requested type would read past the cell,
@@ -36,6 +40,11 @@ const RC_STATE_DONE: u32 = 1;
 
 /// The `rcNS` module value, indicating a network system error.
 const RC_MODULE_NETWORK: u32 = 18;
+
+/// Format string for VDB's printf-style variadic functions (`VDBManagerOpenDBRead`,
+/// `KMetadataOpenNodeRead`, `VCursorAddColumn`, …). Passing a path or name as the
+/// argument to `%s`, rather than as the format itself, keeps any `%` in it literal.
+pub(crate) const LITERAL_FORMAT: &std::ffi::CStr = c"%s";
 
 impl VdbError {
     /// Create a new `VdbError` from a raw `rc_t` value.
@@ -63,7 +72,7 @@ impl VdbError {
     pub fn rc(&self) -> Option<u32> {
         match self {
             Self::Rc(rc) => Some(*rc),
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => None,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => None,
         }
     }
 
@@ -72,7 +81,7 @@ impl VdbError {
     pub fn state(&self) -> u32 {
         match self {
             Self::Rc(rc) => rc & 0x3F,
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -81,7 +90,7 @@ impl VdbError {
     pub fn object(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 6) & 0xFF,
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -90,7 +99,7 @@ impl VdbError {
     pub fn context(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 14) & 0x7F,
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -99,7 +108,7 @@ impl VdbError {
     pub fn target(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 21) & 0x3F,
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 
@@ -108,7 +117,7 @@ impl VdbError {
     pub fn module(&self) -> u32 {
         match self {
             Self::Rc(rc) => (rc >> 27) & 0x1F,
-            Self::InvalidNulByte | Self::ElemBitsMismatch { .. } => 0,
+            Self::InvalidNulByte | Self::PercentInPath | Self::ElemBitsMismatch { .. } => 0,
         }
     }
 }
@@ -128,6 +137,12 @@ impl fmt::Display for VdbError {
             Self::InvalidNulByte => {
                 write!(f, "VDB error: string argument contains interior nul byte")
             }
+            Self::PercentInPath => {
+                write!(
+                    f,
+                    "VDB error: ncbi-vdb cannot handle a path containing '%'; rename or link it"
+                )
+            }
             Self::ElemBitsMismatch { expected, actual } => write!(
                 f,
                 "VDB error: cell element width {actual} bits does not match expected {expected} bits"
@@ -143,6 +158,17 @@ impl std::error::Error for VdbError {}
 /// Returns `Ok(())` if `rc == 0`, or `Err(VdbError)` otherwise.
 pub fn check_rc(rc: u32) -> Result<(), VdbError> {
     if rc == 0 { Ok(()) } else { Err(VdbError::new(rc)) }
+}
+
+/// Convert a path to a `CString` for ncbi-vdb, refusing one it can't handle safely.
+///
+/// Returns `VdbError::PercentInPath` for a path containing `%` and
+/// `VdbError::InvalidNulByte` for one containing a nul byte.
+pub(crate) fn path_to_cstring(path: &str) -> Result<std::ffi::CString, VdbError> {
+    if path.contains('%') {
+        return Err(VdbError::PercentInPath);
+    }
+    to_cstring(path)
 }
 
 /// Convert a `&str` to a `CString`, returning `VdbError::InvalidNulByte` on failure.
@@ -189,6 +215,12 @@ mod tests {
         assert!(!err.is_done());
         assert_eq!(err.rc(), None);
         assert!(err.to_string().contains("nul byte"));
+    }
+
+    #[test]
+    fn test_path_to_cstring_refuses_percent() {
+        assert_eq!(path_to_cstring("/data/100%/run.sra").unwrap_err(), VdbError::PercentInPath);
+        assert!(path_to_cstring("/data/run.sra").is_ok());
     }
 
     #[test]

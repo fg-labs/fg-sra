@@ -6,7 +6,7 @@
 use std::ptr;
 
 use crate::database::VDatabase;
-use crate::error::{VdbError, check_rc, to_cstring};
+use crate::error::{LITERAL_FORMAT, VdbError, check_rc, path_to_cstring};
 
 /// Safe wrapper around the VDB `VDBManager` opaque type.
 ///
@@ -43,16 +43,20 @@ impl VdbManager {
     }
 
     /// Open a read-only database by accession or path.
+    ///
+    /// Fails with [`VdbError::PercentInPath`] for a path containing `%`, which ncbi-vdb
+    /// cannot handle.
     pub fn open_db_read(&self, path: &str) -> Result<VDatabase, VdbError> {
-        let c_path = to_cstring(path)?;
+        let c_path = path_to_cstring(path)?;
         let mut db: *const fg_sra_vdb_sys::VDatabase = ptr::null();
-        // Safety: VDBManagerOpenDBRead is variadic; we pass the path as the only
-        // variadic arg (format string with no format specifiers).
+        // Safety: VDBManagerOpenDBRead is printf-style variadic; the path is the single
+        // argument to a literal "%s" format.
         let rc = unsafe {
             fg_sra_vdb_sys::VDBManagerOpenDBRead(
                 self.ptr,
                 &raw mut db,
                 ptr::null(), // schema (NULL = use default)
+                LITERAL_FORMAT.as_ptr(),
                 c_path.as_ptr(),
             )
         };

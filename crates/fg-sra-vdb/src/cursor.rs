@@ -6,7 +6,7 @@
 use std::ptr;
 use std::slice;
 
-use crate::error::{VdbError, check_rc, to_cstring};
+use crate::error::{LITERAL_FORMAT, VdbError, check_rc, to_cstring};
 use crate::retry::retry_on_network_error;
 
 /// Sentinel value for columns that were never added or are not available.
@@ -45,8 +45,16 @@ impl VCursor {
     pub fn add_column(&self, name: &str) -> Result<u32, VdbError> {
         let c_name = to_cstring(name)?;
         let mut idx: u32 = 0;
-        let rc =
-            unsafe { fg_sra_vdb_sys::VCursorAddColumn(self.ptr, &raw mut idx, c_name.as_ptr()) };
+        // Safety: VCursorAddColumn is printf-style variadic; the name is the single argument
+        // to a literal "%s" format.
+        let rc = unsafe {
+            fg_sra_vdb_sys::VCursorAddColumn(
+                self.ptr,
+                &raw mut idx,
+                LITERAL_FORMAT.as_ptr(),
+                c_name.as_ptr(),
+            )
+        };
         check_rc(rc)?;
         Ok(idx)
     }
