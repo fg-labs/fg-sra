@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fg_sra_vdb::database::VDatabase;
-use fg_sra_vdb::manager::VdbManager;
+use fg_sra_vdb::manager::{VdbManager, disable_remote_access};
 
 /// High-performance SRA toolkit.
 #[derive(Debug, Parser)]
@@ -157,6 +157,13 @@ pub struct ToSam {
     /// Default: one cursor per thread.
     #[arg(long = "pool-size")]
     pub pool_size: Option<usize>,
+
+    // ── Access options ────────────────────────────────────────────────
+    /// Never use the network: find each accession, and an aligned run's
+    /// references, only locally (e.g. beside the archive, as `prefetch` puts
+    /// them).
+    #[arg(long)]
+    pub offline: bool,
 }
 
 /// Output format for converted records.
@@ -308,6 +315,9 @@ impl ToSam {
     /// `--no-header` (FASTA/FASTQ have no header).
     pub fn execute(&self) -> Result<()> {
         self.validate()?;
+        if self.offline {
+            disable_remote_access().context("failed to turn off remote access")?;
+        }
         let Some((first, rest)) = self.accessions.split_first() else {
             anyhow::bail!("no accessions given");
         };
@@ -626,6 +636,12 @@ mod tests {
 
         let cmd = parse(&["SRR123456"]);
         assert_eq!(cmd.pool_size, None);
+    }
+
+    #[test]
+    fn test_offline_flag() {
+        assert!(parse(&["--offline", "SRR123456"]).offline);
+        assert!(!parse(&["SRR123456"]).offline);
     }
 
     fn parse_cache_refs(args: &[&str]) -> CacheRefs {
