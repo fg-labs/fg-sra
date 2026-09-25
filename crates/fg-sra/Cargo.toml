@@ -16,8 +16,9 @@ readme = "../../README.md"
 workspace = true
 
 [features]
-default = ["vendored"]
+default = ["vendored", "zlib-ng"]
 vendored = ["fg-sra-vdb/vendored"]
+zlib-ng = ["fg-sra-vdb/zlib-ng"]
 
 [dependencies]
 fg-sra-vdb.workspace = true

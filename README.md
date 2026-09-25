@@ -79,6 +79,8 @@ cargo build --release
 The `vendored` feature is enabled by default, building ncbi-vdb from the
 git submodule automatically during `cargo build`.
 
+So is `zlib-ng`, which links zlib-ng (built from source through `libz-sys`) in place of the zlib bundled with ncbi-vdb, for faster decompression of archives; `--no-default-features --features vendored` keeps the bundled zlib.
+
 ### Building with a pre-built VDB
 
 To link against a system-installed ncbi-vdb instead of building from source:

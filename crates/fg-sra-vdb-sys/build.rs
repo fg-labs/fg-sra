@@ -8,7 +8,8 @@
 //! 3. Neither — fail with a helpful error message
 //!
 //! The vendored source is first patched, in place, with `vendor/patches/ncbi-vdb/*.patch`: fixes
-//! not yet in an ncbi-vdb release.
+//! not yet in an ncbi-vdb release. With the `zlib-ng` feature, the vendored library's bundled
+//! zlib is removed after the build so that zlib-ng, from `libz-sys`, provides zlib instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -42,8 +43,10 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=pthread");
     }
 
-    // Additional system libraries.
-    println!("cargo:rustc-link-lib=dylib=z");
+    // zlib: the system's, unless zlib-ng (from `libz-sys`) replaces the bundled one.
+    if env::var_os("CARGO_FEATURE_ZLIB_NG").is_none() {
+        println!("cargo:rustc-link-lib=dylib=z");
+    }
 
     // Generate FFI bindings via bindgen.
     generate_bindings(&inc_dir, &out_dir);
@@ -112,6 +115,9 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
         );
     };
 
+    #[cfg(feature = "zlib-ng")]
+    remove_bundled_zlib(&vdb_src, &final_lib_dir.join("libncbi-vdb.a"));
+
     // mbedcrypto is built as a separate static lib in ilib/.
     if helper_lib_dir.join("libmbedcrypto.a").exists() {
         println!("cargo:rustc-link-search=native={}", helper_lib_dir.display());
@@ -162,6 +168,39 @@ fn apply_patches(vdb_src: &Path, patch_dir: &Path) {
             String::from_utf8_lossy(&applied.stdout)
         );
     }
+}
+
+/// Delete the bundled zlib's objects from the uber-library, so that zlib-ng provides zlib.
+///
+/// Members are named after zlib's sources (`inflate.c.o`, …). `crc32.c.o` and `compress.c.o`
+/// are left: other bundled libraries have members of the same names, and those two zlib objects
+/// are referenced only by the zlib objects removed here, so they are never linked.
+#[cfg(feature = "zlib-ng")]
+fn remove_bundled_zlib(vdb_src: &Path, library: &Path) {
+    use std::process::Command;
+
+    const SHARED_NAMES: [&str; 2] = ["crc32.c.o", "compress.c.o"];
+    // The uber-library is a symlink to a versioned file; `ar` must rewrite the file itself.
+    let library = library.canonicalize().expect("libncbi-vdb.a");
+    let zlib_objects: Vec<String> = std::fs::read_dir(vdb_src.join("libs/ext/zlib"))
+        .expect("libs/ext/zlib")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.ends_with(".c").then(|| format!("{name}.o"))
+        })
+        .filter(|member| !SHARED_NAMES.contains(&member.as_str()))
+        .collect();
+    let listing = Command::new("ar").arg("t").arg(&library).output().expect("ar t");
+    let members = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let present: Vec<&String> =
+        zlib_objects.iter().filter(|o| members.lines().any(|m| m == o.as_str())).collect();
+    if present.is_empty() {
+        return;
+    }
+    let status = Command::new("ar").arg("d").arg(&library).args(&present).status().expect("ar d");
+    assert!(status.success(), "failed to remove zlib objects from {}", library.display());
+    let status = Command::new("ranlib").arg(&library).status().expect("ranlib");
+    assert!(status.success(), "ranlib failed on {}", library.display());
 }
 
 /// Returns the OS-specific include directory for ncbi-vdb headers.

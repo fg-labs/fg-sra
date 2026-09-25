@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 vendored = ["fg-sra-vdb-sys/vendored"]
+zlib-ng = ["fg-sra-vdb-sys/zlib-ng"]
 
 [dependencies]
 fg-sra-vdb-sys.workspace = true
