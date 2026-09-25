@@ -648,10 +648,10 @@ fn process_row_range(
         }
 
         // Post-read region coordinate filter.
-        if let Some((rs, re)) = item.region_filter {
-            if state.cols.ref_pos < rs || state.cols.ref_pos >= re {
-                continue;
-            }
+        if let Some((rs, re)) = item.region_filter
+            && (state.cols.ref_pos < rs || state.cols.ref_pos >= re)
+        {
+            continue;
         }
 
         // Reconstruct READ from the preloaded reference and stored deltas (done
