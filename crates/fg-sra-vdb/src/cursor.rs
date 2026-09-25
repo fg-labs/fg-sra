@@ -234,6 +234,26 @@ impl VCursor {
         self.read_slice_into(row_id, col_idx, 8, buf)
     }
 
+    /// Read a slice of `i64` values into an existing `Vec`, reusing its allocation.
+    pub fn read_i64_slice_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut Vec<i64>,
+    ) -> Result<(), VdbError> {
+        self.read_slice_into(row_id, col_idx, 64, buf)
+    }
+
+    /// Read a slice of `u32` values into an existing `Vec`, reusing its allocation.
+    pub fn read_u32_slice_into(
+        &self,
+        row_id: i64,
+        col_idx: u32,
+        buf: &mut Vec<u32>,
+    ) -> Result<(), VdbError> {
+        self.read_slice_into(row_id, col_idx, 32, buf)
+    }
+
     /// Read a slice of `i32` values into an existing `Vec`, reusing its allocation.
     pub fn read_i32_slice_into(
         &self,

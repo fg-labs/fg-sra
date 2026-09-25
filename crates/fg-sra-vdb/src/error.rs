@@ -38,6 +38,9 @@ pub enum VdbError {
 /// The `rcDone` state value, indicating iteration is complete (not an error).
 const RC_STATE_DONE: u32 = 1;
 
+/// The `rcNotFound` state value (`kfc/rc.h`).
+const RC_STATE_NOT_FOUND: u32 = 24;
+
 /// The `rcNS` module value, indicating a network system error.
 const RC_MODULE_NETWORK: u32 = 18;
 
@@ -57,6 +60,13 @@ impl VdbError {
     #[must_use]
     pub fn is_done(&self) -> bool {
         matches!(self, Self::Rc(rc) if rc & 0x3F == RC_STATE_DONE)
+    }
+
+    /// Returns `true` if this error reports that the requested object (a table, metadata
+    /// node, attribute, …) does not exist.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Rc(rc) if rc & 0x3F == RC_STATE_NOT_FOUND)
     }
 
     /// Returns `true` if this error is a network error (`module == rcNS == 18`).
@@ -194,6 +204,20 @@ mod tests {
     fn test_error_is_done() {
         let err = VdbError::new(1); // state=1 is rcDone
         assert!(err.is_done());
+    }
+
+    #[test]
+    fn test_error_is_not_found() {
+        // module=10, target=12, context=7, object=3, state=24 (rcNotFound)
+        let rc = (10 << 27) | (12 << 21) | (7 << 14) | (3 << 6) | 24;
+        assert!(VdbError::new(rc).is_not_found());
+        assert!(!VdbError::new(rc).is_done());
+    }
+
+    #[test]
+    fn test_error_other_states_are_not_not_found() {
+        assert!(!VdbError::new(1).is_not_found());
+        assert!(!VdbError::InvalidNulByte.is_not_found());
     }
 
     #[test]

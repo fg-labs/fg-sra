@@ -147,7 +147,16 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("VDBManagerMakeRead")
         .allowlist_function("VDBManagerRelease")
         .allowlist_function("VDBManagerOpenDBRead")
+        .allowlist_function("VDBManagerOpenTableRead")
+        .allowlist_function("VDBManagerPathType")
         .allowlist_function("VDBManagerDisablePagemapThread")
+        // VFS manager / resolver: process-wide remote-access control
+        .allowlist_function("VFSManagerMake")
+        .allowlist_function("VFSManagerRelease")
+        .allowlist_function("VFSManagerGetResolver")
+        .allowlist_function("VResolverRelease")
+        .allowlist_function("VResolverRemoteEnable")
+        .allowlist_item("vrAlwaysDisable")
         // VDatabase
         .allowlist_function("VDatabaseRelease")
         .allowlist_function("VDatabaseOpenTableRead")
@@ -164,6 +173,8 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("VTableCreateCursorRead")
         .allowlist_function("VTableCreateCachedCursorRead")
         .allowlist_function("VTableListReadableColumns")
+        .allowlist_function("VTableListPhysColumns")
+        .allowlist_function("VTableOpenMetadataRead")
         // VCursor
         .allowlist_function("VCursorAddColumn")
         .allowlist_function("VCursorOpen")
@@ -175,6 +186,8 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("KMetadataOpenNodeRead")
         .allowlist_function("KMDataNodeRelease")
         .allowlist_function("KMDataNodeRead")
+        .allowlist_function("KMDataNodeReadAsU64")
+        .allowlist_function("KMDataNodeReadAttr")
         .allowlist_function("KMDataNodeListChildren")
         // KNamelist
         .allowlist_function("KNamelistRelease")
@@ -190,6 +203,7 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("ReferenceObj_SeqId")
         .allowlist_function("ReferenceObj_SeqLength")
         .allowlist_function("ReferenceObj_Idx")
+        .allowlist_function("ReferenceObj_IdRange")
         .allowlist_function("ReferenceObj_Read")
         .allowlist_function("ReferenceObj_Circular")
         .allowlist_function("ReferenceObj_External")
@@ -216,6 +230,8 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_type("PlacementRecordExtendFuncs")
         .allowlist_type("align_id_src")
         .allowlist_type("VDBDependencies")
+        // KPathType / KDBPathType constants, for interpreting VDBManagerPathType.
+        .allowlist_item("kpt.*")
         // rc.h constants for error decoding.
         .allowlist_var("rcDone")
         // Derive traits.

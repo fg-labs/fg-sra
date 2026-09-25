@@ -188,6 +188,19 @@ impl ReferenceObj {
         })
     }
 
+    /// The first and last rows of the `REFERENCE` table holding this reference; alignments
+    /// name their reference by one of these rows (`REF_ID`).
+    pub fn id_range(&self) -> Result<(i64, i64), VdbError> {
+        retry_on_network_error("ReferenceObj_IdRange", || {
+            let (mut start, mut stop) = (0i64, 0i64);
+            let rc = unsafe {
+                fg_sra_vdb_sys::ReferenceObj_IdRange(self.ptr, &raw mut start, &raw mut stop)
+            };
+            check_rc(rc)?;
+            Ok((start, stop))
+        })
+    }
+
     /// Read up to `buf.len()` reference bases starting at 0-based `offset`,
     /// returning the number of bases written into `buf`.
     ///
