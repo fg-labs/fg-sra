@@ -3,6 +3,7 @@
 //! - [`reader`]: reading spots from an archive's reads table ([`crate::archive`]).
 //! - [`prefetch`]: rebuilding, ahead of conversion, aligned reads stored far from their batch's.
 //! - [`spot`]: a spot's reads, and which output each spot goes to.
+//! - [`subsample`]: which spots a random subsample keeps.
 //! - [`defline`] and [`format`]: read names and records.
 //! - [`pipeline`]: converting batches on worker threads and writing them in order.
 //! - [`counts`]: tallies of what was read and written, and the metrics file.
@@ -14,6 +15,7 @@ pub mod pipeline;
 pub mod prefetch;
 pub mod reader;
 pub mod spot;
+pub mod subsample;
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
@@ -41,6 +43,7 @@ use pipeline::{
 use prefetch::PrefetchedReads;
 use reader::{ReadColumns, References, SpotSource, VdbSpotReader};
 use spot::{ReadFilter, SpotRouter};
+use subsample::{Subsampler, parse_fraction};
 
 /// `--table` value that lets [`crate::archive::default_table`] choose.
 const AUTO_TABLE: &str = "auto";
@@ -60,8 +63,9 @@ const MAX_REFERENCE_LOADERS: usize = 8;
 /// (`--r1`/`--r2`, or `--interleaved`), one goes to `--unpaired`, and spots with none or
 /// more than two are dropped and counted. A spot whose output wasn't given is dropped and
 /// counted too; it is an error if nothing at all is written. Filters test biological reads
-/// and fail the whole spot. `--technical` writes the technical reads of the spots written,
-/// one file per technical read, in step with the biological output.
+/// and fail the whole spot, and `--subsample-fraction` keeps or skips whole spots too.
+/// `--technical` writes the technical reads of the spots written, one file per technical read,
+/// in step with the biological output.
 ///
 /// Outputs ending `.gz` or `.bgz` are BGZF-compressed; any output may be `-` for stdout.
 /// Output bytes are the same at any thread count. Aligned (cSRA) archives are supported: their
@@ -135,6 +139,23 @@ pub struct Fastq {
     /// `pass` also drops them.
     #[arg(long, value_enum, value_delimiter = ',', help_heading = "Filters", value_name = "VALUE")]
     pub read_filter: Vec<ReadFilter>,
+
+    /// Fraction of spots to keep, each spot chosen at random with all its reads; with a spot
+    /// range, about this fraction of the range. Spots skipped aren't read, and the totals
+    /// aren't checked against the archive's.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        value_parser = parse_fraction,
+        help_heading = "Filters",
+        value_name = "FRACTION"
+    )]
+    pub subsample_fraction: f64,
+
+    /// Seed choosing the spots --subsample-fraction keeps; a seed keeps the same spots at any
+    /// thread count.
+    #[arg(long, default_value_t = 42, help_heading = "Filters", value_name = "N")]
+    pub subsample_seed: u64,
 
     /// Read-name template: `$ac` accession, `$si` spot id, `$sn` original name (else the
     /// spot id), `$sg` spot group, `$ri` read number within its type, `$rl` read length.
@@ -229,6 +250,7 @@ impl Fastq {
         refuse_overwriting_input(&outputs, Path::new(&archive.location))?;
 
         let config = PipelineConfig {
+            subsampler: self.subsampler(),
             router: self.router(layout.technical.len()),
             formatter: RecordFormatter::new(self.defline.clone(), &accession, self.fasta),
             layout,
@@ -253,6 +275,7 @@ impl Fastq {
                 alignments,
                 References { store, rows },
                 spots.clone(),
+                self.subsampler(),
                 usize::from(self.threads),
                 &accession,
             )?),
@@ -432,6 +455,11 @@ impl Fastq {
         }
     }
 
+    /// The subsampler choosing which spots are converted.
+    fn subsampler(&self) -> Subsampler {
+        Subsampler::new(self.subsample_fraction, self.subsample_seed)
+    }
+
     /// Check the finished conversion, report it, and write the metrics.
     ///
     /// Fails if the run was complete but its totals don't match the archive's stored ones,
@@ -445,6 +473,7 @@ impl Fastq {
     ) -> Result<()> {
         let counts = &summary.counts;
         let whole_run = !summary.stopped_early
+            && self.subsampler().keeps_all()
             && *spots.start() == archive.first_spot
             && *spots.end() == archive.last_spot();
         let metrics = FastqMetrics::new(
@@ -579,20 +608,28 @@ fn load_references(
     Ok((store, rows))
 }
 
-/// Rebuild, ahead of conversion, the aligned reads of `spots` whose alignments lie far from the
-/// rest of their batch's (see [`prefetch`]).
+/// Rebuild, ahead of conversion, the aligned reads of the spots of `spots` that `subsampler`
+/// keeps whose alignments lie far from the rest of their batch's (see [`prefetch`]).
 fn prefetch_far_reads(
     table: &VTable,
     alignments: &VTable,
     references: References<'_>,
     spots: RangeInclusive<i64>,
+    subsampler: Subsampler,
     threads: usize,
     accession: &str,
 ) -> Result<PrefetchedReads> {
     let started = Instant::now();
-    let reads =
-        PrefetchedReads::far_alignments(table, alignments, references, spots, BATCH_SPOTS, threads)
-            .context("failed to prefetch aligned reads")?;
+    let reads = PrefetchedReads::far_alignments(
+        table,
+        alignments,
+        references,
+        spots,
+        BATCH_SPOTS,
+        subsampler,
+        threads,
+    )
+    .context("failed to prefetch aligned reads")?;
     eprintln!(
         "[fastq] {accession}: prefetched {} aligned reads far from their batches' others ({} \
          bases) in {:.1}s",
@@ -649,6 +686,31 @@ mod tests {
         assert_eq!(cmd.defline, Defline::parse("$ac.$si").unwrap());
         assert_eq!(cmd.table, "auto");
         assert!(cmd.read_filter.is_empty());
+    }
+
+    #[test]
+    fn every_spot_is_kept_by_default() {
+        let cmd = parse(&["SRR1.sra", "-u", "u.fq"]).unwrap();
+        assert!(cmd.subsampler().keeps_all());
+        assert_eq!(cmd.subsample_seed, 42);
+    }
+
+    #[test]
+    fn subsample_fraction_and_seed_parse() {
+        let args =
+            ["SRR1.sra", "-u", "u.fq", "--subsample-fraction", "0.1", "--subsample-seed", "7"];
+        let cmd = parse(&args).unwrap();
+        assert_eq!(cmd.subsampler(), Subsampler::new(0.1, 7));
+    }
+
+    #[test]
+    fn subsample_fraction_of_zero_is_refused() {
+        assert!(parse(&["SRR1.sra", "-u", "u.fq", "--subsample-fraction", "0"]).is_err());
+    }
+
+    #[test]
+    fn subsample_fraction_over_one_is_refused() {
+        assert!(parse(&["SRR1.sra", "-u", "u.fq", "--subsample-fraction", "2"]).is_err());
     }
 
     #[test]

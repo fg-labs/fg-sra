@@ -23,6 +23,7 @@ use super::counts::SpotCounts;
 use super::format::RecordFormatter;
 use super::reader::SpotSource;
 use super::spot::{SpotOutcome, SpotRouter};
+use super::subsample::Subsampler;
 use crate::progress::ProgressLogger;
 
 /// Spots per batch. It is fixed, whatever the thread count, because BGZF blocks end only at
@@ -119,6 +120,8 @@ pub struct OutputLayout {
 /// Everything about a conversion that workers need.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
+    /// Which spots are converted; the rest are skipped unread.
+    pub subsampler: Subsampler,
     pub router: SpotRouter,
     pub formatter: RecordFormatter,
     pub layout: OutputLayout,
@@ -341,7 +344,8 @@ fn work<S: SpotSource>(
     failure.map_or(Ok(tally), Err)
 }
 
-/// Read, route and format the spots `ids` into one buffer per output.
+/// Read, route and format the spots of `ids` that the subsampler keeps into one buffer per
+/// output.
 fn convert_batch<S: SpotSource>(
     source: &mut S,
     ids: RangeInclusive<i64>,
@@ -351,8 +355,11 @@ fn convert_batch<S: SpotSource>(
     let layout = &config.layout;
     let formatter = &config.formatter;
     let mut tally = WorkerTally::default();
-    source.start_batch(ids.clone())?;
-    for id in ids {
+    let kept: Vec<i64> = ids.clone().filter(|&id| config.subsampler.keeps(id)).collect();
+    let batch_len = (ids.end() - ids.start() + 1) as u64;
+    tally.counts.spots_skipped_by_subsampling = batch_len - kept.len() as u64;
+    source.start_batch(&kept)?;
+    for &id in &kept {
         let spot = source.read(id)?;
         spot.validate(config.with_qualities)?;
         let outcome = config.router.route(&spot);
@@ -532,14 +539,14 @@ mod tests {
     /// A source that logs each batch it is told of, and fails a read outside that batch.
     struct BatchLoggingSource {
         source: TestSource,
-        batch: Option<RangeInclusive<i64>>,
-        log: Arc<Mutex<Vec<RangeInclusive<i64>>>>,
+        batch: Option<Vec<i64>>,
+        log: Arc<Mutex<Vec<Vec<i64>>>>,
     }
 
     impl SpotSource for BatchLoggingSource {
-        fn start_batch(&mut self, ids: RangeInclusive<i64>) -> Result<()> {
-            self.log.lock().unwrap().push(ids.clone());
-            self.batch = Some(ids);
+        fn start_batch(&mut self, ids: &[i64]) -> Result<()> {
+            self.log.lock().unwrap().push(ids.to_vec());
+            self.batch = Some(ids.to_vec());
             Ok(())
         }
 
@@ -586,6 +593,7 @@ mod tests {
 
     fn config(layout: OutputLayout) -> PipelineConfig {
         PipelineConfig {
+            subsampler: Subsampler::new(1.0, 42),
             router: SpotRouter {
                 min_read_len: 0,
                 kept_filters: [true; 4],
@@ -672,8 +680,73 @@ mod tests {
             .collect();
         run_to(sources, 1..=10, &outputs, &config(paired_layout())).unwrap();
         let mut batches = log.lock().unwrap().clone();
-        batches.sort_by_key(|batch| *batch.start());
-        assert_eq!(batches, [1..=4, 5..=8, 9..=10]);
+        batches.sort();
+        assert_eq!(batches, [vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]]);
+    }
+
+    /// `config` for `layout`, keeping `fraction` of spots by seed 42.
+    fn subsampled_config(layout: OutputLayout, fraction: f64) -> PipelineConfig {
+        PipelineConfig { subsampler: Subsampler::new(fraction, 42), ..config(layout) }
+    }
+
+    /// The spot ids of `fastq`'s records, named `$ac.$si/$ri`.
+    fn spot_ids(fastq: &str) -> Vec<i64> {
+        names(fastq)
+            .iter()
+            .map(|name| name.trim_start_matches("@T.").split('/').next().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn subsampling_keeps_or_skips_each_spot_in_every_output_together() {
+        let dir = scratch_dir("subsample-mates");
+        let outputs = ["r1.fq", "r2.fq", "u.fq"].map(|n| output(&dir, n, Encoding::Plain));
+        let config = subsampled_config(paired_layout(), 0.5);
+        run_to(sources(90, 2), 1..=90, &outputs, &config).unwrap();
+
+        let first_mates = spot_ids(&read_text(&dir.join("r1.fq")));
+        assert_eq!(first_mates, spot_ids(&read_text(&dir.join("r2.fq"))));
+        let mut written = [first_mates, spot_ids(&read_text(&dir.join("u.fq")))].concat();
+        written.sort_unstable();
+        let kept: Vec<i64> = (1..=90).filter(|&id| config.subsampler.keeps(id)).collect();
+        assert_eq!(written, kept);
+        assert!(!kept.is_empty() && kept.len() < 90, "{kept:?}");
+    }
+
+    #[test]
+    fn spots_skipped_by_subsampling_are_never_read_but_are_counted() {
+        let dir = scratch_dir("subsample-unread");
+        let outputs = ["r1.fq", "r2.fq", "u.fq"].map(|n| output(&dir, n, Encoding::Plain));
+        let log = Arc::default();
+        let sources: Vec<_> = sources(40, 3)
+            .into_iter()
+            .map(|source| BatchLoggingSource { source, batch: None, log: Arc::clone(&log) })
+            .collect();
+        let config = subsampled_config(paired_layout(), 0.3);
+        let summary = run_to(sources, 1..=40, &outputs, &config).unwrap();
+
+        let mut started: Vec<i64> = log.lock().unwrap().concat();
+        started.sort_unstable();
+        let kept: Vec<i64> = (1..=40).filter(|&id| config.subsampler.keeps(id)).collect();
+        assert_eq!(started, kept);
+        assert_eq!(summary.counts.spots, kept.len() as u64);
+        assert_eq!(summary.counts.spots_skipped_by_subsampling, 40 - kept.len() as u64);
+    }
+
+    #[test]
+    fn subsampled_output_is_identical_at_one_and_four_threads() {
+        let convert = |threads| {
+            let dir = scratch_dir(&format!("subsample-threads-{threads}"));
+            let outputs =
+                ["r1.fq.gz", "r2.fq.gz", "u.fq.gz"].map(|n| output(&dir, n, Encoding::Bgzf));
+            let config = subsampled_config(paired_layout(), 0.2);
+            run_to(sources(500, threads), 1..=500, &outputs, &config).unwrap();
+            outputs.map(|output| match output.target {
+                OutputTarget::Path(path) => std::fs::read(path).unwrap(),
+                OutputTarget::Stdout => unreachable!(),
+            })
+        };
+        assert!(convert(1) == convert(4), "subsampled output differs between 1 and 4 threads");
     }
 
     #[test]

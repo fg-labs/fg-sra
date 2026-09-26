@@ -16,6 +16,7 @@ use fg_sra_vdb::database::VTable;
 
 use super::pipeline::VDB_THREAD_STACK_BYTES;
 use super::reader::{AlignmentReader, References};
+use super::subsample::Subsampler;
 
 /// Alignment rows per block when judging whether an alignment is near the rest of its batch's:
 /// about one blob of the alignment table's columns.
@@ -45,9 +46,10 @@ pub struct PrefetchedReads {
 }
 
 impl PrefetchedReads {
-    /// Find the alignments of `spots` that lie far from the rest of their batch's, taking batches
-    /// of `batch_spots` from the range's start as the conversion does, and rebuild their reads from
-    /// `alignments` and `references`, on `threads` threads.
+    /// Find the alignments of the spots of `spots` that `subsampler` keeps that lie far from the
+    /// rest of their batch's, taking batches of `batch_spots` from the range's start as the
+    /// conversion does, and rebuild their reads from `alignments` and `references`, on
+    /// `threads` threads.
     ///
     /// `table` is the reads table, read for `PRIMARY_ALIGNMENT_ID` only.
     pub fn far_alignments(
@@ -56,9 +58,10 @@ impl PrefetchedReads {
         references: References<'_>,
         spots: RangeInclusive<i64>,
         batch_spots: i64,
+        subsampler: Subsampler,
         threads: usize,
     ) -> Result<Self> {
-        let mut far = find_far_alignments(table, spots, batch_spots, threads)?;
+        let mut far = find_far_alignments(table, spots, batch_spots, subsampler, threads)?;
         far.truncate(MAX_PREFETCHED);
         let readers = (0..threads.max(1))
             .map(|_| AlignmentReader::new(alignments, references))
@@ -139,11 +142,13 @@ struct Chunk {
     bases: Vec<u8>,
 }
 
-/// The alignments of every batch of `spots` that [`far_in_batch`] picks, ascending.
+/// The alignments of every batch of `spots` that [`far_in_batch`] picks, ascending, counting
+/// only the spots `subsampler` keeps as a batch's.
 fn find_far_alignments(
     table: &VTable,
     spots: RangeInclusive<i64>,
     batch_spots: i64,
+    subsampler: Subsampler,
     threads: usize,
 ) -> Result<Vec<i64>> {
     let (first, last) = spots.into_inner();
@@ -166,7 +171,7 @@ fn find_far_alignments(
         parallel_chunks(&batches.iter().collect::<Vec<_>>(), cursors, |state, batch| {
             let (cursor, column, cell) = state;
             let mut ids = Vec::new();
-            for spot in batch.clone() {
+            for spot in batch.clone().filter(|&spot| subsampler.keeps(spot)) {
                 cursor
                     .read_i64_slice_into(spot, *column, cell)
                     .with_context(|| format!("failed to read spot {spot}'s alignment ids"))?;
