@@ -8,10 +8,18 @@
 //! - `FG_SRA_TEST_COLOR_SPACE_SRA` to a colour-space run stored as `CSREAD` with no physical
 //!   `READ`, e.g. ERR048905.
 //!
-//! Without them, those tests print a note and pass.
+//! Without them, those tests print a note and pass. Tests that need only some archive use
+//! a small aligned database from the vendored ncbi-vdb tests.
 
+use std::fs::{File, Permissions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+/// A small aligned database with embedded references, from the vendored ncbi-vdb tests.
+fn vendored_archive() -> String {
+    path(Path::new(env!("CARGO_MANIFEST_DIR")), "../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra")
+}
 
 /// Returns the archive named by env var `key`, or `None` (after a note) if it is unset.
 fn archive_from_env(key: &str) -> Option<String> {
@@ -123,6 +131,24 @@ fn paired_run_sent_only_to_unpaired_fails_and_leaves_no_output() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("did you mean --r1/--r2?"), "{}", stderr(&output));
     assert!(!Path::new(&unpaired).exists());
+}
+
+#[test]
+fn failed_run_keeps_an_existing_output_it_could_not_open() {
+    let dir = scratch_dir("read-only-output");
+    let (r1, r2, unpaired) = (path(&dir, "r1.fq"), path(&dir, "r2.fq"), path(&dir, "u.fq"));
+    std::fs::write(&unpaired, "kept\n").unwrap();
+    std::fs::set_permissions(&unpaired, Permissions::from_mode(0o444)).unwrap();
+    if File::options().append(true).open(&unpaired).is_ok() {
+        eprintln!("skipping: permissions don't stop this user writing {unpaired}");
+        return;
+    }
+    let output = fastq(&[&vendored_archive(), "-1", &r1, "-2", &r2, "-u", &unpaired]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("failed to create"), "{}", stderr(&output));
+    assert!(!Path::new(&r1).exists());
+    assert!(!Path::new(&r2).exists());
+    assert_eq!(std::fs::read_to_string(&unpaired).unwrap(), "kept\n");
 }
 
 #[test]

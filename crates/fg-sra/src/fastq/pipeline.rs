@@ -13,6 +13,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow};
 use bgzf::{BGZF_BLOCK_SIZE, CompressionLevel, Compressor};
@@ -81,6 +82,26 @@ pub enum Encoding {
 pub struct Output {
     pub target: OutputTarget,
     pub encoding: Encoding,
+}
+
+/// The regular files a run opened, creating or truncating them: the outputs to remove if the
+/// run fails, so a partial file can't be mistaken for a complete one. An existing file the run
+/// couldn't open is never recorded, so is left as it was; nor are FIFOs, devices or stdout.
+#[derive(Debug, Default)]
+pub struct CreatedFiles(Mutex<Vec<PathBuf>>);
+
+impl CreatedFiles {
+    fn record(&self, path: &Path) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_path_buf());
+    }
+
+    /// Remove every file recorded.
+    pub fn remove(self) {
+        for path in self.0.into_inner().unwrap_or_else(PoisonError::into_inner) {
+            // Best effort: the run has failed already.
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Which output each kind of record goes to, as indices into the outputs.
@@ -164,11 +185,13 @@ struct WorkerTally {
 /// On failure, the first real error is returned: a worker's (reading, validating or
 /// compressing) in preference to a writer's. If an output's reader goes away the run stops
 /// early without error, and the summary says so. BGZF outputs get their end-of-file block
-/// only when every spot was converted.
+/// only when every spot was converted. The regular files opened are recorded in `created`,
+/// whether or not the run succeeds.
 pub fn run<S: SpotSource + Send>(
     sources: Vec<S>,
     spots: RangeInclusive<i64>,
     outputs: &[Output],
+    created: &CreatedFiles,
     config: &PipelineConfig,
     progress: &ProgressLogger,
 ) -> Result<PipelineSummary> {
@@ -184,7 +207,9 @@ pub fn run<S: SpotSource + Send>(
             let (order_tx, order_rx) = bounded(threads * BATCHES_PER_WORKER);
             order_txs.push(order_tx);
             let (stop, pipe_closed) = (&stop, &pipe_closed);
-            writers.push(scope.spawn(move || write_output(&order_rx, output, stop, pipe_closed)));
+            writers.push(
+                scope.spawn(move || write_output(&order_rx, output, created, stop, pipe_closed)),
+            );
         }
         let workers = sources
             .into_iter()
@@ -396,15 +421,21 @@ fn encode(
 fn write_output(
     order: &Receiver<Receiver<Result<Vec<u8>>>>,
     output: &Output,
+    created: &CreatedFiles,
     stop: &AtomicBool,
     pipe_closed: &AtomicBool,
 ) -> Result<()> {
     let name = output.target.describe();
     let sink: Box<dyn Write> = match &output.target {
         OutputTarget::Stdout => Box::new(std::io::stdout().lock()),
-        OutputTarget::Path(path) => Box::new(
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
-        ),
+        OutputTarget::Path(path) => {
+            let file = File::create(path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            if file.metadata().is_ok_and(|meta| meta.is_file()) {
+                created.record(path);
+            }
+            Box::new(file)
+        }
     };
     let mut writer = BufWriter::with_capacity(WRITE_BUFFER_BYTES, sink);
     let mut closed = false;
@@ -457,6 +488,7 @@ fn write_output(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -597,7 +629,8 @@ mod tests {
         outputs: &[Output],
         config: &PipelineConfig,
     ) -> Result<PipelineSummary> {
-        run(sources, spots, outputs, config, &ProgressLogger::new(0, 0))
+        let created = CreatedFiles::default();
+        run(sources, spots, outputs, &created, config, &ProgressLogger::new(0, 0))
     }
 
     fn read_text(path: &Path) -> String {
@@ -799,6 +832,28 @@ mod tests {
         let err =
             run_to(sources(2_000, 2), 1..=2_000, &outputs, &config(paired_layout())).unwrap_err();
         assert!(err.to_string().contains("failed to create"), "{err:#}");
+    }
+
+    #[test]
+    fn removing_a_failed_runs_files_keeps_an_existing_file_it_could_not_open() {
+        let dir = scratch_dir("read-only-existing");
+        let r2 = dir.join("r2.fq");
+        std::fs::write(&r2, "kept\n").unwrap();
+        std::fs::set_permissions(&r2, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if File::options().append(true).open(&r2).is_ok() {
+            eprintln!("skipping: permissions don't stop this user writing {}", r2.display());
+            return;
+        }
+        let outputs = ["r1.fq", "r2.fq", "u.fq"].map(|n| output(&dir, n, Encoding::Plain));
+        let created = CreatedFiles::default();
+        let progress = ProgressLogger::new(0, 0);
+        let config = config(paired_layout());
+        run(sources(100, 2), 1..=100, &outputs, &created, &config, &progress).unwrap_err();
+
+        created.remove();
+        assert!(!dir.join("r1.fq").exists());
+        assert!(!dir.join("u.fq").exists());
+        assert_eq!(read_text(&r2), "kept\n");
     }
 
     /// Make a FIFO at `path` with the `mkfifo` utility.

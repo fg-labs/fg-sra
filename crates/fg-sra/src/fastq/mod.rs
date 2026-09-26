@@ -35,7 +35,7 @@ use counts::FastqMetrics;
 use defline::Defline;
 use format::RecordFormatter;
 use pipeline::{
-    BATCH_SPOTS, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig,
+    BATCH_SPOTS, CreatedFiles, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig,
     VDB_THREAD_STACK_BYTES,
 };
 use prefetch::PrefetchedReads;
@@ -227,7 +227,6 @@ impl Fastq {
         let technical_paths = self.technical_paths(&table.table, *spots.start(), columns)?;
         let (outputs, layout) = self.outputs(&technical_paths);
         refuse_overwriting_input(&outputs, Path::new(&archive.location))?;
-        let removable = removable_outputs(&outputs);
 
         let config = PipelineConfig {
             router: self.router(layout.technical.len()),
@@ -272,10 +271,11 @@ impl Fastq {
             })
             .collect::<Result<Vec<_>>>()?;
         let progress = ProgressLogger::new(0, PROGRESS_INTERVAL);
-        let result = pipeline::run(sources, spots.clone(), &outputs, &config, &progress)
+        let created = CreatedFiles::default();
+        let result = pipeline::run(sources, spots.clone(), &outputs, &created, &config, &progress)
             .and_then(|summary| self.finish(&archive, &accession, &spots, &summary));
         if result.is_err() {
-            remove_outputs(&removable);
+            created.remove();
         }
         result
     }
@@ -630,28 +630,6 @@ fn refuse_overwriting_input(outputs: &[Output], input: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The outputs that are regular files this run creates or truncates, which a failed run
-/// removes; FIFOs, devices (e.g. `/dev/null`) and stdout are left alone.
-fn removable_outputs(outputs: &[Output]) -> Vec<PathBuf> {
-    outputs
-        .iter()
-        .filter_map(|output| match &output.target {
-            OutputTarget::Path(path) => Some(path),
-            OutputTarget::Stdout => None,
-        })
-        .filter(|path| std::fs::metadata(path).map_or(true, |meta| meta.is_file()))
-        .cloned()
-        .collect()
-}
-
-/// Remove outputs of a failed run, so a partial file can't be mistaken for a complete one.
-fn remove_outputs(paths: &[PathBuf]) {
-    for path in paths {
-        // Best effort: the file may never have been created.
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[cfg(test)]
