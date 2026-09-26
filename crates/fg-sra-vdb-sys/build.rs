@@ -6,6 +6,10 @@
 //! 1. `VDB_INCDIR` / `VDB_LIBDIR` env vars — use a pre-built ncbi-vdb
 //! 2. `vendored` cargo feature — build ncbi-vdb from the git submodule via cmake
 //! 3. Neither — fail with a helpful error message
+//!
+//! The vendored source is first patched, in place, with `vendor/patches/ncbi-vdb/*.patch`: fixes
+//! not yet in an ncbi-vdb release. With the `zlib-ng` feature, the vendored library's bundled
+//! zlib is removed after the build so that zlib-ng, from `libz-sys`, provides zlib instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -39,8 +43,10 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=pthread");
     }
 
-    // Additional system libraries.
-    println!("cargo:rustc-link-lib=dylib=z");
+    // zlib: the system's, unless zlib-ng (from `libz-sys`) replaces the bundled one.
+    if env::var_os("CARGO_FEATURE_ZLIB_NG").is_none() {
+        println!("cargo:rustc-link-lib=dylib=z");
+    }
 
     // Generate FFI bindings via bindgen.
     generate_bindings(&inc_dir, &out_dir);
@@ -84,6 +90,8 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
              Run: git submodule update --init --recursive",
         );
 
+    apply_patches(&vdb_src, &vdb_src.join("../patches/ncbi-vdb"));
+
     let dst =
         cmake::Config::new(&vdb_src).define("LIBS_ONLY", "ON").build_target("ncbi-vdb").build();
 
@@ -107,6 +115,9 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
         );
     };
 
+    #[cfg(feature = "zlib-ng")]
+    remove_bundled_zlib(&vdb_src, &final_lib_dir.join("libncbi-vdb.a"));
+
     // mbedcrypto is built as a separate static lib in ilib/.
     if helper_lib_dir.join("libmbedcrypto.a").exists() {
         println!("cargo:rustc-link-search=native={}", helper_lib_dir.display());
@@ -117,6 +128,79 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
     println!("cargo:rerun-if-changed={}", vdb_src.display());
 
     (inc_dir, final_lib_dir)
+}
+
+/// Apply each `*.patch` in `patch_dir` to the ncbi-vdb source at `vdb_src`, in name order,
+/// skipping those already applied: the source is patched in place, so later builds find them
+/// there. The options used mean the same to GNU patch and to macOS's BSD patch.
+#[cfg(feature = "vendored")]
+fn apply_patches(vdb_src: &Path, patch_dir: &Path) {
+    use std::process::Command;
+
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(patch_dir)
+        .expect("vendor/patches/ncbi-vdb")
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+        .collect();
+    patches.sort();
+    for patch in &patches {
+        println!("cargo:rerun-if-changed={}", patch.display());
+        let run = |extra: &[&str]| {
+            Command::new("patch")
+                .args(["-p1", "-f", "-s", "-F0", "-d"])
+                .arg(vdb_src)
+                .args(extra)
+                .arg("-i")
+                .arg(patch)
+                .output()
+                .expect("failed to run patch")
+        };
+        // A patch that reverses cleanly is already applied.
+        if run(&["-R", "--dry-run"]).status.success() {
+            continue;
+        }
+        let applied = run(&[]);
+        assert!(
+            applied.status.success(),
+            "failed to apply {} to {}:\n{}",
+            patch.display(),
+            vdb_src.display(),
+            String::from_utf8_lossy(&applied.stdout)
+        );
+    }
+}
+
+/// Delete the bundled zlib's objects from the uber-library, so that zlib-ng provides zlib.
+///
+/// Members are named after zlib's sources (`inflate.c.o`, …). `crc32.c.o` and `compress.c.o`
+/// are left: other bundled libraries have members of the same names, and those two zlib objects
+/// are referenced only by the zlib objects removed here, so they are never linked.
+#[cfg(feature = "zlib-ng")]
+fn remove_bundled_zlib(vdb_src: &Path, library: &Path) {
+    use std::process::Command;
+
+    const SHARED_NAMES: [&str; 2] = ["crc32.c.o", "compress.c.o"];
+    // The uber-library is a symlink to a versioned file; `ar` must rewrite the file itself.
+    let library = library.canonicalize().expect("libncbi-vdb.a");
+    let zlib_objects: Vec<String> = std::fs::read_dir(vdb_src.join("libs/ext/zlib"))
+        .expect("libs/ext/zlib")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.ends_with(".c").then(|| format!("{name}.o"))
+        })
+        .filter(|member| !SHARED_NAMES.contains(&member.as_str()))
+        .collect();
+    let listing = Command::new("ar").arg("t").arg(&library).output().expect("ar t");
+    let members = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let present: Vec<&String> =
+        zlib_objects.iter().filter(|o| members.lines().any(|m| m == o.as_str())).collect();
+    if present.is_empty() {
+        return;
+    }
+    let status = Command::new("ar").arg("d").arg(&library).args(&present).status().expect("ar d");
+    assert!(status.success(), "failed to remove zlib objects from {}", library.display());
+    let status = Command::new("ranlib").arg(&library).status().expect("ranlib");
+    assert!(status.success(), "ranlib failed on {}", library.display());
 }
 
 /// Returns the OS-specific include directory for ncbi-vdb headers.
@@ -147,7 +231,16 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("VDBManagerMakeRead")
         .allowlist_function("VDBManagerRelease")
         .allowlist_function("VDBManagerOpenDBRead")
+        .allowlist_function("VDBManagerOpenTableRead")
+        .allowlist_function("VDBManagerPathType")
         .allowlist_function("VDBManagerDisablePagemapThread")
+        // VFS manager / resolver: process-wide remote-access control
+        .allowlist_function("VFSManagerMake")
+        .allowlist_function("VFSManagerRelease")
+        .allowlist_function("VFSManagerGetResolver")
+        .allowlist_function("VResolverRelease")
+        .allowlist_function("VResolverRemoteEnable")
+        .allowlist_item("vrAlwaysDisable")
         // VDatabase
         .allowlist_function("VDatabaseRelease")
         .allowlist_function("VDatabaseOpenTableRead")
@@ -164,17 +257,26 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("VTableCreateCursorRead")
         .allowlist_function("VTableCreateCachedCursorRead")
         .allowlist_function("VTableListReadableColumns")
+        .allowlist_function("VTableListPhysColumns")
+        .allowlist_function("VTableOpenMetadataRead")
         // VCursor
         .allowlist_function("VCursorAddColumn")
         .allowlist_function("VCursorOpen")
         .allowlist_function("VCursorCellDataDirect")
         .allowlist_function("VCursorIdRange")
+        .allowlist_function("VCursorGetBlobDirect")
+        // VBlob
+        .allowlist_function("VBlobIdRange")
+        .allowlist_function("VBlobCellData")
+        .allowlist_function("VBlobRelease")
         .allowlist_function("VCursorRelease")
         // KMetadata / KMDataNode
         .allowlist_function("KMetadataRelease")
         .allowlist_function("KMetadataOpenNodeRead")
         .allowlist_function("KMDataNodeRelease")
         .allowlist_function("KMDataNodeRead")
+        .allowlist_function("KMDataNodeReadAsU64")
+        .allowlist_function("KMDataNodeReadAttr")
         .allowlist_function("KMDataNodeListChildren")
         // KNamelist
         .allowlist_function("KNamelistRelease")
@@ -190,6 +292,7 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_function("ReferenceObj_SeqId")
         .allowlist_function("ReferenceObj_SeqLength")
         .allowlist_function("ReferenceObj_Idx")
+        .allowlist_function("ReferenceObj_IdRange")
         .allowlist_function("ReferenceObj_Read")
         .allowlist_function("ReferenceObj_Circular")
         .allowlist_function("ReferenceObj_External")
@@ -216,6 +319,8 @@ fn generate_bindings(inc_dir: &Path, out_dir: &Path) {
         .allowlist_type("PlacementRecordExtendFuncs")
         .allowlist_type("align_id_src")
         .allowlist_type("VDBDependencies")
+        // KPathType / KDBPathType constants, for interpreting VDBManagerPathType.
+        .allowlist_item("kpt.*")
         // rc.h constants for error decoding.
         .allowlist_var("rcDone")
         // Derive traits.

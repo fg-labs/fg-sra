@@ -1,0 +1,2 @@
+# Platform names that doc comments use as written, besides clippy's defaults ("..").
+doc-valid-idents = ["PacBio", "SOLiD", ".."]

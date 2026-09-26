@@ -4,9 +4,10 @@
 //! It is created once and used to open all VDB resources.
 
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::database::VDatabase;
-use crate::error::{VdbError, check_rc, to_cstring};
+use crate::database::{VDatabase, VTable};
+use crate::error::{LITERAL_FORMAT, VdbError, check_rc, path_to_cstring};
 
 /// Safe wrapper around the VDB `VDBManager` opaque type.
 ///
@@ -16,7 +17,24 @@ pub struct VdbManager {
     ptr: *const fg_sra_vdb_sys::VDBManager,
 }
 
-// VDBManager is internally reference-counted and thread-safe for read operations.
+/// Serializes making and releasing VDB managers: both build or tear down
+/// ncbi-vdb's process-wide configuration (`KConfig`), which isn't safe to do on
+/// two threads at once. Managers made concurrently otherwise abort with
+/// `Assertion failed: (self -> mgr == mgr), function KConfigNodeVOpenNodeReadInt`.
+///
+/// Databases, tables, cursors, metadata, reference lists and dependency lists
+/// hold their manager, so releasing the last of them tears it down too; their
+/// releases hold the lock as well.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+
+/// Hold [`LIFECYCLE`]; a panic while it was held leaves nothing to repair.
+pub(crate) fn lifecycle_lock() -> MutexGuard<'static, ()> {
+    LIFECYCLE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// VDBManager is internally reference-counted and thread-safe for read operations;
+// making and releasing one, directly or through what holds it, is serialized by
+// `LIFECYCLE`.
 unsafe impl Send for VdbManager {}
 unsafe impl Sync for VdbManager {}
 
@@ -27,6 +45,7 @@ impl VdbManager {
     /// for the working directory to use the default.
     pub fn make_read() -> Result<Self, VdbError> {
         let mut mgr: *const fg_sra_vdb_sys::VDBManager = ptr::null();
+        let _lock = lifecycle_lock();
         // Safety: VDBManagerMakeRead initializes mgr; we pass NULL for default directory.
         let rc = unsafe { fg_sra_vdb_sys::VDBManagerMakeRead(&raw mut mgr, ptr::null()) };
         check_rc(rc)?;
@@ -42,22 +61,64 @@ impl VdbManager {
         check_rc(rc)
     }
 
+    /// Report what kind of VDB object `path` names: a database, a flat table, or neither.
+    ///
+    /// Like the `open_*` methods this resolves accessions, so a bare accession may cost a
+    /// network lookup. Opening a database as a table, or a table as a database, fails, so
+    /// call this first when the input could be either. Fails with
+    /// [`VdbError::PercentInPath`] for a path containing `%`.
+    pub fn path_type(&self, path: &str) -> Result<PathType, VdbError> {
+        let c_path = path_to_cstring(path)?;
+        // Safety: VDBManagerPathType is printf-style variadic; the path is the single
+        // argument to a literal "%s" format.
+        let raw = unsafe {
+            fg_sra_vdb_sys::VDBManagerPathType(self.ptr, LITERAL_FORMAT.as_ptr(), c_path.as_ptr())
+        };
+        Ok(PathType::from_raw(raw))
+    }
+
     /// Open a read-only database by accession or path.
+    ///
+    /// Fails with [`VdbError::PercentInPath`] for a path containing `%`, which ncbi-vdb
+    /// cannot handle.
     pub fn open_db_read(&self, path: &str) -> Result<VDatabase, VdbError> {
-        let c_path = to_cstring(path)?;
+        let c_path = path_to_cstring(path)?;
         let mut db: *const fg_sra_vdb_sys::VDatabase = ptr::null();
-        // Safety: VDBManagerOpenDBRead is variadic; we pass the path as the only
-        // variadic arg (format string with no format specifiers).
+        // Safety: VDBManagerOpenDBRead is printf-style variadic; the path is the single
+        // argument to a literal "%s" format.
         let rc = unsafe {
             fg_sra_vdb_sys::VDBManagerOpenDBRead(
                 self.ptr,
                 &raw mut db,
                 ptr::null(), // schema (NULL = use default)
+                LITERAL_FORMAT.as_ptr(),
                 c_path.as_ptr(),
             )
         };
         check_rc(rc)?;
         Ok(VDatabase::from_raw(db))
+    }
+
+    /// Open a read-only flat table (e.g. an older unaligned SRA run) by accession or path.
+    ///
+    /// This fails on a database; open its `SEQUENCE` table through [`VDatabase`] instead.
+    /// Like [`open_db_read`](Self::open_db_read), it refuses a path containing `%`.
+    pub fn open_table_read(&self, path: &str) -> Result<VTable, VdbError> {
+        let c_path = path_to_cstring(path)?;
+        let mut tbl: *const fg_sra_vdb_sys::VTable = ptr::null();
+        // Safety: VDBManagerOpenTableRead is printf-style variadic; the path is the single
+        // argument to a literal "%s" format.
+        let rc = unsafe {
+            fg_sra_vdb_sys::VDBManagerOpenTableRead(
+                self.ptr,
+                &raw mut tbl,
+                ptr::null(), // schema (NULL = use the table's own)
+                LITERAL_FORMAT.as_ptr(),
+                c_path.as_ptr(),
+            )
+        };
+        check_rc(rc)?;
+        Ok(VTable::from_raw(tbl))
     }
 
     /// Get the raw pointer (for passing to C APIs that need the manager).
@@ -70,8 +131,129 @@ impl VdbManager {
 impl Drop for VdbManager {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = lifecycle_lock();
             // Safety: we own the reference.
             unsafe { fg_sra_vdb_sys::VDBManagerRelease(self.ptr) };
         }
+    }
+}
+
+/// The kind of object at a path, from `VDBManagerPathType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathType {
+    /// A VDB database: a cSRA archive, or a database holding only a `SEQUENCE` table.
+    Database,
+    /// A flat VDB table, as many older unaligned SRA runs are.
+    Table,
+    /// Nothing exists at the path, or the accession could not be resolved.
+    NotFound,
+    /// Anything else (a plain file or directory, a bad path, a lone column, …), with the
+    /// raw `KDBPathType` value and its alias bit cleared.
+    Other(u32),
+}
+
+impl PathType {
+    /// Interpret a raw `VDBManagerPathType` result, ignoring the alias bit (set when the
+    /// path is reached through a symbolic link).
+    fn from_raw(raw: std::os::raw::c_int) -> Self {
+        let Ok(raw) = u32::try_from(raw) else {
+            return Self::Other(fg_sra_vdb_sys::kptBadPath);
+        };
+        match raw & !fg_sra_vdb_sys::kptAlias {
+            fg_sra_vdb_sys::kptDatabase => Self::Database,
+            fg_sra_vdb_sys::kptTable => Self::Table,
+            fg_sra_vdb_sys::kptNotFound => Self::NotFound,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// Stop VDB from resolving or reading anything over the network, for the rest of the process.
+///
+/// Accessions and references are then found only locally (the working directory, local
+/// repositories, or beside the archive), and anything else fails. The setting is
+/// process-wide (a global in ncbi-vdb's resolver), so it applies to managers made before
+/// and after the call.
+pub fn disable_remote_access() -> Result<(), VdbError> {
+    let _lock = lifecycle_lock();
+    let mut vfs: *mut fg_sra_vdb_sys::VFSManager = ptr::null_mut();
+    // Safety: VFSManagerMake initializes `vfs`, which is released below.
+    check_rc(unsafe { fg_sra_vdb_sys::VFSManagerMake(&raw mut vfs) })?;
+    let mut resolver: *mut fg_sra_vdb_sys::VResolver = ptr::null_mut();
+    // Safety: `vfs` is valid; VFSManagerGetResolver initializes `resolver`.
+    let rc = unsafe { fg_sra_vdb_sys::VFSManagerGetResolver(vfs, &raw mut resolver) };
+    if rc == 0 {
+        // Safety: `resolver` is valid. The call returns the prior state, not an rc.
+        unsafe {
+            fg_sra_vdb_sys::VResolverRemoteEnable(resolver, fg_sra_vdb_sys::vrAlwaysDisable);
+            fg_sra_vdb_sys::VResolverRelease(resolver);
+        }
+    }
+    // Safety: we own the reference made above.
+    unsafe { fg_sra_vdb_sys::VFSManagerRelease(vfs) };
+    check_rc(rc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn databases_outliving_their_managers_can_be_released_on_several_threads_at_once() {
+        // Dropping the manager first leaves the database's release to tear it down,
+        // under the lock, while other threads make managers.
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+        let archive = archive.to_str().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        let manager = VdbManager::make_read().unwrap();
+                        let database = manager.open_db_read(archive).unwrap();
+                        drop(manager);
+                        drop(database);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn managers_can_be_made_and_released_on_several_threads_at_once() {
+        // Unserialized, this aborted in ncbi-vdb's configuration within a few rounds.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        drop(VdbManager::make_read().unwrap());
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn database_path_type_is_recognised() {
+        let raw = std::os::raw::c_int::try_from(fg_sra_vdb_sys::kptDatabase).unwrap();
+        assert_eq!(PathType::from_raw(raw), PathType::Database);
+    }
+
+    #[test]
+    fn table_reached_through_a_symlink_is_still_a_table() {
+        let raw = fg_sra_vdb_sys::kptTable | fg_sra_vdb_sys::kptAlias;
+        let raw = std::os::raw::c_int::try_from(raw).unwrap();
+        assert_eq!(PathType::from_raw(raw), PathType::Table);
+    }
+
+    #[test]
+    fn plain_directory_is_other() {
+        let raw = std::os::raw::c_int::try_from(fg_sra_vdb_sys::kptDir).unwrap();
+        assert_eq!(PathType::from_raw(raw), PathType::Other(fg_sra_vdb_sys::kptDir));
+    }
+
+    #[test]
+    fn negative_path_type_is_a_bad_path() {
+        assert_eq!(PathType::from_raw(-1), PathType::Other(fg_sra_vdb_sys::kptBadPath));
     }
 }

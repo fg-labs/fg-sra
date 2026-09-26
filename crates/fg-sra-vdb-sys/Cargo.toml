@@ -19,6 +19,12 @@ pedantic = { level = "allow", priority = -1 }
 # Without this feature, VDB_INCDIR and VDB_LIBDIR env vars must be set
 # to point at a pre-built ncbi-vdb installation.
 vendored = ["dep:cmake"]
+# Link zlib-ng (built from source, zlib-compatible) in place of the zlib bundled with the
+# vendored ncbi-vdb, whose inflate is a large part of reading an archive.
+zlib-ng = ["vendored", "dep:libz-sys"]
+
+[dependencies]
+libz-sys = { version = "1.1", optional = true, default-features = false, features = ["static", "zlib-ng"] }
 
 [build-dependencies]
 bindgen = "0.72"

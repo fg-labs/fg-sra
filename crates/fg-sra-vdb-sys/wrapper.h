@@ -15,12 +15,19 @@
 #include <vdb/database.h>
 #include <vdb/table.h>
 #include <vdb/cursor.h>
+#include <vdb/blob.h>
 #include <vdb/vdb-priv.h>
+
+/* VFS resolver (remote access control) */
+#include <vfs/manager.h>
+#include <vfs/resolver.h>
 
 /* VDB Dependencies (reference cache population) */
 #include <vdb/dependencies.h>
 
-/* KDB Metadata */
+/* KDB path types and metadata */
+#include <kfs/defs.h>
+#include <kdb/manager.h>
 #include <kdb/meta.h>
 #include <kdb/namelist.h>
 

@@ -26,6 +26,14 @@ pub enum Command {
     /// Pre-populate the local VDB reference sequence cache.
     #[command(name = "cache-refs")]
     CacheRefs(CacheRefs),
+
+    /// Convert an SRA archive to FASTQ, in spot order, with mates paired.
+    #[command(name = "fastq")]
+    Fastq(crate::fastq::Fastq),
+
+    /// Describe SRA archives: kind, totals, qualities, names and read layout.
+    #[command(name = "info")]
+    Info(crate::info::Info),
 }
 
 /// Convert NCBI SRA archives to SAM or BAM format, replacing `sam-dump`
@@ -174,6 +182,8 @@ impl Cli {
         match &self.command {
             Command::ToSam(cmd) => cmd.execute(),
             Command::CacheRefs(cmd) => cmd.execute(),
+            Command::Fastq(cmd) => cmd.execute(),
+            Command::Info(cmd) => cmd.execute(),
         }
     }
 }
@@ -488,7 +498,9 @@ mod tests {
         let cli = Cli::parse_from(full);
         match cli.command {
             Command::ToSam(cmd) => cmd,
-            Command::CacheRefs(_) => panic!("expected ToSam command"),
+            Command::CacheRefs(_) | Command::Fastq(_) | Command::Info(_) => {
+                panic!("expected ToSam command")
+            }
         }
     }
 
@@ -622,7 +634,9 @@ mod tests {
         let cli = Cli::parse_from(full);
         match cli.command {
             Command::CacheRefs(cmd) => cmd,
-            Command::ToSam(_) => panic!("expected CacheRefs command"),
+            Command::ToSam(_) | Command::Fastq(_) | Command::Info(_) => {
+                panic!("expected CacheRefs command")
+            }
         }
     }
 

@@ -112,6 +112,7 @@ impl Drop for ReferenceList {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // ReferenceList_Release returns void.
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::ReferenceList_Release(self.ptr) };
         }
     }
@@ -185,6 +186,19 @@ impl ReferenceObj {
             let rc = unsafe { fg_sra_vdb_sys::ReferenceObj_Idx(self.ptr, &raw mut idx) };
             check_rc(rc)?;
             Ok(idx)
+        })
+    }
+
+    /// The first and last rows of the `REFERENCE` table holding this reference; alignments
+    /// name their reference by one of these rows (`REF_ID`).
+    pub fn id_range(&self) -> Result<(i64, i64), VdbError> {
+        retry_on_network_error("ReferenceObj_IdRange", || {
+            let (mut start, mut stop) = (0i64, 0i64);
+            let rc = unsafe {
+                fg_sra_vdb_sys::ReferenceObj_IdRange(self.ptr, &raw mut start, &raw mut stop)
+            };
+            check_rc(rc)?;
+            Ok((start, stop))
         })
     }
 
@@ -278,6 +292,7 @@ impl Drop for ReferenceObj {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // ReferenceObj_Release returns void.
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::ReferenceObj_Release(self.ptr) };
         }
     }

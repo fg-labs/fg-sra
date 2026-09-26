@@ -58,7 +58,7 @@ impl ProgressLogger {
     /// record count falls exactly on an interval boundary (already logged).
     pub fn complete(&self) {
         let count = self.record_count.load(Ordering::Relaxed);
-        if self.interval == 0 || count % self.interval != 0 {
+        if self.interval == 0 || !count.is_multiple_of(self.interval) {
             self.log(Some("(complete)"));
         }
     }
@@ -109,14 +109,14 @@ fn format_duration(d: Duration) -> String {
 }
 
 /// Format a `u64` with thousands separators: 1234567 -> "1,234,567".
-fn format_count(n: u64) -> String {
+pub(crate) fn format_count(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(c);

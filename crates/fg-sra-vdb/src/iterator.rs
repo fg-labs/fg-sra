@@ -266,7 +266,7 @@ impl PlacementRecordRef {
                 return None;
             }
             let bytes = std::slice::from_raw_parts(
-                rec.spot_group as *const u8,
+                rec.spot_group.cast::<u8>(),
                 rec.spot_group_len as usize,
             );
             Some(String::from_utf8_lossy(bytes).into_owned())

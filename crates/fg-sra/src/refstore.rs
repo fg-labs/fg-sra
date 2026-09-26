@@ -10,11 +10,11 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
-use fg_sra_vdb::reference::ReferenceList;
+use fg_sra_vdb::reference::{ReferenceList, ReferenceObj};
 use rustc_hash::FxHashMap;
 
 /// The `INSDC:4na:map:CHARSET`: index by 4na code (`0..=15`); code 0 renders `.`.
-const CHARSET_4NA: &[u8; 16] = b".ACMGRSVTWYHKDBN";
+pub(crate) const CHARSET_4NA: &[u8; 16] = b".ACMGRSVTWYHKDBN";
 
 /// Map `INSDC:4na:bin` codes to the CHARSET ASCII alphabet, in place into `dst`.
 pub fn map_4na_to_ascii(src: &[u8], dst: &mut Vec<u8>) {
@@ -84,6 +84,29 @@ impl ReferenceStore {
         Self { seqs }
     }
 
+    /// One store holding the references of every store in `stores`, which hold different
+    /// references.
+    #[must_use]
+    pub fn merge(stores: impl IntoIterator<Item = ReferenceStore>) -> Self {
+        let mut seqs = FxHashMap::default();
+        for store in stores {
+            seqs.extend(store.seqs);
+        }
+        Self { seqs }
+    }
+
+    /// Number of references held.
+    #[must_use]
+    pub fn num_references(&self) -> usize {
+        self.seqs.len()
+    }
+
+    /// Bases held across all references.
+    #[must_use]
+    pub fn total_bases(&self) -> u64 {
+        self.seqs.values().map(|seq| seq.bases.len() as u64).sum()
+    }
+
     /// Extract the `ref_len` reference bases starting at 0-based `ref_pos`.
     ///
     /// Borrows directly from the stored sequence when the window fits before the
@@ -151,6 +174,74 @@ impl ReferenceStore {
     }
 }
 
+/// Which reference each row of the `REFERENCE` table belongs to, so an alignment's `REF_ID`
+/// (a `REFERENCE` row) and `REF_START` (an offset within that row) can be turned into its
+/// [`ReferenceList`] index and position without reading the `REFERENCE` table on a worker
+/// thread.
+pub struct ReferenceRows {
+    /// `(first_row, last_row, reference index)`, sorted by first row.
+    ranges: Vec<(i64, i64, u32)>,
+    /// Bases per `REFERENCE` row (`MAX_SEQ_LEN`); 0 when the table has no such column, in
+    /// which case `REF_START` is already the position on the reference.
+    max_seq_len: u32,
+}
+
+impl ReferenceRows {
+    /// The row ranges of every reference in `reflist` (single-threaded), whose rows hold
+    /// `max_seq_len` bases each.
+    pub fn new(reflist: &ReferenceList, max_seq_len: u32) -> Result<Self> {
+        let count = reflist.count()?;
+        let mut ranges = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            let (first, last) =
+                reflist.get(idx)?.id_range().with_context(|| format!("id range {idx}"))?;
+            ranges.push((first, last, idx));
+        }
+        Ok(Self::from_ranges(ranges, max_seq_len))
+    }
+
+    /// Rows from `(first_row, last_row, reference index)` ranges, in any order.
+    #[must_use]
+    pub fn from_ranges(mut ranges: Vec<(i64, i64, u32)>, max_seq_len: u32) -> Self {
+        ranges.sort_unstable();
+        Self { ranges, max_seq_len }
+    }
+
+    /// The reference index and 0-based position of offset `row_offset` within `REFERENCE`
+    /// row `row`, as the schema's `REF_POS` computes it; `None` if no reference covers the row
+    /// or the position doesn't fit.
+    #[must_use]
+    pub fn locate(&self, row: i64, row_offset: i32) -> Option<(u32, i32)> {
+        let (first, idx) = self.range_of(row)?;
+        let position = (row - first) * i64::from(self.max_seq_len) + i64::from(row_offset);
+        Some((idx, i32::try_from(position).ok()?))
+    }
+
+    /// The first row and index of the reference covering `row`.
+    fn range_of(&self, row: i64) -> Option<(i64, u32)> {
+        let after = self.ranges.partition_point(|&(first, _, _)| first <= row);
+        let &(first, last, idx) = self.ranges.get(after.checked_sub(1)?)?;
+        (row <= last).then_some((first, idx))
+    }
+}
+
+/// Split references, given as `(index, length)`, into at most `groups` groups of similar total
+/// length, for loading in parallel: longest first, each to the group with the least so far.
+#[must_use]
+pub fn split_by_length(references: &[(u32, u64)], groups: usize) -> Vec<Vec<u32>> {
+    let mut by_length = references.to_vec();
+    by_length.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut split: Vec<(u64, Vec<u32>)> =
+        vec![(0, Vec::new()); groups.clamp(1, references.len().max(1))];
+    for (idx, len) in by_length {
+        let lightest =
+            split.iter_mut().min_by_key(|(total, _)| *total).expect("at least one group");
+        lightest.0 += len;
+        lightest.1.push(idx);
+    }
+    split.into_iter().map(|(_, indices)| indices).filter(|g| !g.is_empty()).collect()
+}
+
 /// Preload the distinct references in `ref_indices` into memory (single-threaded).
 ///
 /// Duplicate indices within a single call are loaded once; a reference that
@@ -164,19 +255,32 @@ pub fn preload_references(reflist: &ReferenceList, ref_indices: &[u32]) -> Resul
             continue;
         }
         let obj = reflist.get(idx).with_context(|| format!("get reference {idx}"))?;
-        let raw = obj.read_all().with_context(|| format!("read reference {idx}"))?;
-        let expected = obj.seq_length().with_context(|| format!("seq_length {idx}"))? as usize;
+        let label = reference_label(&obj, idx);
+        let raw = obj.read_all().with_context(|| format!("failed to read reference {label}"))?;
+        let expected = obj.seq_length().with_context(|| format!("seq_length {label}"))? as usize;
         anyhow::ensure!(
             raw.len() == expected,
-            "reference {idx}: read {} of {expected} bases",
+            "reference {label}: read {} of {expected} bases",
             raw.len()
         );
         map_4na_to_ascii(&raw, &mut ascii);
-        let wrap = obj.circular().with_context(|| format!("circular {idx}"))?
-            || !obj.external().with_context(|| format!("external {idx}"))?;
+        let wrap = obj.circular().with_context(|| format!("circular {label}"))?
+            || !obj.external().with_context(|| format!("external {label}"))?;
         seqs.insert(idx, RefSeq { bases: std::mem::take(&mut ascii), wrap });
     }
     Ok(ReferenceStore::from_parts(seqs))
+}
+
+/// A reference's accession and, when different, its name in the archive (e.g.
+/// `NC_000001.11 (chr1)`), so a user can tell which reference to fetch; `#idx` if unreadable.
+fn reference_label(obj: &ReferenceObj, idx: u32) -> String {
+    match (obj.seq_id(), obj.name()) {
+        (Ok(seq_id), Ok(name)) if name != seq_id && !name.is_empty() => {
+            format!("{seq_id} ({name})")
+        }
+        (Ok(seq_id), _) => seq_id,
+        (Err(_), _) => format!("#{idx}"),
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +288,68 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn reference_rows_find_the_reference_covering_a_row() {
+        let rows = ReferenceRows::from_ranges(vec![(11, 20, 1), (1, 10, 0), (21, 21, 2)], 5000);
+        let reference_of = |row| rows.locate(row, 0).map(|(idx, _)| idx);
+        assert_eq!(reference_of(1), Some(0));
+        assert_eq!(reference_of(10), Some(0));
+        assert_eq!(reference_of(11), Some(1));
+        assert_eq!(reference_of(21), Some(2));
+    }
+
+    #[test]
+    fn reference_rows_outside_every_range_have_no_reference() {
+        let rows = ReferenceRows::from_ranges(vec![(5, 10, 0), (20, 30, 1)], 5000);
+        assert_eq!(rows.locate(4, 0), None);
+        assert_eq!(rows.locate(15, 0), None);
+        assert_eq!(rows.locate(31, 0), None);
+    }
+
+    #[test]
+    fn locate_offsets_by_whole_rows_from_the_reference_start() {
+        let rows = ReferenceRows::from_ranges(vec![(1, 10, 0), (11, 20, 1)], 5000);
+        assert_eq!(rows.locate(1, 17), Some((0, 17)));
+        assert_eq!(rows.locate(3, 17), Some((0, 10_017)));
+        assert_eq!(rows.locate(11, 0), Some((1, 0)));
+        assert_eq!(rows.locate(14, 4999), Some((1, 19_999)));
+    }
+
+    #[test]
+    fn locate_without_a_row_length_uses_the_offset_as_the_position() {
+        let rows = ReferenceRows::from_ranges(vec![(1, 10, 0)], 0);
+        assert_eq!(rows.locate(4, 123), Some((0, 123)));
+    }
+
+    #[test]
+    fn split_by_length_balances_total_length() {
+        let groups = split_by_length(&[(0, 100), (1, 60), (2, 50), (3, 10)], 2);
+        assert_eq!(groups, vec![vec![0, 3], vec![1, 2]]);
+    }
+
+    #[test]
+    fn split_by_length_makes_no_more_groups_than_references() {
+        let groups = split_by_length(&[(0, 5), (1, 5)], 8);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn split_by_length_of_nothing_is_empty() {
+        assert!(split_by_length(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn merged_stores_hold_every_reference() {
+        let store = |idx: u32, bases: &[u8]| {
+            let mut seqs = FxHashMap::default();
+            seqs.insert(idx, RefSeq { bases: bases.to_vec(), wrap: false });
+            ReferenceStore::from_parts(seqs)
+        };
+        let merged = ReferenceStore::merge([store(0, b"ACGT"), store(3, b"GG")]);
+        assert_eq!(merged.num_references(), 2);
+        assert_eq!(merged.total_bases(), 6);
+    }
 
     #[test]
     fn charset_maps_common_codes() {

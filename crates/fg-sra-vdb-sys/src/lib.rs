@@ -10,3 +10,7 @@
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+// Nothing here calls zlib-ng; linking the crate is what replaces ncbi-vdb's own zlib.
+#[cfg(feature = "zlib-ng")]
+extern crate libz_sys as _;
