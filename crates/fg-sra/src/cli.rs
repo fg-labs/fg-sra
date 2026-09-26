@@ -504,6 +504,7 @@ impl ToSam {
                 writer,
                 &opts,
                 self.unaligned_spots_only,
+                self.num_threads(),
                 &unaligned_progress,
             )?;
         }
