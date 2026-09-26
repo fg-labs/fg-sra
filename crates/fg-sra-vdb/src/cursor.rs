@@ -331,6 +331,7 @@ impl VCursor {
 impl Drop for VCursor {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::VCursorRelease(self.ptr) };
         }
     }

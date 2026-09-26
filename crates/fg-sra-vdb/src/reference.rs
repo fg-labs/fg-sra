@@ -112,6 +112,7 @@ impl Drop for ReferenceList {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // ReferenceList_Release returns void.
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::ReferenceList_Release(self.ptr) };
         }
     }
@@ -291,6 +292,7 @@ impl Drop for ReferenceObj {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // ReferenceObj_Release returns void.
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::ReferenceObj_Release(self.ptr) };
         }
     }

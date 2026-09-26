@@ -82,6 +82,7 @@ impl VDatabase {
 impl Drop for VDatabase {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::VDatabaseRelease(self.ptr) };
         }
     }
@@ -163,6 +164,7 @@ impl VTable {
 impl Drop for VTable {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::VTableRelease(self.ptr) };
         }
     }
@@ -196,6 +198,7 @@ impl KMetadata {
 impl Drop for KMetadata {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = crate::manager::lifecycle_lock();
             unsafe { fg_sra_vdb_sys::KMetadataRelease(self.ptr) };
         }
     }

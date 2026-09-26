@@ -4,6 +4,7 @@
 //! It is created once and used to open all VDB resources.
 
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::database::{VDatabase, VTable};
 use crate::error::{LITERAL_FORMAT, VdbError, check_rc, path_to_cstring};
@@ -16,7 +17,24 @@ pub struct VdbManager {
     ptr: *const fg_sra_vdb_sys::VDBManager,
 }
 
-// VDBManager is internally reference-counted and thread-safe for read operations.
+/// Serializes making and releasing VDB managers: both build or tear down
+/// ncbi-vdb's process-wide configuration (`KConfig`), which isn't safe to do on
+/// two threads at once. Managers made concurrently otherwise abort with
+/// `Assertion failed: (self -> mgr == mgr), function KConfigNodeVOpenNodeReadInt`.
+///
+/// Databases, tables, cursors, metadata, reference lists and dependency lists
+/// hold their manager, so releasing the last of them tears it down too; their
+/// releases hold the lock as well.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+
+/// Hold [`LIFECYCLE`]; a panic while it was held leaves nothing to repair.
+pub(crate) fn lifecycle_lock() -> MutexGuard<'static, ()> {
+    LIFECYCLE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// VDBManager is internally reference-counted and thread-safe for read operations;
+// making and releasing one, directly or through what holds it, is serialized by
+// `LIFECYCLE`.
 unsafe impl Send for VdbManager {}
 unsafe impl Sync for VdbManager {}
 
@@ -27,6 +45,7 @@ impl VdbManager {
     /// for the working directory to use the default.
     pub fn make_read() -> Result<Self, VdbError> {
         let mut mgr: *const fg_sra_vdb_sys::VDBManager = ptr::null();
+        let _lock = lifecycle_lock();
         // Safety: VDBManagerMakeRead initializes mgr; we pass NULL for default directory.
         let rc = unsafe { fg_sra_vdb_sys::VDBManagerMakeRead(&raw mut mgr, ptr::null()) };
         check_rc(rc)?;
@@ -112,6 +131,7 @@ impl VdbManager {
 impl Drop for VdbManager {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let _lock = lifecycle_lock();
             // Safety: we own the reference.
             unsafe { fg_sra_vdb_sys::VDBManagerRelease(self.ptr) };
         }
@@ -155,6 +175,7 @@ impl PathType {
 /// process-wide (a global in ncbi-vdb's resolver), so it applies to managers made before
 /// and after the call.
 pub fn disable_remote_access() -> Result<(), VdbError> {
+    let _lock = lifecycle_lock();
     let mut vfs: *mut fg_sra_vdb_sys::VFSManager = ptr::null_mut();
     // Safety: VFSManagerMake initializes `vfs`, which is released below.
     check_rc(unsafe { fg_sra_vdb_sys::VFSManagerMake(&raw mut vfs) })?;
@@ -176,6 +197,41 @@ pub fn disable_remote_access() -> Result<(), VdbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn databases_outliving_their_managers_can_be_released_on_several_threads_at_once() {
+        // Dropping the manager first leaves the database's release to tear it down,
+        // under the lock, while other threads make managers.
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+        let archive = archive.to_str().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        let manager = VdbManager::make_read().unwrap();
+                        let database = manager.open_db_read(archive).unwrap();
+                        drop(manager);
+                        drop(database);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn managers_can_be_made_and_released_on_several_threads_at_once() {
+        // Unserialized, this aborted in ncbi-vdb's configuration within a few rounds.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        drop(VdbManager::make_read().unwrap());
+                    }
+                });
+            }
+        });
+    }
 
     #[test]
     fn database_path_type_is_recognised() {
