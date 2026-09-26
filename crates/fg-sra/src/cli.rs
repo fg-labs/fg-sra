@@ -1,12 +1,12 @@
 //! Command-line argument definitions for fg-sra.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fg_sra_vdb::database::VDatabase;
-use fg_sra_vdb::manager::VdbManager;
+use fg_sra_vdb::manager::{VdbManager, disable_remote_access};
 
 /// High-performance SRA toolkit.
 #[derive(Debug, Parser)]
@@ -103,7 +103,7 @@ pub struct ToSam {
     #[arg(long = "output-format", default_value = "sam")]
     pub output_format: OutputFormat,
 
-    /// Compress SAM output with gzip.
+    /// Compress SAM output with gzip, as BGZF (compressed on `--threads` threads).
     #[arg(long = "gzip")]
     pub gzip: bool,
 
@@ -157,6 +157,13 @@ pub struct ToSam {
     /// Default: one cursor per thread.
     #[arg(long = "pool-size")]
     pub pool_size: Option<usize>,
+
+    // ── Access options ────────────────────────────────────────────────
+    /// Never use the network: find each accession, and an aligned run's
+    /// references, only locally (e.g. beside the archive, as `prefetch` puts
+    /// them).
+    #[arg(long)]
+    pub offline: bool,
 }
 
 /// Output format for converted records.
@@ -308,6 +315,14 @@ impl ToSam {
     /// `--no-header` (FASTA/FASTQ have no header).
     pub fn execute(&self) -> Result<()> {
         self.validate()?;
+        if self.offline {
+            disable_remote_access().context("failed to turn off remote access")?;
+        }
+        if let Some(output) = &self.output_file {
+            for accession in &self.accessions {
+                crate::pending_file::refuse_overwriting_input(output, Path::new(accession))?;
+            }
+        }
         let Some((first, rest)) = self.accessions.split_first() else {
             anyhow::bail!("no accessions given");
         };
@@ -315,10 +330,10 @@ impl ToSam {
         // accession that cannot be opened does not truncate an existing file.
         let first_db = open_database(first)?;
         let mut writer = self.create_writer()?;
-        self.process_database(&first_db, &mut writer)?;
+        self.process_database(first, &first_db, &mut writer)?;
         drop(first_db);
         for accession in rest {
-            self.process_database(&open_database(accession)?, &mut writer)?;
+            self.process_database(accession, &open_database(accession)?, &mut writer)?;
         }
         writer.finish()
     }
@@ -357,13 +372,20 @@ impl ToSam {
         }
     }
 
+    /// Worker threads to use: `--threads`, or by default the available cores.
+    fn num_threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)
+        })
+    }
+
     /// Open the output (`--output-file` or stdout) for the selected format.
     fn create_writer(&self) -> Result<crate::output::OutputWriter> {
         use crate::output::{CompressionMode, OutputWriter};
         if self.output_mode() == crate::record::OutputMode::Bam {
             return Ok(match &self.output_file {
-                Some(path) => OutputWriter::bam_from_path(path)?,
-                None => OutputWriter::bam_stdout(),
+                Some(path) => OutputWriter::bam_from_path(path, self.num_threads())?,
+                None => OutputWriter::bam_stdout(self.num_threads()),
             });
         }
         let compression = if self.gzip {
@@ -374,14 +396,17 @@ impl ToSam {
             CompressionMode::None
         };
         Ok(match &self.output_file {
-            Some(path) => OutputWriter::from_path_with_compression(path, compression)?,
-            None => OutputWriter::stdout_with_compression(compression),
+            Some(path) => {
+                OutputWriter::from_path_with_compression(path, compression, self.num_threads())?
+            }
+            None => OutputWriter::stdout_with_compression(compression, self.num_threads()),
         })
     }
 
-    /// Convert a single opened SRA database, writing to `writer`.
+    /// Convert `accession`, whose database `db` is open, writing to `writer`.
     fn process_database(
         &self,
+        accession: &str,
         db: &VDatabase,
         writer: &mut crate::output::OutputWriter,
     ) -> Result<()> {
@@ -433,17 +458,19 @@ impl ToSam {
             ref_name_to_id: ref_name_to_id.as_ref(),
         };
 
+        // Loaders reopen what the accession resolved to, as `fastq`'s do.
+        let location = crate::archive::vdb_location(accession)?;
+        let reopen = || open_database(&location);
         let align_config = AlignConfig {
             use_seqid: self.seqid,
             use_long_cigar: self.cigar_long,
             primary_only: self.primary,
             min_mapq: self.min_mapq,
-            num_threads: self.threads.unwrap_or_else(|| {
-                std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)
-            }),
+            num_threads: self.num_threads(),
             pool_size_override: self.pool_size,
             opts: &opts,
             regions: &self.aligned_region,
+            reopen: &reopen,
         };
 
         // Plan the aligned reads (unless --unaligned-spots-only) before writing the
@@ -477,6 +504,7 @@ impl ToSam {
                 writer,
                 &opts,
                 self.unaligned_spots_only,
+                self.num_threads(),
                 &unaligned_progress,
             )?;
         }
@@ -628,6 +656,12 @@ mod tests {
         assert_eq!(cmd.pool_size, None);
     }
 
+    #[test]
+    fn test_offline_flag() {
+        assert!(parse(&["--offline", "SRR123456"]).offline);
+        assert!(!parse(&["SRR123456"]).offline);
+    }
+
     fn parse_cache_refs(args: &[&str]) -> CacheRefs {
         let mut full = vec!["fg-sra", "cache-refs"];
         full.extend_from_slice(args);
@@ -733,6 +767,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(result.is_err());
         assert_eq!(contents, "keep me\n");
+    }
+
+    #[test]
+    fn test_output_that_is_an_input_archive_is_refused() {
+        let dir = std::env::temp_dir().join(format!("fg-sra-cli-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("in.sra");
+        std::fs::write(&archive, b"archive").unwrap();
+        let other = dir.join("other.sra");
+        let result = parse(&[
+            "--no-header",
+            "--output-file",
+            archive.to_str().unwrap(),
+            other.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .execute();
+        let contents = std::fs::read(&archive).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("is the input archive"), "{err:#}");
+        assert_eq!(contents, b"archive");
     }
 
     #[test]

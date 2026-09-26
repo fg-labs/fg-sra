@@ -2,6 +2,7 @@
 
 mod aligned;
 mod archive;
+mod bgzf_writer;
 mod cigar;
 mod cli;
 mod fastq;
@@ -10,6 +11,7 @@ mod info;
 mod matecache;
 mod md_tag;
 mod output;
+mod pending_file;
 mod progress;
 mod quality;
 mod record;

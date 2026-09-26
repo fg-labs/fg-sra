@@ -9,16 +9,15 @@ use fg_sra_vdb::error::VdbError;
 
 use super::prefetch::PrefetchedReads;
 use super::spot::Spot;
-use crate::refstore::{CHARSET_4NA, ReferenceRows, ReferenceStore, ref_window_len};
+use crate::archive::marks_rna;
+use crate::refstore::{
+    CHARSET_4NA, CHARSET_4NA_RNA, ReferenceRows, ReferenceStore, ref_window_len,
+};
 use crate::restore_read::{restore_read, restore_spot};
 
 /// Bytes of VDB blob cache for each alignment cursor. Each batch's alignments are read in
 /// ascending order, so little is revisited, but without a cache 2-9% more bytes are read.
 const ALIGNMENT_CURSOR_CACHE_BYTES: usize = 8 * 1024 * 1024;
-
-/// [`CHARSET_4NA`] with `U` for `T`, as the schema's text `READ` gives the bases of a table
-/// whose metadata marks them as RNA.
-const CHARSET_4NA_RNA: &[u8; 16] = b".ACMGRSVUWYHKDBN";
 
 /// Something spots can be read from by id; each worker thread has its own.
 pub trait SpotSource {
@@ -449,15 +448,6 @@ impl AlignmentCells {
         self.ref_start = cursor.read_coord_zero(align_id, columns.ref_start)?;
         Ok(())
     }
-}
-
-/// Whether `table`'s metadata marks its bases as RNA (`RNA_FLAG` starting `1`, as the schema's
-/// `NCBI:SRA:useRnaFlag` reads it).
-fn marks_rna(table: &VTable) -> bool {
-    let Ok(metadata) = table.open_metadata_read() else { return false };
-    let Ok(node) = metadata.open_node_read("RNA_FLAG") else { return false };
-    let mut flag = [0u8; 1];
-    node.read(0, &mut flag).is_ok_and(|(read, _)| read == 1 && flag[0] == b'1')
 }
 
 /// Cut a text cell at its first NUL. Some loaders store `NAME` and `SPOT_GROUP` NUL-padded to a
