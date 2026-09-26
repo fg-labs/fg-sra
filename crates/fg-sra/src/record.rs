@@ -170,7 +170,7 @@ mod sam_flags {
 }
 
 /// Output format mode.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputMode {
     Sam,
     Bam,
