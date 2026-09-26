@@ -137,9 +137,12 @@ fg-sra fastq SRR13450125.sra -1 r1.fq.gz -2 r2.fq.gz --technical 'tech.{i}.fq.gz
 
 # Original read names, fasterq-dump style, for the first million spots
 fg-sra fastq SRR2584863.sra --defline '$ac.$si $sn length=$rl' --max-spot-id 1000000 -1 a.fq -2 b.fq
+
+# A random 10% of spots, the same on every run and at any thread count
+fg-sra fastq SRR2584863.sra --subsample-fraction 0.1 -1 r1.fq.gz -2 r2.fq.gz
 ```
 
-Reads are named `<accession>.<spot>` by default, identically in every file. `--defline` takes a template with `$ac` (accession), `$si` (spot id), `$sn` (original name), `$sg` (spot group), `$ri` (read number within its type) and `$rl` (read length); the `+` line is always bare. `--min-read-len` and `--read-filter` test biological reads and drop the whole spot, so the outputs never go out of step. Runs loaded from BAM mark duplicates `criteria` and QC failures `reject`, so `--read-filter pass` drops duplicates too.
+Reads are named `<accession>.<spot>` by default, identically in every file. `--defline` takes a template with `$ac` (accession), `$si` (spot id), `$sn` (original name), `$sg` (spot group), `$ri` (read number within its type) and `$rl` (read length); the `+` line is always bare. `--min-read-len` and `--read-filter` test biological reads and drop the whole spot, so the outputs never go out of step. Runs loaded from BAM mark duplicates `criteria` and QC failures `reject`, so `--read-filter pass` drops duplicates too. `--subsample-fraction` keeps a random fraction of spots, again whole spots with all their reads. Which spots are kept depends only on `--subsample-seed` (default 42) and each spot's id, so the output is the same at any thread count, any spot range keeps about the fraction, and with one seed a smaller fraction keeps a subset of a larger one's spots. Skipped spots aren't read, so the totals aren't checked against the archive's.
 
 Porting from sra-tools:
 

@@ -152,6 +152,36 @@ fn failed_run_keeps_an_existing_output_it_could_not_open() {
 }
 
 #[test]
+fn subsampled_run_keeps_about_the_fraction_of_spots_and_skips_the_integrity_check() {
+    let dir = scratch_dir("subsample");
+    let (unpaired, metrics) = (path(&dir, "u.fq"), path(&dir, "m.tsv"));
+    let args = ["-u", &unpaired, "-m", &metrics, "--subsample-fraction", "0.5"];
+    let output = fastq(&[&[vendored_archive().as_str()][..], &args].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // Each of the archive's 985 spots has one biological read.
+    let converted: usize = metric(&metrics, "spots_converted").parse().unwrap();
+    let skipped: usize = metric(&metrics, "spots_skipped_by_subsampling").parse().unwrap();
+    assert_eq!(converted + skipped, 985);
+    assert!(converted.abs_diff(492) <= 80, "{converted} of 985 spots kept");
+    assert_eq!(fastq_records(&unpaired), converted);
+    assert_eq!(metric(&metrics, "integrity"), "n/a");
+}
+
+#[test]
+fn subsampled_output_is_identical_at_one_and_four_threads() {
+    let dir = scratch_dir("subsample-threads");
+    let convert = |threads: &str| {
+        let unpaired = path(&dir, &format!("u.{threads}.fq.gz"));
+        let args = ["-u", &unpaired, "-t", threads, "--subsample-fraction", "0.3"];
+        let output = fastq(&[&[vendored_archive().as_str()][..], &args].concat());
+        assert!(output.status.success(), "{}", stderr(&output));
+        std::fs::read(unpaired).unwrap()
+    };
+    assert!(convert("1") == convert("4"), "subsampled output differs between 1 and 4 threads");
+}
+
+#[test]
 fn defline_template_names_reads() {
     let Some(sra) = archive_from_env("FG_SRA_TEST_PAIRED_SRA") else { return };
     let dir = scratch_dir("defline");
