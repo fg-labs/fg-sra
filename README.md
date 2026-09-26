@@ -33,7 +33,7 @@ processes references in parallel for high throughput.
 Key features:
 - **Multi-threaded** reference processing with ordered output
 - **SAM and BAM** output (BAM via multi-threaded BGZF compression)
-- **gzip/bzip2** compression for SAM output
+- **gzip/bzip2** compression for SAM output (gzip as multi-threaded BGZF, readable by any gzip reader)
 - **FASTA/FASTQ** output modes
 - **Region filtering** by genomic coordinates
 - **Quality quantization**
@@ -44,7 +44,9 @@ Key features:
 
 For aligned runs, `fg-sra` reconstructs each read from the stored alignment
 deltas rather than reading the virtual `READ` column: it preloads each aligned
-reference sequence into memory (single-threaded, once per preload batch), then
+reference sequence into memory (once per preload batch, before any worker starts,
+on up to 8 threads that each open the archive again; on one thread when built against a
+system ncbi-vdb), then
 rebuilds `READ` on worker threads with a port of ncbi-vdb's own reconstruction
 routine. This keeps
 worker threads off libncbi-vdb's `REFERENCE` sub-select, whose blob cache is not
@@ -52,9 +54,8 @@ thread-safe. The preload costs roughly one byte per reference base; references
 are processed in batches to cap this (default 1 GiB, overridable with the
 `FG_SRA_REF_PRELOAD_BUDGET_MB` environment variable). The budget targets the
 retained reference-store bytes, not strict peak memory: a single reference
-larger than the budget still forms its own batch, and loading a reference
-transiently holds both its raw 4na and mapped bases, so peak memory can exceed
-the configured value by roughly the largest single reference.
+larger than the budget still forms its own batch, and each thread loading
+references in parallel adds its own reference reader and caches.
 
 The following `sam-dump` options are accepted but **not yet supported**:
 - `--hide-identical` — output `=` for bases matching reference

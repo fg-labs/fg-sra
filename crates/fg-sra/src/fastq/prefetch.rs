@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::{Context, Result, anyhow};
 use fg_sra_vdb::database::VTable;
 
-use super::pipeline::VDB_THREAD_STACK_BYTES;
 use super::reader::{AlignmentReader, References};
+use crate::archive::VDB_THREAD_STACK_BYTES;
 
 /// Alignment rows per block when judging whether an alignment is near the rest of its batch's:
 /// about one blob of the alignment table's columns.

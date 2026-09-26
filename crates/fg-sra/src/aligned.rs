@@ -17,7 +17,7 @@ use crate::matecache::{MateCache, MateInfo};
 use crate::output::OutputWriter;
 use crate::progress::ProgressLogger;
 use crate::record::{AlignedColumns, FormatOptions, format_aligned_record};
-use crate::refstore::{ReferenceStore, preload_references, ref_window_len};
+use crate::refstore::{MAX_REFERENCE_LOADERS, ReferenceLoaders, ReferenceStore, ref_window_len};
 use crate::restore_read::restore_read;
 
 /// VDB table name for primary alignments.
@@ -41,6 +41,9 @@ pub struct AlignConfig<'a> {
     pub opts: &'a FormatOptions<'a>,
     /// Genomic regions to restrict output to. Empty means all references.
     pub regions: &'a [String],
+    /// Opens the database again, for each thread that preloads references in
+    /// parallel.
+    pub reopen: &'a (dyn Fn() -> Result<VDatabase> + Sync),
 }
 
 impl AlignConfig<'_> {
@@ -228,6 +231,8 @@ struct RefLayout {
     /// Names of references whose alignments span more than one run. Output for
     /// these references is grouped but not coordinate-sorted.
     split_references: Vec<String>,
+    /// The table's rows: its first row id and number of rows.
+    rows: (i64, u64),
 }
 
 /// A row's sort key in a sorted alignment table: `(REF_ID, REF_POS)`.
@@ -412,6 +417,7 @@ fn find_ref_boundaries(
             boundaries: Vec::new(),
             num_sorted_segments: 0,
             split_references: Vec::new(),
+            rows: (first_row, 0),
         });
     }
     let last_row = first_row + total_count as i64 - 1;
@@ -441,7 +447,40 @@ fn find_ref_boundaries(
     }
     let (boundaries, split_references) = group_runs_by_reference(boundaries);
 
-    Ok(RefLayout { boundaries, num_sorted_segments: segments.len(), split_references })
+    Ok(RefLayout {
+        boundaries,
+        num_sorted_segments: segments.len(),
+        split_references,
+        rows: (first_row, total_count),
+    })
+}
+
+/// Check that `ranges` (inclusive row ranges, in any order) cover the table's
+/// `rows` (first row id, row count) exactly once each: a plan that dropped or
+/// repeated rows would silently lose or duplicate alignments.
+fn check_rows_covered(
+    table_name: &str,
+    mut ranges: Vec<(i64, i64)>,
+    (first_row, row_count): (i64, u64),
+) -> Result<()> {
+    ranges.sort_unstable();
+    let mut next = first_row;
+    for (start, end) in ranges {
+        anyhow::ensure!(
+            start == next && end >= start,
+            "{table_name}: planned rows {start}..={end} where row {next} was expected; the \
+             plan would drop or repeat alignments"
+        );
+        next = end + 1;
+    }
+    let end = first_row + row_count as i64;
+    anyhow::ensure!(
+        next == end,
+        "{table_name}: planned {} of {row_count} alignment rows; the plan would {}",
+        next - first_row,
+        if next < end { "drop alignments" } else { "read rows past the end of the table" }
+    );
+    Ok(())
 }
 
 /// The BAM `ref_id` of an output reference: its index among the output header's
@@ -693,10 +732,9 @@ fn process_row_range(
 /// Default reference-preload budget: bound peak memory by processing work items
 /// in reference batches whose sequences sum to at most this many bytes.
 ///
-/// The budget counts the persisted (ASCII-mapped) reference bytes. Preloading a
-/// single reference also transiently holds its raw 4na buffer, so momentary peak
-/// RSS during a batch can exceed the budget by roughly the largest single
-/// reference in it.
+/// The budget counts the preloaded (ASCII-mapped) reference bytes; each reference
+/// is mapped in place as it is read, so it is never held twice. Loading on several
+/// threads adds each loader's own reference reader and its caches on top.
 const REF_PRELOAD_BUDGET_BYTES: usize = 1 << 30; // 1 GiB
 
 /// The reference-preload budget in bytes, overridable via the
@@ -815,7 +853,10 @@ fn plan_table(
         eprintln!("[layout] {}", split_layout_warning(table_name, &layout));
     }
     let mut work_items = if config.regions.is_empty() {
-        collect_row_range_work_items(&layout.boundaries, config.num_threads)
+        let items = collect_row_range_work_items(&layout.boundaries, config.num_threads);
+        let ranges = items.iter().map(|w| (w.start_row, w.end_row)).collect();
+        check_rows_covered(table_name, ranges, layout.rows)?;
+        items
     } else {
         let ref_idx_of = |name: &str| -> Result<u32> {
             let ref_obj =
@@ -928,11 +969,18 @@ pub fn process_aligned_plan(
     config: &AlignConfig<'_>,
     progress_interval: u64,
 ) -> Result<()> {
+    // One set of loaders serves every table and batch, so the archive is opened again
+    // at most once per loader.
+    let mut loaders =
+        ReferenceLoaders::new(config.num_threads.min(MAX_REFERENCE_LOADERS), config.reopen);
     for table in &plan.tables {
-        process_table_plan(db, table, writer, config, progress_interval)?;
+        process_table_plan(db, table, writer, config, &mut loaders, progress_interval)?;
     }
     Ok(())
 }
+
+/// Reference loaders reading through the archive reopened by [`AlignConfig::reopen`].
+type TosamLoaders<'a> = ReferenceLoaders<&'a (dyn Fn() -> Result<VDatabase> + Sync)>;
 
 /// Process one planned alignment table, preloading references batch by batch.
 fn process_table_plan(
@@ -940,6 +988,7 @@ fn process_table_plan(
     plan: &TablePlan,
     writer: &mut OutputWriter,
     config: &AlignConfig<'_>,
+    loaders: &mut TosamLoaders<'_>,
     progress_interval: u64,
 ) -> Result<()> {
     let TablePlan { table_name, reflist, work_items, .. } = plan;
@@ -985,7 +1034,7 @@ fn process_table_plan(
     for range in batches {
         let batch = &work_items[range];
         let ref_indices: Vec<u32> = batch.iter().map(|w| w.ref_idx).collect();
-        let store = preload_references(reflist, &ref_indices)?;
+        let store = loaders.preload(reflist, &ref_indices)?;
         // order_idx is globally contiguous, so the batch's first item's index
         // is the base the ordered collector starts from — no re-basing needed.
         let base_order = batch.first().map_or(0, |w| w.order_idx);
@@ -1367,6 +1416,7 @@ mod tests {
 
     use super::*;
     use crate::record::FormatOptions;
+    use crate::refstore::preload_references;
 
     /// Build an `AlignConfig` with the given thread count for testing.
     fn test_config(num_threads: usize) -> AlignConfig<'static> {
@@ -1389,6 +1439,7 @@ mod tests {
             pool_size_override: None,
             opts: &OPTS,
             regions: &[],
+            reopen: &|| anyhow::bail!("tests do not preload references"),
         }
     }
 
@@ -2182,11 +2233,31 @@ mod tests {
     }
 
     #[test]
+    fn test_check_rows_covered() {
+        check_rows_covered("T", vec![(6, 10), (1, 5), (11, 11)], (1, 11)).unwrap();
+        check_rows_covered("T", vec![], (1, 0)).unwrap();
+        let gap = check_rows_covered("T", vec![(1, 5), (7, 11)], (1, 11)).unwrap_err();
+        assert!(gap.to_string().contains("row 6 was expected"), "{gap}");
+        let overlap = check_rows_covered("T", vec![(1, 6), (6, 11)], (1, 11)).unwrap_err();
+        assert!(overlap.to_string().contains("drop or repeat"), "{overlap}");
+        let short = check_rows_covered("T", vec![(1, 10)], (1, 11)).unwrap_err();
+        assert!(short.to_string().contains("planned 10 of 11"), "{short}");
+        let inverted = check_rows_covered("T", vec![(1, 5), (6, 5), (6, 11)], (1, 11));
+        assert!(inverted.is_err(), "an inverted range must not let row 6 repeat");
+        let past = check_rows_covered("T", vec![(1, 12)], (1, 11)).unwrap_err();
+        assert!(past.to_string().contains("planned 12 of 11"), "{past}");
+        assert!(past.to_string().contains("past the end"), "{past}");
+        let late = check_rows_covered("T", vec![(2, 11)], (1, 11)).unwrap_err();
+        assert!(late.to_string().contains("row 1 was expected"), "{late}");
+    }
+
+    #[test]
     fn test_split_layout_warning() {
         let layout = |split: &[&str]| RefLayout {
             boundaries: Vec::new(),
             num_sorted_segments: 3,
             split_references: split.iter().map(ToString::to_string).collect(),
+            rows: (1, 0),
         };
         assert_eq!(
             split_layout_warning("T", &layout(&["1", "2"])),
