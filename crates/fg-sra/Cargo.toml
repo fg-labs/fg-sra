@@ -23,22 +23,22 @@ zlib-ng = ["fg-sra-vdb/zlib-ng"]
 [dependencies]
 fg-sra-vdb.workspace = true
 anyhow.workspace = true
-bgzf = "0.3"
+bgzf = "0.5"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 fgoxide = "0.6"
 itoa = "1"
 flate2 = "1"
 bzip2 = "0.6"
-noodles-bam = "0.91"
-noodles-bgzf = "0.48"
-noodles-sam = "0.86"
+noodles-bam = "0.95"
+noodles-bgzf = "0.51"
+noodles-sam = "0.90"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [dev-dependencies]
 rstest = { workspace = true }
