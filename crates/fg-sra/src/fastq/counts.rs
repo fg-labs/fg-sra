@@ -12,6 +12,8 @@ use crate::progress::format_count;
 pub struct SpotCounts {
     /// Spots read, whatever became of them.
     pub spots: u64,
+    /// Spots the subsampler skipped, unread.
+    pub spots_skipped_by_subsampling: u64,
     pub pairs_written: u64,
     pub unpaired_written: u64,
     pub spots_no_bio_reads: u64,
@@ -61,6 +63,7 @@ impl SpotCounts {
     /// Add `other`'s counts to these.
     pub fn merge(&mut self, other: &SpotCounts) {
         self.spots += other.spots;
+        self.spots_skipped_by_subsampling += other.spots_skipped_by_subsampling;
         self.pairs_written += other.pairs_written;
         self.unpaired_written += other.unpaired_written;
         self.spots_no_bio_reads += other.spots_no_bio_reads;
@@ -102,6 +105,7 @@ impl SpotCounts {
             (self.spots_no_bio_reads, "had no biological reads"),
             (self.spots_filtered, "failed the filters"),
             (self.spots_technical_mismatch, "had a different number of technical reads"),
+            (self.spots_skipped_by_subsampling, "were skipped by subsampling"),
         ];
         let hints: Vec<String> = hints
             .into_iter()
@@ -124,6 +128,7 @@ pub struct FastqMetrics {
     /// Spots in the archive.
     pub spots_total: u64,
     pub spots_converted: u64,
+    pub spots_skipped_by_subsampling: u64,
     pub pairs_written: u64,
     pub unpaired_written: u64,
     pub technical_reads_written: u64,
@@ -182,6 +187,7 @@ impl FastqMetrics {
             original_names: archive.has_names,
             spots_total: archive.spot_count,
             spots_converted: counts.spots,
+            spots_skipped_by_subsampling: counts.spots_skipped_by_subsampling,
             pairs_written: counts.pairs_written,
             unpaired_written: counts.unpaired_written,
             technical_reads_written,
@@ -238,6 +244,12 @@ impl FastqMetrics {
             format_count(self.unpaired_written),
             format_count(self.technical_reads_written),
         );
+        if self.spots_skipped_by_subsampling > 0 {
+            eprintln!(
+                "[fastq] {accession}: subsampling skipped {} spots",
+                format_count(self.spots_skipped_by_subsampling)
+            );
+        }
         let dropped = [
             (self.spots_no_bio_reads, "with no biological reads"),
             (self.spots_too_many_bio_reads, "with more than two biological reads"),
@@ -403,5 +415,18 @@ mod tests {
         assert_eq!(first.spots_no_bio_reads, 1);
         assert_eq!(first.total_bases(), 6);
         assert_eq!(first.reads[0][1], 1);
+    }
+
+    #[test]
+    fn merged_spots_skipped_by_subsampling_are_the_sum_of_both() {
+        let mut first = SpotCounts { spots_skipped_by_subsampling: 3, ..SpotCounts::default() };
+        first.merge(&SpotCounts { spots_skipped_by_subsampling: 4, ..SpotCounts::default() });
+        assert_eq!(first.spots_skipped_by_subsampling, 7);
+    }
+
+    #[test]
+    fn nothing_written_hint_counts_spots_skipped_by_subsampling() {
+        let counts = SpotCounts { spots_skipped_by_subsampling: 5, ..SpotCounts::default() };
+        assert_eq!(counts.nothing_written_hint(), "5 spots were skipped by subsampling");
     }
 }
