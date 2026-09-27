@@ -23,7 +23,7 @@ zlib-ng = ["fg-sra-vdb/zlib-ng"]
 [dependencies]
 fg-sra-vdb.workspace = true
 anyhow.workspace = true
-bgzf = "0.3"
+bgzf = "0.5"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 fgoxide = "0.6"
@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [dev-dependencies]
 flate2 = "1"
