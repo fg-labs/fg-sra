@@ -431,6 +431,12 @@ pub fn format_unaligned_record(
     }
 }
 
+/// Whether `--reverse` reverse-complements this unaligned read (and sets its 0x10 flag):
+/// only reads whose `READ_TYPE` is REVERSE are flipped.
+fn reverses_unaligned_read(cols: &UnalignedColumns<'_>, opts: &FormatOptions<'_>) -> bool {
+    opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0
+}
+
 /// Format a SAM line for an unaligned record.
 fn format_unaligned_record_sam(
     buf: &mut Vec<u8>,
@@ -438,13 +444,14 @@ fn format_unaligned_record_sam(
     opts: &FormatOptions<'_>,
 ) {
     buf.clear();
+    let reverse = reverses_unaligned_read(cols, opts);
 
     // QNAME — unaligned uses '#' as spot group separator.
     write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
 
     // FLAG
     let mut flags: u32 = sam_flags::UNMAPPED;
-    if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+    if reverse {
         flags |= sam_flags::REVERSE;
     }
     flags = apply_read_filter(flags, Some(cols.read_filter));
@@ -488,7 +495,7 @@ fn format_unaligned_record_sam(
         buf.push(b'*');
     } else {
         // Reverse complement if needed.
-        if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+        if reverse {
             write_reverse_complement(buf, cols.read.as_bytes());
         } else {
             buf.extend_from_slice(cols.read.as_bytes());
@@ -499,7 +506,7 @@ fn format_unaligned_record_sam(
     buf.push(b'\t');
     if opts.omit_quality || cols.quality.is_empty() {
         buf.push(b'*');
-    } else if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+    } else if reverse {
         // Reverse the quality scores.
         for &q in cols.quality.iter().rev() {
             let phred = if let Some(table) = opts.qual_quant {
@@ -729,9 +736,10 @@ fn format_unaligned_record_bam(
     opts: &FormatOptions<'_>,
 ) {
     buf.clear();
+    let reverse = reverses_unaligned_read(cols, opts);
 
     let mut flags: u32 = sam_flags::UNMAPPED;
-    if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+    if reverse {
         flags |= sam_flags::REVERSE;
     }
     flags = apply_read_filter(flags, Some(cols.read_filter));
@@ -782,18 +790,16 @@ fn format_unaligned_record_bam(
     buf.extend_from_slice(&qname_buf);
 
     // Sequence (reverse complement if needed).
-    if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
+    if reverse {
         let mut rc = Vec::with_capacity(seq_bytes.len());
-        for &b in seq_bytes.iter().rev() {
-            rc.push(complement(b));
-        }
+        write_reverse_complement(&mut rc, seq_bytes);
         encode_sequence(buf, &rc);
     } else {
         encode_sequence(buf, seq_bytes);
     }
 
     // Quality (raw phred → raw phred for BAM, with optional quantization/reversal).
-    encode_quality_unaligned(buf, cols.quality, l_seq as usize, cols.read_type, opts);
+    encode_quality_unaligned(buf, cols.quality, l_seq as usize, reverse, opts);
 
     // Aux tags.
     if !cols.spot_group.is_empty() {
@@ -931,17 +937,18 @@ fn encode_quality_aligned(
     }
 }
 
-/// Encode quality scores for an unaligned BAM record (raw Phred values).
+/// Encode quality scores for an unaligned BAM record (raw Phred values), last to first
+/// when `reverse`.
 fn encode_quality_unaligned(
     buf: &mut Vec<u8>,
     quality: &[u8],
     l_seq: usize,
-    read_type: u8,
+    reverse: bool,
     opts: &FormatOptions<'_>,
 ) {
     if opts.omit_quality || quality.is_empty() {
         buf.extend(std::iter::repeat_n(0xFFu8, l_seq));
-    } else if opts.reverse_unaligned && (read_type & READ_TYPE_REVERSE) != 0 {
+    } else if reverse {
         for &q in quality.iter().rev() {
             let phred = if let Some(table) = opts.qual_quant {
                 crate::quality::quantize_phred(q, table)
