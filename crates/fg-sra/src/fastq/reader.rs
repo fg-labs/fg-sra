@@ -1,7 +1,5 @@
 //! Reading spots from an archive's reads table.
 
-use std::ops::RangeInclusive;
-
 use anyhow::{Context, Result, anyhow};
 use fg_sra_vdb::cursor::{BlobColumn, VCursor};
 use fg_sra_vdb::database::VTable;
@@ -21,8 +19,8 @@ const ALIGNMENT_CURSOR_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Something spots can be read from by id; each worker thread has its own.
 pub trait SpotSource {
-    /// Prepare to read the spots `ids`, which are read next, in order.
-    fn start_batch(&mut self, _ids: RangeInclusive<i64>) -> Result<()> {
+    /// Prepare to read the spots `ids` (ascending), which are read next, in order.
+    fn start_batch(&mut self, _ids: &[i64]) -> Result<()> {
         Ok(())
     }
 
@@ -178,7 +176,7 @@ impl<'a> VdbSpotReader<'a> {
 }
 
 impl SpotSource for VdbSpotReader<'_> {
-    fn start_batch(&mut self, ids: RangeInclusive<i64>) -> Result<()> {
+    fn start_batch(&mut self, ids: &[i64]) -> Result<()> {
         match (&mut self.aligned, &mut self.columns.align_ids) {
             (Some(aligned), Some(column)) => aligned.restore_batch(&self.cursor, column, ids),
             _ => Ok(()),
@@ -231,11 +229,11 @@ impl AlignedReads<'_> {
         &mut self,
         cursor: &VCursor,
         column: &mut BlobColumn,
-        ids: RangeInclusive<i64>,
+        ids: &[i64],
     ) -> Result<()> {
         let Self { alignments, prefetched, batch, .. } = self;
         batch.clear();
-        for spot in ids {
+        for &spot in ids {
             column
                 .read_i64_slice_into(cursor, spot, &mut batch.cell)
                 .with_context(|| format!("failed to read spot {spot}'s alignment ids"))?;
