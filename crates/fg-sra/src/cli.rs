@@ -48,7 +48,8 @@ pub struct ToSam {
     pub accessions: Vec<String>,
 
     // ── Core options ──────────────────────────────────────────────────
-    /// Output unaligned reads along with aligned reads.
+    /// Output unaligned reads along with aligned reads. A partly aligned spot's reads are
+    /// then written as a pair, as sam-dump writes them (except with --aligned-region).
     #[arg(short = 'u', long = "unaligned")]
     pub unaligned: bool,
 
@@ -361,6 +362,19 @@ impl ToSam {
     }
 
     /// The record format selected by the output options.
+    /// Whether a partly aligned spot's reads are written as a pair: with `-u`, in SAM or
+    /// BAM. Not with `--aligned-region`, where an unaligned read's aligned mate may not be
+    /// written (sam-dump then writes only the mates of the reads it writes); its reads are
+    /// then written as unpaired.
+    fn pairs_partly_aligned_spots(&self) -> bool {
+        self.unaligned
+            && self.aligned_region.is_empty()
+            && matches!(
+                self.output_mode(),
+                crate::record::OutputMode::Sam | crate::record::OutputMode::Bam
+            )
+    }
+
     fn output_mode(&self) -> crate::record::OutputMode {
         if self.output_format == OutputFormat::Bam {
             crate::record::OutputMode::Bam
@@ -415,7 +429,7 @@ impl ToSam {
         use crate::header::generate_header;
         use crate::progress::ProgressLogger;
         use crate::record::FormatOptions;
-        use crate::unaligned::process_unaligned_reads;
+        use crate::unaligned::{MateNames, process_unaligned_reads};
 
         const PROGRESS_INTERVAL: u64 = 1_000_000;
 
@@ -457,6 +471,7 @@ impl ToSam {
             qual_quant: qual_table.as_ref(),
             output_mode,
             ref_name_to_id: ref_name_to_id.as_ref(),
+            pair_with_unaligned_mates: self.pairs_partly_aligned_spots(),
         };
 
         // Loaders reopen what the accession resolved to, as `fastq`'s do.
@@ -505,6 +520,11 @@ impl ToSam {
                 writer,
                 &opts,
                 self.unaligned_spots_only,
+                self.pairs_partly_aligned_spots().then_some(if self.seqid {
+                    MateNames::RefSeqId
+                } else {
+                    MateNames::RefName
+                }),
                 self.num_threads(),
                 &unaligned_progress,
             )?;
@@ -598,6 +618,16 @@ mod tests {
         ]);
         assert!(cmd.no_header);
         assert_eq!(cmd.header_comment, vec!["line one", "line two"]);
+    }
+
+    #[test]
+    fn test_pairs_partly_aligned_spots() {
+        assert!(parse(&["-u", "SRR1"]).pairs_partly_aligned_spots());
+        assert!(parse(&["-u", "--output-format", "bam", "SRR1"]).pairs_partly_aligned_spots());
+        assert!(!parse(&["SRR1"]).pairs_partly_aligned_spots(), "no unaligned reads");
+        assert!(!parse(&["-u", "--fastq", "SRR1"]).pairs_partly_aligned_spots(), "FASTQ");
+        let regions = parse(&["-u", "--aligned-region", "chr1", "SRR1"]);
+        assert!(!regions.pairs_partly_aligned_spots(), "--aligned-region");
     }
 
     #[test]
