@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::matecache::MateInfo;
 use crate::quality::QuantTable;
+use crate::refstore::{COMPLEMENT_DNA, COMPLEMENT_RNA};
 
 /// Column data read from VDB for an aligned record.
 ///
@@ -137,6 +138,9 @@ pub struct UnalignedColumns<'a> {
     pub num_bio_reads: u32,
     /// Which biological read this is (0 = first, 1 = second, etc.).
     pub bio_read_index: u32,
+    /// Whether the read's table is marked as RNA (its bases have `U` for `T`), which its
+    /// reverse complement pairs with `A`.
+    pub rna: bool,
 }
 
 /// Read filter constants (from `INSDC:SRA:read_filter`).
@@ -496,7 +500,7 @@ fn format_unaligned_record_sam(
     } else {
         // Reverse complement if needed.
         if reverse {
-            write_reverse_complement(buf, cols.read.as_bytes());
+            write_reverse_complement(buf, cols.read.as_bytes(), cols.rna);
         } else {
             buf.extend_from_slice(cols.read.as_bytes());
         }
@@ -568,25 +572,12 @@ pub(crate) fn apply_read_filter(mut flags: u32, read_filter: Option<u8>) -> u32 
     flags
 }
 
-/// Write the reverse complement of a DNA sequence.
-fn write_reverse_complement(buf: &mut Vec<u8>, seq: &[u8]) {
-    for &b in seq.iter().rev() {
-        buf.push(complement(b));
-    }
-}
-
-fn complement(base: u8) -> u8 {
-    match base {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'a' => b't',
-        b't' => b'a',
-        b'c' => b'g',
-        b'g' => b'c',
-        _ => b'N',
-    }
+/// Write the reverse complement of a sequence, with `U` for `T` if `rna`. IUPAC codes are
+/// complemented and case is kept, as sam-dump's `print_sliced_read` does for DNA (see
+/// [`COMPLEMENT_DNA`]); for RNA, `U` pairs with `A` (see [`COMPLEMENT_RNA`]).
+fn write_reverse_complement(buf: &mut Vec<u8>, seq: &[u8], rna: bool) {
+    let complement = if rna { &COMPLEMENT_RNA } else { &COMPLEMENT_DNA };
+    buf.extend(seq.iter().rev().map(|&base| complement[usize::from(base)]));
 }
 
 /// Write a u32 as decimal ASCII.
@@ -792,7 +783,7 @@ fn format_unaligned_record_bam(
     // Sequence (reverse complement if needed).
     if reverse {
         let mut rc = Vec::with_capacity(seq_bytes.len());
-        write_reverse_complement(&mut rc, seq_bytes);
+        write_reverse_complement(&mut rc, seq_bytes, cols.rna);
         encode_sequence(buf, &rc);
     } else {
         encode_sequence(buf, seq_bytes);
@@ -904,7 +895,8 @@ fn base_to_bam(base: u8) -> u8 {
         b'R' | b'r' => 5,
         b'S' | b's' => 6,
         b'V' | b'v' => 7,
-        b'T' | b't' => 8,
+        // BAM has no `U`: a table marked as RNA renders `T` as `U`.
+        b'T' | b't' | b'U' | b'u' => 8,
         b'W' | b'w' => 9,
         b'Y' | b'y' => 10,
         b'H' | b'h' => 11,
@@ -1154,6 +1146,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = default_opts();
         let mut buf = Vec::new();
@@ -1181,6 +1174,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 2,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = default_opts();
         let mut buf = Vec::new();
@@ -1208,6 +1202,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         }
     }
 
@@ -1310,11 +1305,100 @@ mod tests {
 
     #[test]
     fn test_complement() {
-        assert_eq!(complement(b'A'), b'T');
-        assert_eq!(complement(b'T'), b'A');
-        assert_eq!(complement(b'C'), b'G');
-        assert_eq!(complement(b'G'), b'C');
-        assert_eq!(complement(b'N'), b'N');
+        // Every byte, against sam-dump's `print_sliced_read` table (`cmp_tbl`, indexed
+        // by letter): letters map through it, keeping their case; other bytes are kept.
+        let cmp_tbl = b"TVGHEFCDIJMLKNOPQYSAUBWXRZ";
+        for byte in 0..=u8::MAX {
+            let expected = if byte.is_ascii_uppercase() {
+                cmp_tbl[usize::from(byte - b'A')]
+            } else if byte.is_ascii_lowercase() {
+                cmp_tbl[usize::from(byte - b'a')].to_ascii_lowercase()
+            } else {
+                byte
+            };
+            let complement = COMPLEMENT_DNA[usize::from(byte)];
+            assert_eq!(complement, expected, "complement of {:?}", byte as char);
+        }
+    }
+
+    #[test]
+    fn test_unaligned_record_reverse_iupac() {
+        let cols = UnalignedColumns {
+            read: "ACGTRYKMBVDHNSWU.acgtn",
+            quality: &[],
+            ..oriented_unaligned_cols(5)
+        };
+        let opts = FormatOptions { reverse_unaligned: true, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let line = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[9], "nacgt.UWSNDHBVKMRYACGT");
+    }
+
+    #[test]
+    fn test_unaligned_record_reverse_rna() {
+        // A table marked as RNA: `U` pairs with `A`.
+        let cols = UnalignedColumns {
+            read: "AUGGCUn.",
+            quality: &[],
+            rna: true,
+            ..oriented_unaligned_cols(5)
+        };
+        let opts = FormatOptions { reverse_unaligned: true, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let line = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[9], ".nAGCCAU");
+    }
+
+    // BAM has no `U`: an RNA read's `U`, stored or complemented from `A`, gets `T`'s code
+    // (8), not `N`'s (15).
+    #[rstest]
+    #[case::reversed(true, [0x14, 0x22, 0x18])] // AGCCAU
+    #[case::as_stored(false, [0x18, 0x44, 0x28])] // AUGGCU
+    fn test_unaligned_record_rna_bam(#[case] reverse_unaligned: bool, #[case] packed: [u8; 3]) {
+        let cols = UnalignedColumns {
+            read: "AUGGCU",
+            quality: &[],
+            rna: true,
+            ..oriented_unaligned_cols(5)
+        };
+        let opts =
+            FormatOptions { reverse_unaligned, output_mode: OutputMode::Bam, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record_bam(&mut buf, &cols, &opts);
+
+        let seq_start = 36 + buf[12] as usize;
+        assert_eq!(&buf[seq_start..seq_start + 3], &packed);
+    }
+
+    #[test]
+    fn test_unaligned_record_reverse_iupac_bam() {
+        let cols = UnalignedColumns {
+            read: "ACGTRYKMBVDHNSWU.acgtn",
+            quality: &[],
+            ..oriented_unaligned_cols(5)
+        };
+        let opts = FormatOptions {
+            reverse_unaligned: true,
+            output_mode: OutputMode::Bam,
+            ..default_opts()
+        };
+        let mut buf = Vec::new();
+
+        format_unaligned_record_bam(&mut buf, &cols, &opts);
+
+        let mut packed = Vec::new();
+        encode_sequence(&mut packed, b"nacgt.UWSNDHBVKMRYACGT");
+        let seq_start = 36 + buf[12] as usize;
+        assert_eq!(&buf[seq_start..seq_start + packed.len()], packed.as_slice());
     }
 
     #[test]
@@ -1424,6 +1508,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = FormatOptions { omit_quality: true, ..default_opts() };
         let mut buf = Vec::new();
@@ -1465,6 +1550,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = FormatOptions { qual_quant: Some(&table), ..default_opts() };
         let mut buf = Vec::new();
@@ -1513,6 +1599,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = FormatOptions { output_mode: OutputMode::Fasta, ..default_opts() };
         let mut buf = Vec::new();
@@ -1534,6 +1621,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = FormatOptions { output_mode: OutputMode::Fastq, ..default_opts() };
         let mut buf = Vec::new();
@@ -1655,6 +1743,9 @@ mod tests {
         assert_eq!(base_to_bam(b'c'), 2);
         assert_eq!(base_to_bam(b'g'), 4);
         assert_eq!(base_to_bam(b't'), 8);
+        // `U`, as a table marked as RNA renders `T`, has `T`'s code.
+        assert_eq!(base_to_bam(b'U'), 8);
+        assert_eq!(base_to_bam(b'u'), 8);
     }
 
     #[test]
@@ -1803,6 +1894,7 @@ mod tests {
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
+            rna: false,
         };
         let opts = FormatOptions { output_mode: OutputMode::Bam, ..default_opts() };
         let mut buf = Vec::new();

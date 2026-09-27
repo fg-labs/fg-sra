@@ -27,31 +27,7 @@ use std::fmt;
 use anyhow::{Result, bail, ensure};
 
 use crate::record::{READ_TYPE_FORWARD, READ_TYPE_REVERSE};
-use crate::refstore::CHARSET_4NA;
-
-/// The complement of each `INSDC:dna:text` base: its 4na code bit-reversed (as the `map`
-/// in `seq-restore-read.c`) and mapped back through CHARSET, so `A`↔`T`, `C`↔`G`, `M`↔`K`,
-/// `R`↔`Y`, `V`↔`B`, `H`↔`D`, and `S`, `W`, `N` and `.` are their own. Other bytes are
-/// left as they are.
-static COMPLEMENT: [u8; 256] = complement_table();
-
-/// Build [`COMPLEMENT`] at compile time.
-const fn complement_table() -> [u8; 256] {
-    let mut table = [0u8; 256];
-    let mut byte = 0;
-    while byte < 256 {
-        table[byte] = byte as u8;
-        byte += 1;
-    }
-    let mut code = 0;
-    while code < 16 {
-        let reversed =
-            ((code & 1) << 3) | ((code & 2) << 1) | ((code & 4) >> 1) | ((code & 8) >> 3);
-        table[CHARSET_4NA[code] as usize] = CHARSET_4NA[reversed];
-        code += 1;
-    }
-    table
-}
+use crate::refstore::COMPLEMENT_DNA as COMPLEMENT;
 
 /// Error reconstructing a read; each variant mirrors an `rcInconsistent` return
 /// in the C implementation.
@@ -302,6 +278,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::refstore::CHARSET_4NA;
 
     #[rstest]
     #[case::all_match_4m(b"ACGT", &[0, 0, 0, 0], b"", &[0, 0, 0, 0], &[], b"ACGT")]

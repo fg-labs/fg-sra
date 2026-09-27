@@ -104,7 +104,7 @@ pub fn process_unaligned_reads(
         let batch = Batching { threads: num_threads, spots: BATCH_SPOTS };
         process_in_parallel(&table, writer, opts, unaligned_spots_only, batch, progress)
     } else {
-        process_serially(db, writer, opts, unaligned_spots_only, progress)
+        process_serially(db, writer, opts, unaligned_spots_only, marks_rna(&table), progress)
     }
 }
 
@@ -135,12 +135,14 @@ fn reads_to_emit(
     }));
 }
 
-/// Convert unaligned reads on one thread, reading bases through `READ`.
+/// Convert unaligned reads on one thread, reading bases through `READ`, which has `U` for
+/// `T` if the table is marked as `rna`.
 fn process_serially(
     db: &VDatabase,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
     unaligned_spots_only: bool,
+    rna: bool,
     progress: &ProgressLogger,
 ) -> Result<()> {
     let (cursor, idx) = setup_seq_cursor(db)?;
@@ -194,6 +196,7 @@ fn process_serially(
                 read_filter: read_filters.get(i).copied().unwrap_or(0),
                 num_bio_reads,
                 bio_read_index: bio_index as u32,
+                rna,
             };
 
             format_unaligned_record(&mut buf, &cols, opts);
@@ -337,6 +340,8 @@ struct SpotReader {
     primary_alignment_id: BlobColumn,
     /// Text for each 4na code: [`CHARSET_4NA`], or [`CHARSET_4NA_RNA`] for RNA.
     charset: &'static [u8; 16],
+    /// Whether `charset` is [`CHARSET_4NA_RNA`].
+    rna: bool,
     buffers: SpotBuffers,
 }
 
@@ -379,6 +384,7 @@ impl SpotReader {
             name: add(col::NAME)?,
             primary_alignment_id: add(col::PRIMARY_ALIGNMENT_ID)?,
             charset,
+            rna: charset == CHARSET_4NA_RNA,
             buffers: SpotBuffers::default(),
             cursor,
         };
@@ -407,6 +413,7 @@ impl SpotReader {
             name,
             primary_alignment_id,
             charset,
+            rna,
             buffers: b,
         } = self;
         let cursor = &*cursor;
@@ -453,6 +460,7 @@ impl SpotReader {
                 read_filter: b.read_filters.get(i).copied().unwrap_or(0),
                 num_bio_reads,
                 bio_read_index: bio_index as u32,
+                rna: *rna,
             };
             format_unaligned_record(&mut b.record, &cols, opts);
             out.extend_from_slice(&b.record);
@@ -615,7 +623,7 @@ mod tests {
         let progress = ProgressLogger::new(0, 0);
         [false, true].map(|spots_only| {
             let serial = convert_archive(archive, "serial", |db, writer, opts| {
-                process_serially(db, writer, opts, spots_only, &progress)
+                process_serially(db, writer, opts, spots_only, false, &progress)
             });
             let parallel = convert_archive(archive, "parallel", |db, writer, opts| {
                 let table = db.open_table_read("SEQUENCE")?;
