@@ -195,7 +195,8 @@ pub struct FormatOptions<'a> {
     pub spot_group_in_name: bool,
     /// Output alignment ID as XI:i tag.
     pub xi_tag: bool,
-    /// Reverse unaligned reads according to read type.
+    /// Reverse-complement unaligned reads typed `READ_TYPE_REVERSE` and set their 0x10
+    /// flag in SAM/BAM output. FASTA/FASTQ output ignores it, as in sam-dump.
     pub reverse_unaligned: bool,
     /// Replace quality values with `*`.
     pub omit_quality: bool,
@@ -396,16 +397,14 @@ pub fn format_unaligned_record(
     match opts.output_mode {
         OutputMode::Sam => format_unaligned_record_sam(buf, cols, opts),
         OutputMode::Bam => format_unaligned_record_bam(buf, cols, opts),
+        // FASTA/FASTQ ignore `--reverse`, as sam-dump does: with no flag to record the
+        // flip, reads are written as stored.
         OutputMode::Fasta => {
             buf.clear();
             buf.push(b'>');
             write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
             buf.push(b'\n');
-            if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
-                write_reverse_complement(buf, cols.read.as_bytes());
-            } else {
-                buf.extend_from_slice(cols.read.as_bytes());
-            }
+            buf.extend_from_slice(cols.read.as_bytes());
             buf.push(b'\n');
         }
         OutputMode::Fastq => {
@@ -413,23 +412,10 @@ pub fn format_unaligned_record(
             buf.push(b'@');
             write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
             buf.push(b'\n');
-            if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
-                write_reverse_complement(buf, cols.read.as_bytes());
-            } else {
-                buf.extend_from_slice(cols.read.as_bytes());
-            }
+            buf.extend_from_slice(cols.read.as_bytes());
             buf.extend_from_slice(b"\n+\n");
             if opts.omit_quality || cols.quality.is_empty() {
                 buf.push(b'*');
-            } else if opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0 {
-                for &q in cols.quality.iter().rev() {
-                    let phred = if let Some(table) = opts.qual_quant {
-                        crate::quality::quantize_phred(q, table)
-                    } else {
-                        q
-                    };
-                    buf.push(phred + 33);
-                }
             } else {
                 for &q in cols.quality {
                     let phred = if let Some(table) = opts.qual_quant {
@@ -1853,19 +1839,21 @@ mod tests {
         assert_eq!(&buf[qual_start..qual_start + 4], &[30, 30, 30, 30]);
     }
 
-    #[test]
-    fn test_unaligned_fasta_reverse() {
+    // FASTA/FASTQ have no flag to record a flip, so reads are written as stored, as
+    // sam-dump does.
+    #[rstest]
+    #[case::fasta(OutputMode::Fasta, ">spot1\nAACG\n")]
+    #[case::fastq(OutputMode::Fastq, "@spot1\nAACG\n+\n+5?I\n")]
+    fn test_unaligned_fastx_ignores_reverse(
+        #[case] output_mode: OutputMode,
+        #[case] expected: &str,
+    ) {
         let cols = oriented_unaligned_cols(5);
-        let opts = FormatOptions {
-            reverse_unaligned: true,
-            output_mode: OutputMode::Fasta,
-            ..default_opts()
-        };
+        let opts = FormatOptions { reverse_unaligned: true, output_mode, ..default_opts() };
         let mut buf = Vec::new();
 
         format_unaligned_record(&mut buf, &cols, &opts);
 
-        let output = String::from_utf8(buf).unwrap();
-        assert_eq!(output, ">spot1\nCGTT\n");
+        assert_eq!(String::from_utf8(buf).unwrap(), expected);
     }
 }

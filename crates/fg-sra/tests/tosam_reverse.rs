@@ -4,7 +4,8 @@
 //! references are embedded, so no network access is needed). Of its 47 unaligned
 //! spots, each a single biological read, 27 have `READ_TYPE` `BIOLOGICAL|REVERSE`
 //! and 20 `BIOLOGICAL|FORWARD`. `--reverse` must reverse-complement exactly the
-//! REVERSE ones and set their 0x10 flag, as `sam-dump --reverse` does.
+//! REVERSE ones and set their 0x10 flag, as `sam-dump --reverse` does, and leave
+//! FASTQ output as stored.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,4 +75,11 @@ fn reverse_flips_only_reads_typed_reverse() {
         }
     }
     assert_eq!(num_reversed, 27);
+}
+
+#[test]
+fn reverse_leaves_fastq_as_stored() {
+    let stored = convert(&["--fastq"]);
+    assert_eq!(stored.len(), 47 * 4);
+    assert_eq!(convert(&["--fastq", "--reverse"]), stored);
 }
