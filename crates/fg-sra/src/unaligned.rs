@@ -38,7 +38,9 @@ mod col {
     pub const SPOT_GROUP: &str = "SPOT_GROUP";
     pub const READ_START: &str = "READ_START";
     pub const READ_LEN: &str = "READ_LEN";
-    pub const READ_TYPE: &str = "READ_TYPE";
+    /// Cast explicitly: `READ_TYPE` read as `INSDC:SRA:read_type` loses its orientation
+    /// bits, which `--reverse` needs.
+    pub const READ_TYPE: &str = "(INSDC:SRA:xread_type)READ_TYPE";
     pub const READ_FILTER: &str = "READ_FILTER";
     pub const NAME: &str = "NAME";
     pub const PRIMARY_ALIGNMENT_ID: &str = "PRIMARY_ALIGNMENT_ID";

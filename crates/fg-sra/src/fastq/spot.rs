@@ -286,13 +286,14 @@ impl ReadFilter {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::record::{READ_TYPE_FORWARD, READ_TYPE_REVERSE};
 
     const T: u8 = 0;
     const B: u8 = READ_TYPE_BIOLOGICAL;
     /// Biological, reverse-oriented (`BIOLOGICAL | REVERSE`), as bam-load writes.
-    const B_REV: u8 = READ_TYPE_BIOLOGICAL | 4;
+    const B_REV: u8 = READ_TYPE_BIOLOGICAL | READ_TYPE_REVERSE;
     /// Technical, forward-oriented (`TECHNICAL | FORWARD`).
-    const T_FWD: u8 = 2;
+    const T_FWD: u8 = READ_TYPE_FORWARD;
 
     const PASS: u8 = 0;
     const REJECT: u8 = 1;

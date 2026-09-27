@@ -136,7 +136,8 @@ pub struct ToSam {
     #[arg(short = 'p', long = "prefix")]
     pub prefix: Option<String>,
 
-    /// Reverse unaligned reads per read type.
+    /// Reverse-complement unaligned reads whose `READ_TYPE` is REVERSE, and set their
+    /// 0x10 flag. The mate-reverse flag (0x20) is not set. Ignored for FASTA/FASTQ output.
     #[arg(long = "reverse")]
     pub reverse: bool,
 
