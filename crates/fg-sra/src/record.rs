@@ -147,9 +147,17 @@ pub const READ_FILTER_CRITERIA: u8 = 2;
 #[allow(dead_code)]
 pub const READ_FILTER_REDACTED: u8 = 3;
 
-/// Read type bitmask (from `INSDC:SRA:xread_type`).
+// Read type bitmask (from `INSDC:SRA:xread_type`): bit 0 is the read's type and bits 1-2
+// its orientation, e.g. `READ_TYPE_BIOLOGICAL | READ_TYPE_REVERSE`.
+
+/// `SRA_READ_TYPE_BIOLOGICAL`: a biological read (not technical, such as a barcode).
 pub const READ_TYPE_BIOLOGICAL: u8 = 1;
-pub const READ_TYPE_REVERSE: u8 = 2;
+/// `SRA_READ_TYPE_FORWARD`: the read is stored in sequencing orientation, and was
+/// submitted or aligned that way.
+pub const READ_TYPE_FORWARD: u8 = 2;
+/// `SRA_READ_TYPE_REVERSE`: the read is stored in sequencing orientation, but was
+/// submitted or aligned reverse-complemented.
+pub const READ_TYPE_REVERSE: u8 = 4;
 
 /// SAM flag bit constants.
 mod sam_flags {
@@ -1016,6 +1024,8 @@ fn write_bam_tag_str(buf: &mut Vec<u8>, tag: [u8; 2], val: &str) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn default_opts() -> FormatOptions<'static> {
@@ -1193,19 +1203,35 @@ mod tests {
         assert!(flags & sam_flags::FIRST_IN_PAIR != 0, "first in pair flag");
     }
 
-    #[test]
-    fn test_unaligned_record_reverse() {
-        let cols = UnalignedColumns {
+    /// An unaligned read that is not its own reverse complement, with the given
+    /// `READ_TYPE`.
+    fn oriented_unaligned_cols(read_type: u8) -> UnalignedColumns<'static> {
+        UnalignedColumns {
             name: "spot1",
-            read: "ACGT",
+            read: "AACG",
             quality: &[10, 20, 30, 40],
             spot_group: "",
-            read_type: READ_TYPE_BIOLOGICAL | READ_TYPE_REVERSE,
+            read_type,
             read_filter: READ_FILTER_PASS,
             num_bio_reads: 1,
             bio_read_index: 0,
-        };
-        let opts = FormatOptions { reverse_unaligned: true, ..default_opts() };
+        }
+    }
+
+    // Read types are the literal `INSDC:SRA:xread_type` values: 1 = BIOLOGICAL,
+    // 3 = BIOLOGICAL|FORWARD, 5 = BIOLOGICAL|REVERSE.
+    #[rstest]
+    #[case::reverse(5, true, true)]
+    #[case::forward(3, true, false)]
+    #[case::no_orientation(1, true, false)]
+    #[case::reverse_without_option(5, false, false)]
+    fn test_unaligned_record_reverse_sam(
+        #[case] read_type: u8,
+        #[case] reverse_unaligned: bool,
+        #[case] reversed: bool,
+    ) {
+        let cols = oriented_unaligned_cols(read_type);
+        let opts = FormatOptions { reverse_unaligned, ..default_opts() };
         let mut buf = Vec::new();
 
         format_unaligned_record(&mut buf, &cols, &opts);
@@ -1213,10 +1239,80 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         let flags: u32 = fields[1].parse().unwrap();
-        assert!(flags & sam_flags::REVERSE != 0, "reverse flag");
-        assert_eq!(fields[9], "ACGT"); // reverse complement of ACGT
-        // Quality reversed: 40+33, 30+33, 20+33, 10+33 = 'I', '?', '5', '+'
-        assert_eq!(fields[10], "I?5+");
+        assert_eq!(flags & sam_flags::REVERSE != 0, reversed, "reverse flag");
+        if reversed {
+            assert_eq!(fields[9], "CGTT");
+            assert_eq!(fields[10], "I?5+");
+        } else {
+            assert_eq!(fields[9], "AACG");
+            assert_eq!(fields[10], "+5?I");
+        }
+    }
+
+    #[rstest]
+    #[case::reverse(5, true, true)]
+    #[case::forward(3, true, false)]
+    #[case::no_orientation(1, true, false)]
+    #[case::reverse_without_option(5, false, false)]
+    fn test_unaligned_record_reverse_bam(
+        #[case] read_type: u8,
+        #[case] reverse_unaligned: bool,
+        #[case] reversed: bool,
+    ) {
+        let cols = oriented_unaligned_cols(read_type);
+        let opts =
+            FormatOptions { reverse_unaligned, output_mode: OutputMode::Bam, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record_bam(&mut buf, &cols, &opts);
+
+        let flags = u16::from_le_bytes(buf[18..20].try_into().unwrap());
+        assert_eq!(flags & (sam_flags::REVERSE as u16) != 0, reversed, "reverse flag");
+        // SEQ packed two 4-bit codes a byte (A=1, C=2, G=4, T=8): CGTT or AACG.
+        let (packed, quality): ([u8; 2], [u8; 4]) = if reversed {
+            ([0x24, 0x88], [40, 30, 20, 10])
+        } else {
+            ([0x11, 0x24], [10, 20, 30, 40])
+        };
+        let seq_start = 36 + buf[12] as usize;
+        let qual_start = seq_start + packed.len();
+        assert_eq!(&buf[seq_start..qual_start], &packed);
+        assert_eq!(&buf[qual_start..qual_start + 4], &quality);
+    }
+
+    // Quantization applies to reversed qualities too: Phred 5, 15, 25, 35 quantize to
+    // 10, 20, 30, 40 and are written last to first.
+    #[test]
+    fn test_unaligned_reverse_qual_quant_sam() {
+        let table = crate::quality::parse_qual_quant("0:10,10:20,20:30,30:40").unwrap();
+        let cols = UnalignedColumns { quality: &[5, 15, 25, 35], ..oriented_unaligned_cols(5) };
+        let opts =
+            FormatOptions { reverse_unaligned: true, qual_quant: Some(&table), ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let line = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[10].as_bytes(), &[40 + 33, 30 + 33, 20 + 33, 10 + 33]);
+    }
+
+    #[test]
+    fn test_unaligned_reverse_qual_quant_bam() {
+        let table = crate::quality::parse_qual_quant("0:10,10:20,20:30,30:40").unwrap();
+        let cols = UnalignedColumns { quality: &[5, 15, 25, 35], ..oriented_unaligned_cols(5) };
+        let opts = FormatOptions {
+            reverse_unaligned: true,
+            qual_quant: Some(&table),
+            output_mode: OutputMode::Bam,
+            ..default_opts()
+        };
+        let mut buf = Vec::new();
+
+        format_unaligned_record_bam(&mut buf, &cols, &opts);
+
+        let qual_start = 36 + buf[12] as usize + 4_usize.div_ceil(2);
+        assert_eq!(&buf[qual_start..qual_start + 4], &[40, 30, 20, 10]);
     }
 
     #[test]
@@ -1759,16 +1855,7 @@ mod tests {
 
     #[test]
     fn test_unaligned_fasta_reverse() {
-        let cols = UnalignedColumns {
-            name: "spot1",
-            read: "ACGT",
-            quality: &[10, 20, 30, 40],
-            spot_group: "",
-            read_type: READ_TYPE_BIOLOGICAL | READ_TYPE_REVERSE,
-            read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
-        };
+        let cols = oriented_unaligned_cols(5);
         let opts = FormatOptions {
             reverse_unaligned: true,
             output_mode: OutputMode::Fasta,
@@ -1779,6 +1866,6 @@ mod tests {
         format_unaligned_record(&mut buf, &cols, &opts);
 
         let output = String::from_utf8(buf).unwrap();
-        assert_eq!(output, ">spot1\nACGT\n"); // reverse complement of ACGT
+        assert_eq!(output, ">spot1\nCGTT\n");
     }
 }

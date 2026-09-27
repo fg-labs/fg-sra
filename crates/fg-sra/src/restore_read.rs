@@ -26,13 +26,8 @@ use std::fmt;
 
 use anyhow::{Result, bail, ensure};
 
+use crate::record::{READ_TYPE_FORWARD, READ_TYPE_REVERSE};
 use crate::refstore::CHARSET_4NA;
-
-/// `READ_TYPE` bit (`INSDC:SRA:xread_type`) of a read aligned in sequencing orientation.
-const READ_TYPE_FORWARD: u8 = 2;
-
-/// `READ_TYPE` bit of a read aligned reverse-complemented.
-const READ_TYPE_REVERSE: u8 = 4;
 
 /// The complement of each `INSDC:dna:text` base: its 4na code bit-reversed (as the `map`
 /// in `seq-restore-read.c`) and mapped back through CHARSET, so `A`↔`T`, `C`↔`G`, `M`↔`K`,
