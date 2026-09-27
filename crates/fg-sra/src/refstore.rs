@@ -24,6 +24,36 @@ pub(crate) const CHARSET_4NA: &[u8; 16] = b".ACMGRSVTWYHKDBN";
 /// [`crate::archive::marks_rna`]).
 pub(crate) const CHARSET_4NA_RNA: &[u8; 16] = b".ACMGRSVUWYHKDBN";
 
+/// The complement of each base as [`CHARSET_4NA`] renders it (see [`complement_table`]):
+/// `A`↔`T`, `C`↔`G`, `M`↔`K`, `R`↔`Y`, `V`↔`B`, `H`↔`D`, and `S`, `W`, `N` and `.` their
+/// own, in either case. This is also sam-dump's `print_sliced_read` table.
+pub(crate) static COMPLEMENT_DNA: [u8; 256] = complement_table(CHARSET_4NA);
+
+/// [`COMPLEMENT_DNA`] for a table marked as RNA, rendered by [`CHARSET_4NA_RNA`]: `A`↔`U`.
+pub(crate) static COMPLEMENT_RNA: [u8; 256] = complement_table(CHARSET_4NA_RNA);
+
+/// The complement of each base `charset` renders: its 4na code bit-reversed (as the `map`
+/// in ncbi-vdb's `seq-restore-read.c`) and rendered back, in the base's case. Other bytes
+/// are their own.
+const fn complement_table(charset: &[u8; 16]) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = byte as u8;
+        byte += 1;
+    }
+    let mut code = 0;
+    while code < 16 {
+        let reversed =
+            ((code & 1) << 3) | ((code & 2) << 1) | ((code & 4) >> 1) | ((code & 8) >> 3);
+        let (base, complement) = (charset[code], charset[reversed]);
+        table[base as usize] = complement;
+        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+        code += 1;
+    }
+    table
+}
+
 /// Map `INSDC:4na:bin` codes to the CHARSET ASCII alphabet, in place (so a reference
 /// is never held twice).
 pub fn map_4na_to_ascii(bases: &mut [u8]) {
