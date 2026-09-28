@@ -25,6 +25,9 @@ const PRIMARY_ALIGNMENT_TABLE: &str = "PRIMARY_ALIGNMENT";
 /// VDB table name for secondary alignments.
 const SECONDARY_ALIGNMENT_TABLE: &str = "SECONDARY_ALIGNMENT";
 
+/// The SAM flag of a read from a template with several segments.
+const PAIRED: u32 = 0x1;
+
 /// Minimum number of alignment rows per work item.
 const MIN_CHUNK_SIZE: i64 = 10_000;
 
@@ -44,6 +47,10 @@ pub struct AlignConfig<'a> {
     /// Opens the database again, for each thread that preloads references in
     /// parallel.
     pub reopen: &'a (dyn Fn() -> Result<VDatabase> + Sync),
+    /// Where to collect the written primary alignments whose mate is unaligned, as
+    /// `(SEQ_SPOT_ID, alignment id)`, so that only those mates are written unaligned (with
+    /// `-u` and `--aligned-region`, as sam-dump does); `None` to collect nothing.
+    pub unaligned_mates: Option<&'a std::sync::Mutex<Vec<(i64, i64)>>>,
 }
 
 impl AlignConfig<'_> {
@@ -93,6 +100,7 @@ mod col {
     pub const EDIT_DISTANCE: &str = "(U32)EDIT_DISTANCE";
     pub const SEQ_SPOT_GROUP: &str = "(ascii)SEQ_SPOT_GROUP";
     pub const SEQ_NAME: &str = "(ascii)SEQ_NAME";
+    pub const SEQ_SPOT_ID: &str = "(I64)SEQ_SPOT_ID";
     pub const ALIGNMENT_COUNT: &str = "(U8)ALIGNMENT_COUNT";
     pub const READ_FILTER: &str = "(INSDC:SRA:read_filter)READ_FILTER";
     pub const REF_POS: &str = "(INSDC:coord:zero)REF_POS";
@@ -117,6 +125,7 @@ struct AlignColumnIndices {
     edit_distance: u32,
     seq_spot_group: u32,
     seq_name: u32,
+    seq_spot_id: u32,
     alignment_count: Option<u32>,
     read_filter: Option<u32>,
     ref_pos: u32,
@@ -158,6 +167,7 @@ fn setup_data_cursor(
         edit_distance: cursor.add_column(col::EDIT_DISTANCE).context("EDIT_DISTANCE")?,
         seq_spot_group: cursor.add_column(col::SEQ_SPOT_GROUP).context("SEQ_SPOT_GROUP")?,
         seq_name: cursor.add_column(col::SEQ_NAME).context("SEQ_NAME")?,
+        seq_spot_id: cursor.add_column(col::SEQ_SPOT_ID).context("SEQ_SPOT_ID")?,
         alignment_count: cursor.add_column_optional(col::ALIGNMENT_COUNT),
         read_filter: cursor.add_column_optional(col::READ_FILTER),
         ref_pos: cursor.add_column(col::REF_POS).context("REF_POS")?,
@@ -705,6 +715,12 @@ fn process_row_range(
             state.mate_cache.insert(row_id, MateInfo { ref_pos: state.cols.ref_pos });
             info
         } else {
+            // A paired read whose mate is unaligned: collect it, so its mate is written.
+            if let Some(mates) = &mut state.unaligned_mates
+                && state.cols.sam_flags & PAIRED != 0
+            {
+                mates.push((cursor.read_i64(row_id, col_idx.seq_spot_id)?, row_id));
+            }
             state.cols.pair_with_unaligned_mate(opts.pair_with_unaligned_mates);
             None
         };
@@ -1064,13 +1080,7 @@ fn process_table_sequential(
     let (cursor, col_idx) = setup_data_cursor(db, table_name, config.use_long_cigar)?;
     let min_mapq = config.min_mapq_i32();
 
-    let mut state = WorkerState {
-        record_buf: Vec::with_capacity(1024),
-        mate_cache: MateCache::new(),
-        cols: AlignedColumns::new(),
-        scratch: ReadScratch::default(),
-        current_ref_idx: u32::MAX,
-    };
+    let mut state = WorkerState::new(table_name, config);
 
     for item in work_items {
         if item.ref_idx != state.current_ref_idx {
@@ -1093,6 +1103,7 @@ fn process_table_sequential(
         progress.reference_done();
     }
 
+    state.finish(config);
     Ok(())
 }
 
@@ -1165,7 +1176,7 @@ fn process_table_parallel(
                 resource_pool_tx: resource_pool_tx.clone(),
             };
             worker_handles.push(s.spawn(move || -> Result<()> {
-                pool_worker_loop(&channels, config, store, progress)
+                pool_worker_loop(&channels, table_name, config, store, progress)
             }));
         }
         // Drop our copies so only workers hold channel ends.
@@ -1291,6 +1302,33 @@ struct WorkerState {
     scratch: ReadScratch,
     /// Tracks which reference the mate cache belongs to; cleared on change.
     current_ref_idx: u32,
+    /// The written alignments whose mate is unaligned, if they are collected (see
+    /// [`AlignConfig::unaligned_mates`]).
+    unaligned_mates: Option<Vec<(i64, i64)>>,
+}
+
+impl WorkerState {
+    /// A worker's state for `table_name`, collecting alignments with unaligned mates if
+    /// `config` asks and the table is `PRIMARY_ALIGNMENT` (a secondary alignment's mate
+    /// is not written as unaligned).
+    fn new(table_name: &str, config: &AlignConfig<'_>) -> Self {
+        let collects = config.unaligned_mates.is_some() && table_name == PRIMARY_ALIGNMENT_TABLE;
+        Self {
+            record_buf: Vec::with_capacity(1024),
+            mate_cache: MateCache::new(),
+            cols: AlignedColumns::new(),
+            scratch: ReadScratch::default(),
+            current_ref_idx: u32::MAX,
+            unaligned_mates: collects.then(Vec::new),
+        }
+    }
+
+    /// Add the collected alignments to `config`'s.
+    fn finish(self, config: &AlignConfig<'_>) {
+        if let (Some(mates), Some(shared)) = (self.unaligned_mates, config.unaligned_mates) {
+            shared.lock().expect("unaligned mates lock").extend(mates);
+        }
+    }
 }
 
 /// Reusable buffer for [`reconstruct_read`], one per worker.
@@ -1330,17 +1368,12 @@ fn reconstruct_read(
 /// then return them. This bounds total VDB memory to `pool_size` × per-set cost.
 fn pool_worker_loop(
     channels: &PoolWorkerChannels,
+    table_name: &str,
     config: &AlignConfig<'_>,
     store: &ReferenceStore,
     progress: &ProgressLogger,
 ) -> Result<()> {
-    let mut state = WorkerState {
-        record_buf: Vec::with_capacity(1024),
-        mate_cache: MateCache::new(),
-        cols: AlignedColumns::new(),
-        scratch: ReadScratch::default(),
-        current_ref_idx: u32::MAX,
-    };
+    let mut state = WorkerState::new(table_name, config);
     let min_mapq = config.min_mapq_i32();
 
     // Take a buffer from the pool or allocate a new one.
@@ -1407,6 +1440,7 @@ fn pool_worker_loop(
         result?;
     }
 
+    state.finish(config);
     Ok(())
 }
 
@@ -1441,6 +1475,7 @@ mod tests {
             opts: &OPTS,
             regions: &[],
             reopen: &|| anyhow::bail!("tests do not preload references"),
+            unaligned_mates: None,
         }
     }
 

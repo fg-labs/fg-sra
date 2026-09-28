@@ -49,7 +49,8 @@ pub struct ToSam {
 
     // ── Core options ──────────────────────────────────────────────────
     /// Output unaligned reads along with aligned reads. A partly aligned spot's reads are
-    /// then written as a pair, as sam-dump writes them (except with --aligned-region).
+    /// then written as a pair, as sam-dump writes them. With --aligned-region, only the
+    /// unaligned mates of the aligned reads written are, as in sam-dump.
     #[arg(short = 'u', long = "unaligned")]
     pub unaligned: bool,
 
@@ -383,12 +384,10 @@ impl ToSam {
 
     /// The record format selected by the output options.
     /// Whether a partly aligned spot's reads are written as a pair: with `-u`, in SAM or
-    /// BAM. Not with `--aligned-region`, where an unaligned read's aligned mate may not be
-    /// written (sam-dump then writes only the mates of the reads it writes); its reads are
-    /// then written as unpaired.
+    /// BAM. (With `--aligned-region`, only the mates of the aligned reads written are
+    /// written, so every mate is.)
     fn pairs_partly_aligned_spots(&self) -> bool {
         self.unaligned
-            && self.aligned_region.is_empty()
             && matches!(
                 self.output_mode(),
                 crate::record::OutputMode::Sam | crate::record::OutputMode::Bam
@@ -447,9 +446,7 @@ impl ToSam {
     ) -> Result<()> {
         use crate::aligned::{AlignConfig, plan_aligned_tables, process_aligned_plan};
         use crate::header::generate_header;
-        use crate::progress::ProgressLogger;
         use crate::record::FormatOptions;
-        use crate::unaligned::{MateNames, process_unaligned_reads};
 
         const PROGRESS_INTERVAL: u64 = 1_000_000;
 
@@ -495,6 +492,11 @@ impl ToSam {
         // Loaders reopen what the accession resolved to, as `fastq`'s do.
         let location = crate::archive::vdb_location(accession)?;
         let reopen = || open_database(&location);
+        // With -u and --aligned-region, only the unaligned mates of the aligned reads written
+        // are written (as sam-dump does), so the aligned phase collects those reads.
+        let collected_mates =
+            (self.unaligned && !self.unaligned_spots_only && !self.aligned_region.is_empty())
+                .then(|| std::sync::Mutex::new(Vec::new()));
         let align_config = AlignConfig {
             use_seqid: self.seqid,
             use_long_cigar: self.cigar_long,
@@ -505,6 +507,7 @@ impl ToSam {
             opts: &opts,
             regions: &self.aligned_region,
             reopen: &reopen,
+            unaligned_mates: collected_mates.as_ref(),
         };
 
         // Plan the aligned reads (unless --unaligned-spots-only) before writing the
@@ -532,23 +535,53 @@ impl ToSam {
 
         // Unaligned reads (if requested).
         if self.unaligned || self.unaligned_spots_only {
-            let unaligned_progress = ProgressLogger::new(0, PROGRESS_INTERVAL);
-            process_unaligned_reads(
-                db,
-                writer,
-                &opts,
-                self.unaligned_spots_only,
-                self.pairs_partly_aligned_spots().then_some(if self.seqid {
-                    MateNames::RefSeqId
-                } else {
-                    MateNames::RefName
-                }),
-                self.num_threads(),
-                &unaligned_progress,
-            )?;
+            let mates = collected_mates
+                .map(|collected| collected.into_inner().expect("unaligned mates lock"));
+            self.write_unaligned_reads(db, writer, &opts, mates, PROGRESS_INTERVAL)?;
         }
 
         Ok(())
+    }
+
+    /// Write `db`'s unaligned reads: with `mates`, only the unaligned mates of those
+    /// alignments (`(SEQ_SPOT_ID, alignment id)`, collected as the aligned reads were
+    /// written), and otherwise every one (or, with `--unaligned-spots-only`, those of spots
+    /// with no aligned read).
+    fn write_unaligned_reads(
+        &self,
+        db: &VDatabase,
+        writer: &mut crate::output::OutputWriter,
+        opts: &crate::record::FormatOptions<'_>,
+        mates: Option<Vec<(i64, i64)>>,
+        progress_interval: u64,
+    ) -> Result<()> {
+        use crate::progress::ProgressLogger;
+        use crate::unaligned::{MateNames, Selection, process_unaligned_reads};
+
+        let mut mates = mates;
+        let selection = match &mut mates {
+            Some(mates) => {
+                mates.sort_unstable();
+                mates.dedup();
+                Selection::MatesOf(mates)
+            }
+            None => Selection::All { spots_only: self.unaligned_spots_only },
+        };
+        let mate_names = self.pairs_partly_aligned_spots().then_some(if self.seqid {
+            MateNames::RefSeqId
+        } else {
+            MateNames::RefName
+        });
+        let progress = ProgressLogger::new(0, progress_interval);
+        process_unaligned_reads(
+            db,
+            writer,
+            opts,
+            selection,
+            mate_names,
+            self.num_threads(),
+            &progress,
+        )
     }
 }
 
@@ -644,8 +677,8 @@ mod tests {
         assert!(parse(&["-u", "--output-format", "bam", "SRR1"]).pairs_partly_aligned_spots());
         assert!(!parse(&["SRR1"]).pairs_partly_aligned_spots(), "no unaligned reads");
         assert!(!parse(&["-u", "--fastq", "SRR1"]).pairs_partly_aligned_spots(), "FASTQ");
-        let regions = parse(&["-u", "--aligned-region", "chr1", "SRR1"]);
-        assert!(!regions.pairs_partly_aligned_spots(), "--aligned-region");
+        // With --aligned-region, only mates of written aligned reads are written.
+        assert!(parse(&["-u", "--aligned-region", "chr1", "SRR1"]).pairs_partly_aligned_spots());
     }
 
     #[test]

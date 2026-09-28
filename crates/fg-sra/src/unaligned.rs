@@ -10,8 +10,6 @@
 //! aligned spot reaches into the reference, whose cache isn't thread-safe.
 //! Other tables are converted on one thread, through `READ`.
 
-use std::ops::RangeInclusive;
-
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fg_sra_vdb::cursor::{BlobColumn, VCursor};
@@ -141,6 +139,51 @@ fn setup_seq_cursor(db: &VDatabase) -> Result<(VCursor, SeqColumnIndices)> {
     Ok((cursor, indices))
 }
 
+/// Which of the SEQUENCE table's unaligned reads to write.
+#[derive(Clone, Copy, Debug)]
+pub enum Selection<'a> {
+    /// Every unaligned read; with `spots_only`, only those of spots none of whose reads is
+    /// aligned.
+    All { spots_only: bool },
+    /// Only the unaligned mates of these alignments, as `(SEQ_SPOT_ID, alignment id)` sorted
+    /// by spot: with `--aligned-region`, sam-dump writes only the mates of the alignments it
+    /// writes.
+    MatesOf(&'a [(i64, i64)]),
+}
+
+impl<'a> Selection<'a> {
+    /// Whether only spots with no aligned read are written.
+    fn spots_only(self) -> bool {
+        matches!(self, Self::All { spots_only: true })
+    }
+
+    /// The spots to visit, in order, of a table whose rows are `first..first + count`.
+    fn rows(self, first: i64, count: u64) -> Box<dyn Iterator<Item = i64> + Send + 'a> {
+        match self {
+            Self::All { .. } => Box::new(first..first + count as i64),
+            Self::MatesOf(mates) => Box::new(mates.chunk_by(|a, b| a.0 == b.0).map(|c| c[0].0)),
+        }
+    }
+
+    /// Keep in `emitted` only the reads of spot `row` that this selects: with
+    /// [`Selection::MatesOf`], those whose mate (see [`template_place`]) is a listed
+    /// alignment.
+    fn retain(self, row: i64, emitted: &mut Vec<usize>, template: &[usize], primary_ids: &[i64]) {
+        let Self::MatesOf(mates) = self else {
+            return;
+        };
+        let start = mates.partition_point(|&(spot, _)| spot < row);
+        let len = mates[start..].partition_point(|&(spot, _)| spot == row);
+        let listed = &mates[start..start + len];
+        emitted.retain(|&read| {
+            template_place(read, template).is_some_and(|place| {
+                let mate_id = primary_ids.get(place.mate).copied().unwrap_or(0);
+                listed.iter().any(|&(_, id)| id == mate_id)
+            })
+        });
+    }
+}
+
 /// Process unaligned reads from the SEQUENCE table, on up to `num_threads`
 /// threads when it stores `CMP_READ` (see the module docs).
 ///
@@ -155,19 +198,19 @@ pub fn process_unaligned_reads(
     db: &VDatabase,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
-    unaligned_spots_only: bool,
+    selection: Selection<'_>,
     mate_names: Option<MateNames>,
     num_threads: usize,
     progress: &ProgressLogger,
 ) -> Result<()> {
     let table = db.open_table_read("SEQUENCE").context("failed to open SEQUENCE table")?;
     // Only a read in a partly aligned spot has an aligned mate to look up.
-    let mates = if unaligned_spots_only { None } else { mate_names };
+    let mates = if selection.spots_only() { None } else { mate_names };
     if stores_cmp_read(&table)? {
         let batch = Batching { threads: num_threads, spots: BATCH_SPOTS };
-        process_in_parallel(db, &table, writer, opts, unaligned_spots_only, mates, batch, progress)
+        process_in_parallel(db, &table, writer, opts, selection, mates, batch, progress)
     } else {
-        process_serially(db, writer, opts, unaligned_spots_only, marks_rna(&table), mates, progress)
+        process_serially(db, writer, opts, selection, marks_rna(&table), mates, progress)
     }
 }
 
@@ -267,7 +310,7 @@ fn process_serially(
     db: &VDatabase,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
-    unaligned_spots_only: bool,
+    selection: Selection<'_>,
     rna: bool,
     mates: Option<MateNames>,
     progress: &ProgressLogger,
@@ -285,7 +328,7 @@ fn process_serially(
     let mut buf = Vec::with_capacity(512);
     let mut emit_indices = Vec::new();
 
-    for row_id in first_row..first_row + row_count as i64 {
+    for row_id in selection.rows(first_row, row_count) {
         let primary_ids = cursor.read_i64_slice(row_id, idx.primary_alignment_id)?;
         let read_types = cursor.read_u8_slice(row_id, idx.read_type)?;
         let read_starts = cursor.read_i32_slice(row_id, idx.read_start)?;
@@ -296,14 +339,14 @@ fn process_serially(
             &primary_ids,
             &read_types,
             &read_lens,
-            unaligned_spots_only,
+            selection.spots_only(),
             &mut emit_indices,
         );
+        template_reads(&read_types, &read_lens, &mut template);
+        selection.retain(row_id, &mut emit_indices, &template, &primary_ids);
         if emit_indices.is_empty() {
             continue;
         }
-
-        template_reads(&read_types, &read_lens, &mut template);
 
         // Read full spot data only when we have reads to emit.
         let full_read = cursor.read_str(row_id, idx.read)?;
@@ -345,7 +388,7 @@ fn process_serially(
 type BatchResult = Result<(Vec<u8>, u64)>;
 
 /// A batch of spots, and where to send its result.
-type Job = (RangeInclusive<i64>, Sender<BatchResult>);
+type Job = (Vec<i64>, Sender<BatchResult>);
 
 /// How [`process_in_parallel`] divides the work: worker threads, and spots per batch.
 #[derive(Clone, Copy)]
@@ -362,7 +405,7 @@ fn process_in_parallel(
     table: &VTable,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
-    unaligned_spots_only: bool,
+    selection: Selection<'_>,
     mates: Option<MateNames>,
     batching: Batching,
     progress: &ProgressLogger,
@@ -373,7 +416,6 @@ fn process_in_parallel(
         cursor.open().context("failed to open SEQUENCE cursor")?;
         cursor.id_range(read).context("failed to get SEQUENCE row range")?
     };
-    let last_row = first_row + row_count as i64 - 1;
     // Each worker's cursor is made here, on the table's thread, and moved to the worker.
     // Bases are rendered as `READ` renders them, with `U` for `T` in a table marked as RNA.
     let charset = if marks_rna(table) { CHARSET_4NA_RNA } else { CHARSET_4NA };
@@ -396,21 +438,23 @@ fn process_in_parallel(
             std::thread::Builder::new()
                 .stack_size(crate::archive::VDB_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    convert_batches(reader, &job_rx, opts, unaligned_spots_only);
+                    convert_batches(reader, &job_rx, opts, selection);
                 })
                 .context("failed to start an unaligned-read worker")?;
         }
         drop(job_rx);
+        let mut rows = selection.rows(first_row, row_count);
         scope.spawn(move || {
-            let mut start = first_row;
-            while start <= last_row {
-                let end = (start + batching.spots - 1).min(last_row);
-                let (done_tx, done_rx) = bounded(1);
-                // A closed channel means the writer stopped on an error.
-                if order_tx.send(done_rx).is_err() || job_tx.send((start..=end, done_tx)).is_err() {
+            loop {
+                let batch: Vec<i64> = rows.by_ref().take(batching.spots as usize).collect();
+                if batch.is_empty() {
                     return;
                 }
-                start = end + 1;
+                let (done_tx, done_rx) = bounded(1);
+                // A closed channel means the writer stopped on an error.
+                if order_tx.send(done_rx).is_err() || job_tx.send((batch, done_tx)).is_err() {
+                    return;
+                }
             }
         });
         // Returning (on an error) drops `order_rx`, which stops the dispatcher and so the
@@ -445,14 +489,14 @@ fn convert_batches(
     mut reader: SpotReader,
     jobs: &Receiver<Job>,
     opts: &FormatOptions<'_>,
-    unaligned_spots_only: bool,
+    selection: Selection<'_>,
 ) {
     for (spots, done) in jobs {
         let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut out = Vec::new();
             let mut records = 0u64;
             for row in spots {
-                records += reader.convert_spot(row, opts, unaligned_spots_only, &mut out)?;
+                records += reader.convert_spot(row, opts, selection, &mut out)?;
             }
             Ok((out, records))
         }));
@@ -545,7 +589,7 @@ impl SpotReader {
         &mut self,
         row: i64,
         opts: &FormatOptions<'_>,
-        unaligned_spots_only: bool,
+        selection: Selection<'_>,
         out: &mut Vec<u8>,
     ) -> Result<u64> {
         let Self {
@@ -575,9 +619,11 @@ impl SpotReader {
             &b.primary_ids,
             &b.read_types,
             &b.read_lens,
-            unaligned_spots_only,
+            selection.spots_only(),
             &mut b.emitted,
         );
+        template_reads(&b.read_types, &b.read_lens, &mut b.template);
+        selection.retain(row, &mut b.emitted, &b.template, &b.primary_ids);
         if b.emitted.is_empty() {
             return Ok(0);
         }
@@ -595,7 +641,6 @@ impl SpotReader {
         unaligned_read_offsets(&b.primary_ids, &b.read_starts, &b.read_lens, bases.len(), offsets)
             .with_context(|| format!("SEQUENCE row {row}"))?;
 
-        template_reads(&b.read_types, &b.read_lens, &mut b.template);
         for &i in &b.emitted {
             let len = b.read_lens[i] as usize;
             let start = b.read_starts.get(i).copied().unwrap_or(0) as usize;
@@ -787,6 +832,33 @@ mod tests {
         assert!(pairing.is_none());
     }
 
+    #[test]
+    fn test_selection_visits_listed_spots_once_each() {
+        let mates = [(3, 10), (3, 11), (7, 12)];
+        let rows: Vec<i64> = Selection::MatesOf(&mates).rows(1, 9).collect();
+        assert_eq!(rows, [3, 7]);
+        let rows: Vec<i64> = Selection::All { spots_only: false }.rows(1, 3).collect();
+        assert_eq!(rows, [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_selection_keeps_only_mates_of_listed_alignments() {
+        let bio = READ_TYPE_BIOLOGICAL;
+        let mut template = Vec::new();
+        // Spot 5: read 0 unaligned, its mate read 1 aligned as alignment 42.
+        template_reads(&[bio, bio], &[3, 3], &mut template);
+        let (primary_ids, mut emitted) = ([0, 42], vec![0]);
+        Selection::MatesOf(&[(5, 42)]).retain(5, &mut emitted, &template, &primary_ids);
+        assert_eq!(emitted, [0]);
+        // Alignment 42 isn't listed (not written): its mate isn't either.
+        Selection::MatesOf(&[(5, 43)]).retain(5, &mut emitted, &template, &primary_ids);
+        assert!(emitted.is_empty());
+        // Every read is kept without a list.
+        let mut emitted = vec![0];
+        Selection::All { spots_only: false }.retain(5, &mut emitted, &template, &primary_ids);
+        assert_eq!(emitted, [0]);
+    }
+
     /// Record-formatting options for SAM output.
     fn sam_options() -> FormatOptions<'static> {
         FormatOptions {
@@ -837,13 +909,28 @@ mod tests {
         [false, true].map(|spots_only| {
             let mates = if spots_only { None } else { Some(MateNames::RefName) };
             let serial = convert_archive(archive, "serial", |db, writer, opts| {
-                process_serially(db, writer, opts, spots_only, false, mates, &progress)
+                process_serially(
+                    db,
+                    writer,
+                    opts,
+                    Selection::All { spots_only },
+                    false,
+                    mates,
+                    &progress,
+                )
             });
             let parallel = convert_archive(archive, "parallel", |db, writer, opts| {
                 let table = db.open_table_read("SEQUENCE")?;
                 assert!(stores_cmp_read(&table)?, "the archive stores CMP_READ");
                 process_in_parallel(
-                    db, &table, writer, opts, spots_only, mates, batching, &progress,
+                    db,
+                    &table,
+                    writer,
+                    opts,
+                    Selection::All { spots_only },
+                    mates,
+                    batching,
+                    &progress,
                 )
             });
             (serial, parallel)
