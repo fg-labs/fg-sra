@@ -21,7 +21,8 @@ use crate::archive::marks_rna;
 use crate::output::OutputWriter;
 use crate::progress::ProgressLogger;
 use crate::record::{
-    FormatOptions, READ_TYPE_BIOLOGICAL, UnalignedColumns, format_unaligned_record,
+    FormatOptions, READ_TYPE_BIOLOGICAL, UnalignedColumns, UnalignedPairing,
+    format_unaligned_record,
 };
 use crate::refstore::{CHARSET_4NA, CHARSET_4NA_RNA};
 
@@ -46,6 +47,62 @@ mod col {
     pub const PRIMARY_ALIGNMENT_ID: &str = "PRIMARY_ALIGNMENT_ID";
     /// The unaligned reads' bases, end to end, as 4na codes.
     pub const CMP_READ_4NA: &str = "(INSDC:4na:bin)CMP_READ";
+}
+
+/// VDB column names for the `PRIMARY_ALIGNMENT` table, where an unaligned read's aligned
+/// mate is looked up.
+mod mate_col {
+    pub const REF_NAME: &str = "(ascii)REF_NAME";
+    pub const REF_SEQ_ID: &str = "(ascii)REF_SEQ_ID";
+    pub const REF_POS: &str = "(INSDC:coord:zero)REF_POS";
+}
+
+/// How an unaligned read's aligned mate's reference is named in RNEXT: as aligned records
+/// name it, by `REF_NAME`, or by `REF_SEQ_ID` with `--seqid`.
+#[derive(Clone, Copy, Debug)]
+pub enum MateNames {
+    RefName,
+    RefSeqId,
+}
+
+/// Looks up where an unaligned read's aligned mate is: its reference (named as aligned
+/// records name it) and 1-based position, which the read's RNEXT and PNEXT give.
+struct MateLocator {
+    cursor: VCursor,
+    ref_name: u32,
+    ref_pos: u32,
+    name: String,
+}
+
+impl MateLocator {
+    /// A locator on `db`'s `PRIMARY_ALIGNMENT` table, naming references as `names` says;
+    /// `None` if the database has no alignments.
+    fn open(db: &VDatabase, names: MateNames) -> Result<Option<Self>> {
+        if !db.has_table("PRIMARY_ALIGNMENT") {
+            return Ok(None);
+        }
+        let table = db
+            .open_table_read("PRIMARY_ALIGNMENT")
+            .context("failed to open PRIMARY_ALIGNMENT table")?;
+        let cursor =
+            table.create_cursor_read().context("failed to create PRIMARY_ALIGNMENT cursor")?;
+        let name_column = match names {
+            MateNames::RefName => mate_col::REF_NAME,
+            MateNames::RefSeqId => mate_col::REF_SEQ_ID,
+        };
+        let ref_name = cursor.add_column(name_column).context(name_column)?;
+        let ref_pos = cursor.add_column(mate_col::REF_POS).context(mate_col::REF_POS)?;
+        cursor.open().context("failed to open PRIMARY_ALIGNMENT cursor")?;
+        Ok(Some(Self { cursor, ref_name, ref_pos, name: String::new() }))
+    }
+
+    /// The reference name and 1-based position of alignment `align_id`.
+    fn locate(&mut self, align_id: i64) -> Result<(&str, u32)> {
+        let context = || format!("PRIMARY_ALIGNMENT row {align_id}");
+        self.cursor.read_str_into(align_id, self.ref_name, &mut self.name).with_context(context)?;
+        let pos = self.cursor.read_coord_zero(align_id, self.ref_pos).with_context(context)?;
+        Ok((&self.name, u32::try_from(pos).with_context(context)? + 1))
+    }
 }
 
 /// Column indices for the SEQUENCE table cursor.
@@ -91,20 +148,26 @@ fn setup_seq_cursor(db: &VDatabase) -> Result<(VCursor, SeqColumnIndices)> {
 /// - Biological (`READ_TYPE` has biological bit set)
 /// - Unaligned (`PRIMARY_ALIGNMENT_ID` == 0 for that read)
 /// - Non-empty (`READ_LEN` > 0)
+///
+/// A read whose mate is aligned gives the mate's reference, named as `mate_names` says,
+/// and position as its RNEXT and PNEXT; with no `mate_names`, it is written as unpaired.
 pub fn process_unaligned_reads(
     db: &VDatabase,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
     unaligned_spots_only: bool,
+    mate_names: Option<MateNames>,
     num_threads: usize,
     progress: &ProgressLogger,
 ) -> Result<()> {
     let table = db.open_table_read("SEQUENCE").context("failed to open SEQUENCE table")?;
+    // Only a read in a partly aligned spot has an aligned mate to look up.
+    let mates = if unaligned_spots_only { None } else { mate_names };
     if stores_cmp_read(&table)? {
         let batch = Batching { threads: num_threads, spots: BATCH_SPOTS };
-        process_in_parallel(&table, writer, opts, unaligned_spots_only, batch, progress)
+        process_in_parallel(db, &table, writer, opts, unaligned_spots_only, mates, batch, progress)
     } else {
-        process_serially(db, writer, opts, unaligned_spots_only, marks_rna(&table), progress)
+        process_serially(db, writer, opts, unaligned_spots_only, marks_rna(&table), mates, progress)
     }
 }
 
@@ -135,17 +198,86 @@ fn reads_to_emit(
     }));
 }
 
+/// The spot's reads that make up its template: biological and non-empty, aligned or not.
+/// An unaligned read's pairing flags come from its place among them.
+fn template_reads(read_types: &[u8], read_lens: &[u32], template: &mut Vec<usize>) {
+    template.clear();
+    template.extend((0..read_types.len()).filter(|&i| {
+        read_types[i] & READ_TYPE_BIOLOGICAL != 0 && read_lens.get(i).copied().unwrap_or(0) != 0
+    }));
+}
+
+/// A read's place in its spot's template.
+#[derive(Debug, PartialEq, Eq)]
+struct TemplatePlace {
+    first: bool,
+    last: bool,
+    /// The index of the read's mate in the spot.
+    mate: usize,
+}
+
+/// Where read `read` is in `template` (see [`template_reads`]), or `None` if it is not in
+/// it (a technical or empty read) or is the only read there. Its mate is the next read,
+/// or the one before for the last. sam-dump picks mates the same way but over all of a
+/// spot's reads, so the two differ only on spots with technical or empty reads.
+fn template_place(read: usize, template: &[usize]) -> Option<TemplatePlace> {
+    let place = template.iter().position(|&i| i == read)?;
+    if template.len() < 2 {
+        return None;
+    }
+    let last = place == template.len() - 1;
+    let mate = if last { template[place - 1] } else { template[place + 1] };
+    Some(TemplatePlace { first: place == 0, last, mate })
+}
+
+/// The pairing of unaligned read `read`, from its [`template_place`]. An aligned mate is
+/// found with `mates`; without them (no lookups: FASTA/FASTQ, which have no pairing, or
+/// `--aligned-region`), a read whose mate is aligned is written as unpaired.
+fn pairing_of<'a>(
+    read: usize,
+    template: &[usize],
+    primary_ids: &[i64],
+    read_types: &[u8],
+    mates: Option<&'a mut MateLocator>,
+) -> Result<Option<UnalignedPairing<'a>>> {
+    let Some(TemplatePlace { first, last, mate }) = template_place(read, template) else {
+        return Ok(None);
+    };
+    let mate_id = primary_ids.get(mate).copied().unwrap_or(0);
+    let mate_alignment = if mate_id > 0 {
+        let Some(mates) = mates else {
+            return Ok(None);
+        };
+        Some(mates.locate(mate_id)?)
+    } else {
+        None
+    };
+    Ok(Some(UnalignedPairing {
+        first,
+        last,
+        mate_read_type: read_types.get(mate).copied().unwrap_or(0),
+        mate_alignment,
+    }))
+}
+
 /// Convert unaligned reads on one thread, reading bases through `READ`, which has `U` for
-/// `T` if the table is marked as `rna`.
+/// `T` if the table is marked as `rna`. Aligned mates are looked up, named as `mates` says,
+/// when it is `Some`.
 fn process_serially(
     db: &VDatabase,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
     unaligned_spots_only: bool,
     rna: bool,
+    mates: Option<MateNames>,
     progress: &ProgressLogger,
 ) -> Result<()> {
     let (cursor, idx) = setup_seq_cursor(db)?;
+    let mut mates = match mates {
+        Some(names) => MateLocator::open(db, names)?,
+        None => None,
+    };
+    let mut template = Vec::new();
 
     let (first_row, row_count) =
         cursor.id_range(idx.read).context("failed to get SEQUENCE row range")?;
@@ -171,7 +303,7 @@ fn process_serially(
             continue;
         }
 
-        let num_bio_reads = emit_indices.len() as u32;
+        template_reads(&read_types, &read_lens, &mut template);
 
         // Read full spot data only when we have reads to emit.
         let full_read = cursor.read_str(row_id, idx.read)?;
@@ -179,7 +311,7 @@ fn process_serially(
         let name = cursor.read_str(row_id, idx.name)?;
         let spot_group = cursor.read_str(row_id, idx.spot_group)?;
 
-        for (bio_index, &i) in emit_indices.iter().enumerate() {
+        for &i in &emit_indices {
             let read_start = read_starts.get(i).copied().unwrap_or(0) as usize;
             let read_len = read_lens.get(i).copied().unwrap_or(0) as usize;
             let read_end = read_start + read_len;
@@ -194,9 +326,9 @@ fn process_serially(
                 spot_group: &spot_group,
                 read_type: read_types.get(i).copied().unwrap_or(0),
                 read_filter: read_filters.get(i).copied().unwrap_or(0),
-                num_bio_reads,
-                bio_read_index: bio_index as u32,
                 rna,
+                pairing: pairing_of(i, &template, &primary_ids, &read_types, mates.as_mut())
+                    .with_context(|| format!("SEQUENCE row {row_id}"))?,
             };
 
             format_unaligned_record(&mut buf, &cols, opts);
@@ -223,11 +355,15 @@ struct Batching {
 }
 
 /// Convert unaligned reads on worker threads, in batches of spots written in spot order.
+/// Aligned mates are looked up in `db` as in [`process_serially`].
+#[allow(clippy::too_many_arguments)]
 fn process_in_parallel(
+    db: &VDatabase,
     table: &VTable,
     writer: &mut OutputWriter,
     opts: &FormatOptions<'_>,
     unaligned_spots_only: bool,
+    mates: Option<MateNames>,
     batching: Batching,
     progress: &ProgressLogger,
 ) -> Result<()> {
@@ -242,7 +378,13 @@ fn process_in_parallel(
     // Bases are rendered as `READ` renders them, with `U` for `T` in a table marked as RNA.
     let charset = if marks_rna(table) { CHARSET_4NA_RNA } else { CHARSET_4NA };
     let readers = (0..batching.threads.max(1))
-        .map(|_| SpotReader::new(table, charset))
+        .map(|_| {
+            let mates = match mates {
+                Some(names) => MateLocator::open(db, names)?,
+                None => None,
+            };
+            SpotReader::new(table, charset, mates)
+        })
         .collect::<Result<Vec<_>>>()?;
     let num_threads = readers.len();
 
@@ -342,6 +484,8 @@ struct SpotReader {
     charset: &'static [u8; 16],
     /// Whether `charset` is [`CHARSET_4NA_RNA`].
     rna: bool,
+    /// Where aligned mates are, if they are looked up.
+    mates: Option<MateLocator>,
     buffers: SpotBuffers,
 }
 
@@ -360,6 +504,8 @@ struct SpotBuffers {
     primary_ids: Vec<i64>,
     /// Indices of the reads to write.
     emitted: Vec<usize>,
+    /// Indices of the reads in the template (see [`template_reads`]).
+    template: Vec<usize>,
     /// Where each read's bases start in `cmp_text`.
     offsets: Vec<usize>,
     record: Vec<u8>,
@@ -367,8 +513,8 @@ struct SpotBuffers {
 
 impl SpotReader {
     /// A reader with its own (uncached, as blob reads require) cursor on `table`, rendering
-    /// bases with `charset`.
-    fn new(table: &VTable, charset: &'static [u8; 16]) -> Result<Self> {
+    /// bases with `charset` and looking up aligned mates with `mates`.
+    fn new(table: &VTable, charset: &'static [u8; 16], mates: Option<MateLocator>) -> Result<Self> {
         let cursor = table.create_cursor_read().context("failed to create SEQUENCE cursor")?;
         let add = |name: &str| {
             cursor.add_column(name).map(BlobColumn::new).with_context(|| name.to_string())
@@ -385,6 +531,7 @@ impl SpotReader {
             primary_alignment_id: add(col::PRIMARY_ALIGNMENT_ID)?,
             charset,
             rna: charset == CHARSET_4NA_RNA,
+            mates,
             buffers: SpotBuffers::default(),
             cursor,
         };
@@ -414,6 +561,7 @@ impl SpotReader {
             primary_alignment_id,
             charset,
             rna,
+            mates,
             buffers: b,
         } = self;
         let cursor = &*cursor;
@@ -447,8 +595,8 @@ impl SpotReader {
         unaligned_read_offsets(&b.primary_ids, &b.read_starts, &b.read_lens, bases.len(), offsets)
             .with_context(|| format!("SEQUENCE row {row}"))?;
 
-        let num_bio_reads = b.emitted.len() as u32;
-        for (bio_index, &i) in b.emitted.iter().enumerate() {
+        template_reads(&b.read_types, &b.read_lens, &mut b.template);
+        for &i in &b.emitted {
             let len = b.read_lens[i] as usize;
             let start = b.read_starts.get(i).copied().unwrap_or(0) as usize;
             let cols = UnalignedColumns {
@@ -458,14 +606,14 @@ impl SpotReader {
                 spot_group: &group,
                 read_type: b.read_types.get(i).copied().unwrap_or(0),
                 read_filter: b.read_filters.get(i).copied().unwrap_or(0),
-                num_bio_reads,
-                bio_read_index: bio_index as u32,
                 rna: *rna,
+                pairing: pairing_of(i, &b.template, &b.primary_ids, &b.read_types, mates.as_mut())
+                    .with_context(|| format!("SEQUENCE row {row}"))?,
             };
             format_unaligned_record(&mut b.record, &cols, opts);
             out.extend_from_slice(&b.record);
         }
-        Ok(u64::from(num_bio_reads))
+        Ok(b.emitted.len() as u64)
     }
 }
 
@@ -575,6 +723,70 @@ mod tests {
         assert_eq!(emitted, [0, 1]);
     }
 
+    /// The [`template_place`] of each read of a spot with `read_types` and `read_lens`.
+    fn places(read_types: &[u8], read_lens: &[u32]) -> Vec<Option<TemplatePlace>> {
+        let mut template = vec![99]; // Cleared first.
+        template_reads(read_types, read_lens, &mut template);
+        (0..read_types.len()).map(|read| template_place(read, &template)).collect()
+    }
+
+    /// A read's place: whether first and last, and its mate, as [`template_place`] gives it.
+    #[allow(clippy::unnecessary_wraps)]
+    fn place(first: bool, last: bool, mate: usize) -> Option<TemplatePlace> {
+        Some(TemplatePlace { first, last, mate })
+    }
+
+    #[test]
+    fn test_template_place_of_a_pair() {
+        let bio = READ_TYPE_BIOLOGICAL;
+        // Each mate is the other's, whether aligned or not.
+        assert_eq!(places(&[bio, bio], &[3, 3]), [place(true, false, 1), place(false, true, 0)]);
+        // A single read, or a pair with an empty mate, is unpaired.
+        assert_eq!(places(&[bio], &[3]), [None]);
+        assert_eq!(places(&[bio, bio], &[3, 0]), [None, None]);
+    }
+
+    #[test]
+    fn test_template_place_skips_technical_reads() {
+        let bio = READ_TYPE_BIOLOGICAL;
+        // A technical read (a barcode, say) is not in the template, and has no place.
+        assert_eq!(
+            places(&[0, bio, bio], &[8, 3, 3]),
+            [None, place(true, false, 2), place(false, true, 1)]
+        );
+    }
+
+    #[test]
+    fn test_template_place_of_three_reads() {
+        let bio = READ_TYPE_BIOLOGICAL;
+        // The middle read's mate is the next one; the last's is the one before.
+        assert_eq!(
+            places(&[bio, bio, bio], &[3, 3, 3]),
+            [place(true, false, 1), place(false, false, 2), place(false, true, 1)]
+        );
+    }
+
+    #[test]
+    fn test_pairing_of_unaligned_mates() {
+        let (fwd, rev) = (READ_TYPE_BIOLOGICAL | 2, READ_TYPE_BIOLOGICAL | 4);
+        let (template, ids, types) = ([0, 1], [0, 0], [fwd, rev]);
+        // Each read's mate is the other, with the other's READ_TYPE, and unaligned.
+        let first = pairing_of(0, &template, &ids, &types, None).unwrap().unwrap();
+        assert_eq!((first.first, first.last, first.mate_read_type), (true, false, rev));
+        assert_eq!(first.mate_alignment, None);
+        let last = pairing_of(1, &template, &ids, &types, None).unwrap().unwrap();
+        assert_eq!((last.first, last.last, last.mate_read_type), (false, true, fwd));
+        assert_eq!(last.mate_alignment, None);
+    }
+
+    #[test]
+    fn test_pairing_of_a_read_whose_mate_is_not_looked_up() {
+        let bio = READ_TYPE_BIOLOGICAL;
+        // Read 1 is aligned: without lookups, read 0 is written as unpaired.
+        let pairing = pairing_of(0, &[0, 1], &[0, 7], &[bio, bio], None).unwrap();
+        assert!(pairing.is_none());
+    }
+
     /// Record-formatting options for SAM output.
     fn sam_options() -> FormatOptions<'static> {
         FormatOptions {
@@ -586,6 +798,7 @@ mod tests {
             qual_quant: None,
             output_mode: crate::record::OutputMode::Sam,
             ref_name_to_id: None,
+            pair_with_unaligned_mates: false,
         }
     }
 
@@ -622,13 +835,16 @@ mod tests {
     fn serial_and_parallel(archive: &str, batching: Batching) -> [(Vec<u8>, Vec<u8>); 2] {
         let progress = ProgressLogger::new(0, 0);
         [false, true].map(|spots_only| {
+            let mates = if spots_only { None } else { Some(MateNames::RefName) };
             let serial = convert_archive(archive, "serial", |db, writer, opts| {
-                process_serially(db, writer, opts, spots_only, false, &progress)
+                process_serially(db, writer, opts, spots_only, false, mates, &progress)
             });
             let parallel = convert_archive(archive, "parallel", |db, writer, opts| {
                 let table = db.open_table_read("SEQUENCE")?;
                 assert!(stores_cmp_read(&table)?, "the archive stores CMP_READ");
-                process_in_parallel(&table, writer, opts, spots_only, batching, &progress)
+                process_in_parallel(
+                    db, &table, writer, opts, spots_only, mates, batching, &progress,
+                )
             });
             (serial, parallel)
         })

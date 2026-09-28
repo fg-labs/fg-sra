@@ -107,13 +107,25 @@ impl AlignedColumns {
         self.ref_offset.clear();
     }
 
-    /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`).
+    /// Strip paired-end flags when the mate has no alignment (`mate_align_id == 0`) and
+    /// is not written (no `-u`).
     ///
-    /// Matches sam-dump behavior: reads without a mate alignment are output as
-    /// unpaired by clearing PAIRED, `PROPER_PAIR`, `MATE_UNMAPPED`, `MATE_REVERSE`,
-    /// `FIRST_IN_PAIR`, and `LAST_IN_PAIR` flag bits.
+    /// Such reads are output as unpaired, as sam-dump outputs them, by clearing PAIRED,
+    /// `PROPER_PAIR`, `MATE_UNMAPPED`, `MATE_REVERSE`, `FIRST_IN_PAIR`, and
+    /// `LAST_IN_PAIR` flag bits (sam-dump clears only PAIRED, `MATE_UNMAPPED`,
+    /// `FIRST_IN_PAIR` and `LAST_IN_PAIR`, and only when PAIRED and `MATE_UNMAPPED` are
+    /// set).
     pub fn strip_paired_flags(&mut self) {
         self.sam_flags &= !sam_flags::PAIRED_MASK;
+    }
+
+    /// Set the flags of a read whose mate has no alignment: it keeps its stored pairing
+    /// flags if `mate_written` (`-u`, as sam-dump does), and is otherwise written as
+    /// unpaired (see [`Self::strip_paired_flags`]).
+    pub fn pair_with_unaligned_mate(&mut self, mate_written: bool) {
+        if !mate_written {
+            self.strip_paired_flags();
+        }
     }
 }
 
@@ -134,13 +146,25 @@ pub struct UnalignedColumns<'a> {
     pub read_type: u8,
     /// Read filter value (`READ_FILTER`).
     pub read_filter: u8,
-    /// Number of biological reads in the spot (for paired-end flag logic).
-    pub num_bio_reads: u32,
-    /// Which biological read this is (0 = first, 1 = second, etc.).
-    pub bio_read_index: u32,
     /// Whether the read's table is marked as RNA (its bases have `U` for `T`), which its
     /// reverse complement pairs with `A`.
     pub rna: bool,
+    /// The read's place in its spot's template, or `None` if the spot has no other read.
+    pub pairing: Option<UnalignedPairing<'a>>,
+}
+
+/// An unaligned read's place in its spot's template, which sets its pairing flags, RNEXT
+/// and PNEXT as sam-dump does.
+pub struct UnalignedPairing<'a> {
+    /// Whether the read is the template's first (0x40).
+    pub first: bool,
+    /// Whether the read is the template's last (0x80).
+    pub last: bool,
+    /// The mate's `READ_TYPE`: its REVERSE bit sets 0x20, with or without `--reverse`.
+    pub mate_read_type: u8,
+    /// The mate's reference name and 1-based position, if it is aligned; if it is not,
+    /// 0x8 is set and RNEXT/PNEXT are `*`/0.
+    pub mate_alignment: Option<(&'a str, u32)>,
 }
 
 /// Read filter constants (from `INSDC:SRA:read_filter`).
@@ -210,6 +234,10 @@ pub struct FormatOptions<'a> {
     pub output_mode: OutputMode,
     /// Reference name → BAM reference ID map. Required for BAM output.
     pub ref_name_to_id: Option<&'a HashMap<String, i32>>,
+    /// Whether unaligned reads are written too (`-u`). An aligned read whose mate is
+    /// unaligned then keeps its pairing flags, as in sam-dump; otherwise it is written as
+    /// unpaired.
+    pub pair_with_unaligned_mates: bool,
 }
 
 /// Format a record for an aligned read, dispatching by output mode.
@@ -441,6 +469,31 @@ fn reverses_unaligned_read(cols: &UnalignedColumns<'_>, opts: &FormatOptions<'_>
     opts.reverse_unaligned && (cols.read_type & READ_TYPE_REVERSE) != 0
 }
 
+/// FLAG of an unaligned read, as sam-dump's `calculate_unaligned_sam_flags_db` sets it.
+fn unaligned_flags(cols: &UnalignedColumns<'_>, reverse: bool) -> u32 {
+    let mut flags: u32 = sam_flags::UNMAPPED;
+    if reverse {
+        flags |= sam_flags::REVERSE;
+    }
+    flags = apply_read_filter(flags, Some(cols.read_filter));
+    if let Some(pairing) = &cols.pairing {
+        flags |= sam_flags::PAIRED;
+        if pairing.mate_alignment.is_none() {
+            flags |= sam_flags::MATE_UNMAPPED;
+        }
+        if pairing.mate_read_type & READ_TYPE_REVERSE != 0 {
+            flags |= sam_flags::MATE_REVERSE;
+        }
+        if pairing.first {
+            flags |= sam_flags::FIRST_IN_PAIR;
+        }
+        if pairing.last {
+            flags |= sam_flags::LAST_IN_PAIR;
+        }
+    }
+    flags
+}
+
 /// Format a SAM line for an unaligned record.
 fn format_unaligned_record_sam(
     buf: &mut Vec<u8>,
@@ -454,23 +507,8 @@ fn format_unaligned_record_sam(
     write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
 
     // FLAG
-    let mut flags: u32 = sam_flags::UNMAPPED;
-    if reverse {
-        flags |= sam_flags::REVERSE;
-    }
-    flags = apply_read_filter(flags, Some(cols.read_filter));
-    // Paired-end flags.
-    if cols.num_bio_reads > 1 {
-        flags |= sam_flags::PAIRED | sam_flags::MATE_UNMAPPED;
-        if cols.bio_read_index == 0 {
-            flags |= sam_flags::FIRST_IN_PAIR;
-        }
-        if cols.bio_read_index == cols.num_bio_reads - 1 {
-            flags |= sam_flags::LAST_IN_PAIR;
-        }
-    }
     buf.push(b'\t');
-    write_u32(buf, flags);
+    write_u32(buf, unaligned_flags(cols, reverse));
 
     // RNAME = *
     buf.extend_from_slice(b"\t*");
@@ -484,11 +522,15 @@ fn format_unaligned_record_sam(
     // CIGAR = *
     buf.extend_from_slice(b"\t*");
 
-    // RNEXT = *
-    buf.extend_from_slice(b"\t*");
-
-    // PNEXT = 0
-    buf.extend_from_slice(b"\t0");
+    // RNEXT, PNEXT: the mate's alignment, if it has one.
+    if let Some((mate_ref, mate_pos)) = cols.pairing.as_ref().and_then(|p| p.mate_alignment) {
+        buf.push(b'\t');
+        buf.extend_from_slice(mate_ref.as_bytes());
+        buf.push(b'\t');
+        write_u32(buf, mate_pos);
+    } else {
+        buf.extend_from_slice(b"\t*\t0");
+    }
 
     // TLEN = 0
     buf.extend_from_slice(b"\t0");
@@ -728,21 +770,18 @@ fn format_unaligned_record_bam(
 ) {
     buf.clear();
     let reverse = reverses_unaligned_read(cols, opts);
-
-    let mut flags: u32 = sam_flags::UNMAPPED;
-    if reverse {
-        flags |= sam_flags::REVERSE;
-    }
-    flags = apply_read_filter(flags, Some(cols.read_filter));
-    if cols.num_bio_reads > 1 {
-        flags |= sam_flags::PAIRED | sam_flags::MATE_UNMAPPED;
-        if cols.bio_read_index == 0 {
-            flags |= sam_flags::FIRST_IN_PAIR;
-        }
-        if cols.bio_read_index == cols.num_bio_reads - 1 {
-            flags |= sam_flags::LAST_IN_PAIR;
-        }
-    }
+    let flags = unaligned_flags(cols, reverse);
+    // The mate's alignment, if it has one: its BAM reference ID and 0-based position.
+    // Both are -1 if the mate is unaligned or its reference has no ID, as for aligned reads.
+    let (mate_ref_id, mate_pos) = cols
+        .pairing
+        .as_ref()
+        .and_then(|p| p.mate_alignment)
+        .and_then(|(mate_ref, mate_pos)| {
+            let mate_ref_id = opts.ref_name_to_id?.get(mate_ref).copied()?;
+            Some((mate_ref_id, mate_pos as i32 - 1))
+        })
+        .unwrap_or((-1, -1));
 
     // Build QNAME (null-terminated).
     let mut qname_buf = Vec::with_capacity(64);
@@ -773,8 +812,8 @@ fn format_unaligned_record_bam(
     buf.extend_from_slice(&0u16.to_le_bytes()); // n_cigar_op = 0
     buf.extend_from_slice(&(flags as u16).to_le_bytes());
     buf.extend_from_slice(&l_seq.to_le_bytes());
-    buf.extend_from_slice(&(-1i32).to_le_bytes()); // mate refID = -1
-    buf.extend_from_slice(&(-1i32).to_le_bytes()); // mate pos = -1
+    buf.extend_from_slice(&mate_ref_id.to_le_bytes());
+    buf.extend_from_slice(&mate_pos.to_le_bytes());
     buf.extend_from_slice(&0i32.to_le_bytes()); // tlen = 0
 
     // Variable-length fields.
@@ -1023,6 +1062,7 @@ mod tests {
             qual_quant: None,
             output_mode: OutputMode::Sam,
             ref_name_to_id: None,
+            pair_with_unaligned_mates: false,
         }
     }
 
@@ -1144,9 +1184,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = default_opts();
         let mut buf = Vec::new();
@@ -1163,31 +1202,78 @@ mod tests {
         assert_eq!(fields[10], "????");
     }
 
-    #[test]
-    fn test_unaligned_record_paired() {
+    /// SAM fields of an unaligned read in a two-read spot, whose mate has `mate_read_type`
+    /// and is aligned at `mate_alignment`, if given.
+    fn paired_unaligned_fields(
+        first: bool,
+        mate_read_type: u8,
+        mate_alignment: Option<(&str, u32)>,
+    ) -> Vec<String> {
         let cols = UnalignedColumns {
-            name: "spot1",
-            read: "ACGT",
-            quality: &[30, 30, 30, 30],
-            spot_group: "",
-            read_type: READ_TYPE_BIOLOGICAL,
-            read_filter: READ_FILTER_PASS,
-            num_bio_reads: 2,
-            bio_read_index: 0,
-            rna: false,
+            pairing: Some(UnalignedPairing { first, last: !first, mate_read_type, mate_alignment }),
+            ..oriented_unaligned_cols(READ_TYPE_BIOLOGICAL)
         };
-        let opts = default_opts();
+        let mut buf = Vec::new();
+        format_unaligned_record(&mut buf, &cols, &default_opts());
+        String::from_utf8(buf).unwrap().trim_end().split('\t').map(str::to_string).collect()
+    }
+
+    // Flags as sam-dump writes them, e.g. 77/141 for a pair with neither mate aligned and
+    // 69/133 (or 101/165 with the mate REVERSE) for a mate of an aligned read.
+    #[rstest]
+    #[case::neither_aligned_first(true, 3, None, 77)]
+    #[case::neither_aligned_last(false, 3, None, 141)]
+    #[case::mate_typed_reverse(true, 5, None, 109)]
+    #[case::mate_aligned_first(true, 3, Some(("chr2", 501)), 69)]
+    #[case::mate_aligned_last(false, 3, Some(("chr2", 501)), 133)]
+    #[case::mate_aligned_reverse(true, 5, Some(("chr2", 501)), 101)]
+    fn test_unaligned_record_paired(
+        #[case] first: bool,
+        #[case] mate_read_type: u8,
+        #[case] mate_alignment: Option<(&str, u32)>,
+        #[case] expected_flags: u32,
+    ) {
+        let fields = paired_unaligned_fields(first, mate_read_type, mate_alignment);
+        assert_eq!(fields[1], expected_flags.to_string(), "FLAG");
+        let (rnext, pnext) = mate_alignment
+            .map_or(("*".to_string(), "0".to_string()), |a| (a.0.to_string(), a.1.to_string()));
+        assert_eq!((&fields[6], &fields[7]), (&rnext, &pnext), "RNEXT, PNEXT");
+    }
+
+    // An aligned mate's reference ID and position, both -1 if the reference has no ID.
+    #[rstest]
+    #[case::reference_with_id("chr2", 1, 500)]
+    #[case::reference_without_id("chrUn", -1, -1)]
+    fn test_unaligned_record_bam_mate(
+        #[case] mate_ref: &str,
+        #[case] expected_ref_id: i32,
+        #[case] expected_pos: i32,
+    ) {
+        let mut ref_ids = HashMap::new();
+        ref_ids.insert("chr2".to_string(), 1);
+        let cols = UnalignedColumns {
+            pairing: Some(UnalignedPairing {
+                first: false,
+                last: true,
+                mate_read_type: 5,
+                mate_alignment: Some((mate_ref, 501)),
+            }),
+            ..oriented_unaligned_cols(READ_TYPE_BIOLOGICAL)
+        };
+        let opts = FormatOptions {
+            output_mode: OutputMode::Bam,
+            ref_name_to_id: Some(&ref_ids),
+            ..default_opts()
+        };
         let mut buf = Vec::new();
 
-        format_unaligned_record(&mut buf, &cols, &opts);
+        format_unaligned_record_bam(&mut buf, &cols, &opts);
 
-        let line = String::from_utf8(buf).unwrap();
-        let fields: Vec<&str> = line.trim_end().split('\t').collect();
-        let flags: u32 = fields[1].parse().unwrap();
-        assert!(flags & sam_flags::PAIRED != 0, "paired flag");
-        assert!(flags & sam_flags::UNMAPPED != 0, "unmapped flag");
-        assert!(flags & sam_flags::MATE_UNMAPPED != 0, "mate unmapped flag");
-        assert!(flags & sam_flags::FIRST_IN_PAIR != 0, "first in pair flag");
+        let flags = u16::from_le_bytes(buf[18..20].try_into().unwrap());
+        assert_eq!(flags, 165);
+        let mate_ref_id = i32::from_le_bytes(buf[24..28].try_into().unwrap());
+        let mate_pos = i32::from_le_bytes(buf[28..32].try_into().unwrap());
+        assert_eq!((mate_ref_id, mate_pos), (expected_ref_id, expected_pos));
     }
 
     /// An unaligned read that is not its own reverse complement, with the given
@@ -1200,9 +1286,8 @@ mod tests {
             spot_group: "",
             read_type,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         }
     }
 
@@ -1301,6 +1386,18 @@ mod tests {
 
         let qual_start = 36 + buf[12] as usize + 4_usize.div_ceil(2);
         assert_eq!(&buf[qual_start..qual_start + 4], &[40, 30, 20, 10]);
+    }
+
+    // A read whose mate is unaligned, e.g. sam-dump's 153 (paired, 0x8, reverse, last),
+    // keeps its flags if the mate is written (`-u`), and is otherwise unpaired (16).
+    #[rstest]
+    #[case::mate_written(true, 153)]
+    #[case::mate_not_written(false, 16)]
+    fn test_pair_with_unaligned_mate(#[case] mate_written: bool, #[case] expected: u32) {
+        let mut cols =
+            AlignedColumns { sam_flags: 153, mate_align_id: 0, ..default_aligned_cols() };
+        cols.pair_with_unaligned_mate(mate_written);
+        assert_eq!(cols.sam_flags, expected);
     }
 
     #[test]
@@ -1506,9 +1603,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = FormatOptions { omit_quality: true, ..default_opts() };
         let mut buf = Vec::new();
@@ -1548,9 +1644,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = FormatOptions { qual_quant: Some(&table), ..default_opts() };
         let mut buf = Vec::new();
@@ -1597,9 +1692,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = FormatOptions { output_mode: OutputMode::Fasta, ..default_opts() };
         let mut buf = Vec::new();
@@ -1619,9 +1713,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = FormatOptions { output_mode: OutputMode::Fastq, ..default_opts() };
         let mut buf = Vec::new();
@@ -1892,9 +1985,8 @@ mod tests {
             spot_group: "",
             read_type: READ_TYPE_BIOLOGICAL,
             read_filter: READ_FILTER_PASS,
-            num_bio_reads: 1,
-            bio_read_index: 0,
             rna: false,
+            pairing: None,
         };
         let opts = FormatOptions { output_mode: OutputMode::Bam, ..default_opts() };
         let mut buf = Vec::new();

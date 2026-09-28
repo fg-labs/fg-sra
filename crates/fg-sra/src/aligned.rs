@@ -697,15 +697,15 @@ fn process_row_range(
         // after the filters so skipped rows pay nothing).
         reconstruct_read(&mut state.cols, store, item.ref_idx, &mut state.scratch, row_id)?;
 
-        // Resolve mate: look up cached mate info and store ours.
-        // When mate has no alignment, strip paired-end flags to match
-        // sam-dump's behavior (the read is output as unpaired).
+        // Resolve mate: look up cached mate info and store ours. When the mate has no
+        // alignment, the read is written as unpaired unless its mate is written too
+        // (`-u`), as in sam-dump.
         let mate_info = if state.cols.mate_align_id != 0 {
             let info = state.mate_cache.take(state.cols.mate_align_id);
             state.mate_cache.insert(row_id, MateInfo { ref_pos: state.cols.ref_pos });
             info
         } else {
-            state.cols.strip_paired_flags();
+            state.cols.pair_with_unaligned_mate(opts.pair_with_unaligned_mates);
             None
         };
 
@@ -1429,6 +1429,7 @@ mod tests {
             qual_quant: None,
             output_mode: crate::record::OutputMode::Sam,
             ref_name_to_id: None,
+            pair_with_unaligned_mates: false,
         };
         AlignConfig {
             use_seqid: false,
