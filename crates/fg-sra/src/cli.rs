@@ -142,9 +142,23 @@ pub struct ToSam {
     #[arg(long = "reverse")]
     pub reverse: bool,
 
-    /// Quality score quantization (e.g. "1:10,10:20,20:30,30:40").
-    #[arg(short = 'Q', long = "qual-quant")]
-    pub qual_quant: Option<String>,
+    /// Bin quality scores into comma-separated `low:high[=value]` ranges (e.g.
+    /// "0:10,10:20,20:30,30:40,40:94").
+    ///
+    /// Each range maps Phred qualities from `low` up to, but not including, `high` to
+    /// `value`, or without `=value` to the range's probability-averaged quality (the mean
+    /// of its qualities' error probabilities, back in Phred and rounded): the example bins
+    /// to Q4, Q14, Q24, Q34 and Q50. `high` may be up to 94, to include Q93. Qualities
+    /// outside every range are left as they are. Ranges must not be empty or overlap.
+    ///
+    /// The average weights every quality in a range equally, whether or not it occurs, so
+    /// a wide range averages above most real qualities (`40:94` gives Q50); give it a
+    /// value instead, e.g. `40:94=40`.
+    ///
+    /// Unlike sam-dump's `-Q` (`value:limit,…,value:-`), ranges are `low:high` and there
+    /// is no trailing `-`.
+    #[arg(short = 'Q', long = "qual-quant", value_parser = parse_qual_quant_arg)]
+    pub qual_quant: Option<crate::quality::QuantTable>,
 
     /// Output alignment ID in XI:i tag.
     #[arg(long = "XI")]
@@ -247,6 +261,12 @@ fn header_for_output(
 ///
 /// Creates a VDB manager, disables the pagemap thread (best-effort), and
 /// opens the database for reading.
+/// Parse `--qual-quant` for clap, keeping the whole error chain: clap shows only an
+/// error's `Display`, which for an [`anyhow::Error`] is just its outermost context.
+fn parse_qual_quant_arg(spec: &str) -> std::result::Result<crate::quality::QuantTable, String> {
+    crate::quality::parse_qual_quant(spec).map_err(|e| format!("{e:#}"))
+}
+
 fn open_database(accession: &str) -> Result<VDatabase> {
     let mgr = VdbManager::make_read().context("failed to create VDB manager")?;
     mgr.disable_pagemap_thread().ok();
@@ -460,15 +480,13 @@ impl ToSam {
             None
         };
 
-        let qual_table =
-            self.qual_quant.as_deref().map(crate::quality::parse_qual_quant).transpose()?;
         let opts = FormatOptions {
             prefix: self.prefix.as_deref(),
             spot_group_in_name: self.spot_group,
             xi_tag: self.xi_tag,
             reverse_unaligned: self.reverse,
             omit_quality: self.omit_quality,
-            qual_quant: qual_table.as_ref(),
+            qual_quant: self.qual_quant.as_ref(),
             output_mode,
             ref_name_to_id: ref_name_to_id.as_ref(),
             pair_with_unaligned_mates: self.pairs_partly_aligned_spots(),
@@ -645,8 +663,31 @@ mod tests {
 
     #[test]
     fn test_qual_quant() {
-        let cmd = parse(&["--qual-quant", "1:10,10:20,20:30,30:40", "SRR123456"]);
-        assert_eq!(cmd.qual_quant.as_deref(), Some("1:10,10:20,20:30,30:40"));
+        let cmd = parse(&["--qual-quant", "0:10,10:20,20:30,30:40,40:94=40", "SRR123456"]);
+        let table = cmd.qual_quant.expect("--qual-quant was given");
+        assert_eq!((table[5], table[15], table[35], table[93]), (4, 14, 34, 40));
+    }
+
+    // A bad spec is rejected while parsing arguments, before the archive is opened or the
+    // output created.
+    #[test]
+    fn test_qual_quant_rejected_when_parsing() {
+        let err = Cli::try_parse_from(["fg-sra", "tosam", "-Q", "0:10,5:15", "SRR123456"])
+            .expect_err("overlapping ranges");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("ranges 0:10 and 5:15 overlap"), "{err}");
+    }
+
+    // The message names the cause of a number that doesn't parse, not just which number.
+    #[test]
+    fn test_qual_quant_parse_error_shows_cause() {
+        let err = Cli::try_parse_from(["fg-sra", "tosam", "-Q", "0:300", "SRR123456"])
+            .expect_err("300 is not a u8");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"invalid qual-quant high value in "0:300": number too large"#),
+            "{msg}"
+        );
     }
 
     #[test]

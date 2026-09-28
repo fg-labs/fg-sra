@@ -1344,7 +1344,7 @@ mod tests {
     }
 
     // Quantization applies to reversed qualities too: Phred 5, 15, 25, 35 quantize to
-    // 10, 20, 30, 40 and are written last to first.
+    // their ranges' averages, 4, 14, 24, 34, and are written last to first.
     #[test]
     fn test_unaligned_reverse_qual_quant_sam() {
         let table = crate::quality::parse_qual_quant("0:10,10:20,20:30,30:40").unwrap();
@@ -1357,7 +1357,7 @@ mod tests {
 
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
-        assert_eq!(fields[10].as_bytes(), &[40 + 33, 30 + 33, 20 + 33, 10 + 33]);
+        assert_eq!(fields[10].as_bytes(), &[34 + 33, 24 + 33, 14 + 33, 4 + 33]);
     }
 
     #[test]
@@ -1375,7 +1375,7 @@ mod tests {
         format_unaligned_record_bam(&mut buf, &cols, &opts);
 
         let qual_start = 36 + buf[12] as usize + 4_usize.div_ceil(2);
-        assert_eq!(&buf[qual_start..qual_start + 4], &[40, 30, 20, 10]);
+        assert_eq!(&buf[qual_start..qual_start + 4], &[34, 24, 14, 4]);
     }
 
     // A read whose mate is unaligned, e.g. sam-dump's 153 (paired, 0x8, reverse, last),
@@ -1645,8 +1645,8 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         let qual_bytes = fields[10].as_bytes();
-        // Phred 5 → 10, Phred 15 → 20, Phred 25 → 30, Phred 35 → 40
-        assert_eq!(qual_bytes, &[10 + 33, 20 + 33, 30 + 33, 40 + 33]);
+        // Phred 5 → 4, Phred 15 → 14, Phred 25 → 24, Phred 35 → 34 (the ranges' averages)
+        assert_eq!(qual_bytes, &[4 + 33, 14 + 33, 24 + 33, 34 + 33]);
     }
 
     #[test]
@@ -1670,8 +1670,8 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         let qual_bytes = fields[10].as_bytes();
-        // Phred 5 → 10, Phred 15 → 20, Phred 25 → 30, Phred 35 → 40
-        assert_eq!(qual_bytes, &[10 + 33, 20 + 33, 30 + 33, 40 + 33]);
+        // Phred 5 → 4, Phred 15 → 14, Phred 25 → 24, Phred 35 → 34 (the ranges' averages)
+        assert_eq!(qual_bytes, &[4 + 33, 14 + 33, 24 + 33, 34 + 33]);
     }
 
     #[test]
