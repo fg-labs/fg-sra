@@ -11,7 +11,8 @@ use std::process::Command;
 
 /// The vendored aligned database used as input.
 fn test_database() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra")
 }
 
 /// Run `fg-sra tosam` with `args` on the test database, returning its output file's bytes.

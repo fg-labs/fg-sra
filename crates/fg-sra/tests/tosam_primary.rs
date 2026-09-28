@@ -20,7 +20,7 @@ const SUPPLEMENTARY: u32 = 0x800;
 /// The vendored aligned database used as input.
 fn test_database() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/ncbi-vdb/test/vdb/db/blob_val_inv_chsum.sra")
+        .join("../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/blob_val_inv_chsum.sra")
 }
 
 /// Run `fg-sra tosam -u --no-header` on the test database, returning each record's QNAME and

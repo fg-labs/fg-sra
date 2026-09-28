@@ -4,12 +4,15 @@
 //!
 //! Library resolution (checked in order):
 //! 1. `VDB_INCDIR` / `VDB_LIBDIR` env vars — use a pre-built ncbi-vdb
-//! 2. `vendored` cargo feature — build ncbi-vdb from the git submodule via cmake
+//! 2. `vendored` cargo feature — build ncbi-vdb from `vendor/ncbi-vdb` (a git submodule in the
+//!    repository, and part of the published package) via cmake
 //! 3. Neither — fail with a helpful error message
 //!
-//! The vendored source is first patched, in place, with `vendor/patches/ncbi-vdb/*.patch`: fixes
-//! not yet in an ncbi-vdb release. With the `zlib-ng` feature, the vendored library's bundled
-//! zlib is removed after the build so that zlib-ng, from `libz-sys`, provides zlib instead.
+//! The vendored source is copied to `OUT_DIR` and built there, never in place: the copy is
+//! patched with `vendor/patches/ncbi-vdb/*.patch` (fixes not yet in an ncbi-vdb release), and
+//! cmake's configure step writes into the source tree, which `cargo publish` rejects. With the
+//! `zlib-ng` feature, the vendored library's bundled zlib is removed after the build so that
+//! zlib-ng, from `libz-sys`, provides zlib instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -71,7 +74,7 @@ fn build_vendored(_out_dir: &Path) -> (PathBuf, PathBuf) {
             ncbi-vdb not found. Either:\n\
             \n\
             1. Set VDB_INCDIR and VDB_LIBDIR to point at a pre-built ncbi-vdb, or\n\
-            2. Enable the `vendored` feature to build from the git submodule:\n\
+            2. Enable the `vendored` feature (on by default) to build the vendored ncbi-vdb:\n\
             \n\
             cargo build --features fg-sra-vdb-sys/vendored\n\
             "
@@ -79,18 +82,39 @@ fn build_vendored(_out_dir: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
-/// Build ncbi-vdb from the vendored submodule using cmake.
+/// Build ncbi-vdb from the vendored source using cmake, in a patched copy under `out_dir`.
 #[cfg(feature = "vendored")]
-fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
-    let vdb_src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("../../vendor/ncbi-vdb")
-        .canonicalize()
-        .expect(
-            "vendor/ncbi-vdb not found; did you initialize the git submodule?\n\
-             Run: git submodule update --init --recursive",
-        );
+fn build_ncbi_vdb(out_dir: &Path) -> (PathBuf, PathBuf) {
+    let vendor = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("vendor");
+    let vendored_src = vendor.join("ncbi-vdb");
+    assert!(
+        vendored_src.join("CMakeLists.txt").exists(),
+        "{} not found; did you initialize the git submodule?\n\
+         Run: git submodule update --init --recursive",
+        vendored_src.display()
+    );
+    // Rebuild if the vendored source changes (the copy is made again).
+    println!("cargo:rerun-if-changed={}", vendored_src.display());
 
-    apply_patches(&vdb_src, &vdb_src.join("../patches/ncbi-vdb"));
+    let patch_dir = vendor.join("patches/ncbi-vdb");
+    // Rerun when a patch is added or removed, not only when one changes.
+    println!("cargo:rerun-if-changed={}", patch_dir.display());
+
+    let vdb_src = out_dir.join("ncbi-vdb");
+    copy_source(&vendored_src, &vdb_src);
+    apply_patches(&vdb_src, &patch_dir);
+    // The copy keeps the vendored files' mtimes, so cmake rebuilds only what changed. A
+    // patch that is dropped or narrowed, though, leaves files older than the objects built
+    // from their patched versions: build from scratch whenever the set of patches changes.
+    let stamp = out_dir.join("ncbi-vdb-patches.stamp");
+    let patches = patch_set_stamp(&patch_dir);
+    if std::fs::read_to_string(&stamp).ok().as_deref() != Some(patches.as_str()) {
+        let build_dir = out_dir.join("build");
+        if build_dir.exists() {
+            std::fs::remove_dir_all(&build_dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", build_dir.display()));
+        }
+    }
 
     let dst =
         cmake::Config::new(&vdb_src).define("LIBS_ONLY", "ON").build_target("ncbi-vdb").build();
@@ -118,32 +142,99 @@ fn build_ncbi_vdb(_out_dir: &Path) -> (PathBuf, PathBuf) {
     #[cfg(feature = "zlib-ng")]
     remove_bundled_zlib(&vdb_src, &final_lib_dir.join("libncbi-vdb.a"));
 
+    std::fs::write(&stamp, patches).unwrap_or_else(|e| panic!("{}: {e}", stamp.display()));
+
     // mbedcrypto is built as a separate static lib in ilib/.
     if helper_lib_dir.join("libmbedcrypto.a").exists() {
         println!("cargo:rustc-link-search=native={}", helper_lib_dir.display());
         println!("cargo:rustc-link-lib=static=mbedcrypto");
     }
 
-    // Tell cargo to rebuild if the ncbi-vdb source changes.
-    println!("cargo:rerun-if-changed={}", vdb_src.display());
-
     (inc_dir, final_lib_dir)
 }
 
-/// Apply each `*.patch` in `patch_dir` to the ncbi-vdb source at `vdb_src`, in name order,
-/// skipping those already applied: the source is patched in place, so later builds find them
-/// there. The options used mean the same to GNU patch and to macOS's BSD patch.
+/// The `*.patch` files in `patch_dir`, in name order.
 #[cfg(feature = "vendored")]
-fn apply_patches(vdb_src: &Path, patch_dir: &Path) {
-    use std::process::Command;
-
+fn patch_files(patch_dir: &Path) -> Vec<PathBuf> {
     let mut patches: Vec<PathBuf> = std::fs::read_dir(patch_dir)
-        .expect("vendor/patches/ncbi-vdb")
+        .unwrap_or_else(|e| panic!("{}: {e}", patch_dir.display()))
         .filter_map(|entry| Some(entry.ok()?.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
         .collect();
     patches.sort();
-    for patch in &patches {
+    patches
+}
+
+/// A stamp of the patches in `patch_dir`: a hash of their names and contents.
+#[cfg(feature = "vendored")]
+fn patch_set_stamp(patch_dir: &Path) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    for patch in patch_files(patch_dir) {
+        patch.file_name().hash(&mut hasher);
+        std::fs::read(&patch)
+            .unwrap_or_else(|e| panic!("{}: {e}", patch.display()))
+            .hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Copy the ncbi-vdb source at `src` to `dst`, replacing any earlier copy, with each file's
+/// modification time. Its tests, Python bindings and git metadata are left out: the library
+/// build needs none of them, and the published package leaves the same parts out (see
+/// `exclude` in Cargo.toml, which must match).
+#[cfg(feature = "vendored")]
+fn copy_source(src: &Path, dst: &Path) {
+    /// Top-level entries left out, besides anything named `.git*`.
+    const SKIPPED: [&str; 2] = ["test", "py_vdb"];
+
+    fn copy_dir(src: &Path, dst: &Path, skipped: &[&str]) {
+        std::fs::create_dir_all(dst).unwrap_or_else(|e| panic!("{}: {e}", dst.display()));
+        let entries = std::fs::read_dir(src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+            let file_name = entry.file_name();
+            let top_level_skip = !skipped.is_empty()
+                && (skipped.iter().any(|name| file_name == *name)
+                    || file_name.to_string_lossy().starts_with(".git"));
+            if top_level_skip {
+                continue;
+            }
+            let (from, to) = (entry.path(), dst.join(entry.file_name()));
+            let file_type = entry.file_type().unwrap_or_else(|e| panic!("{}: {e}", from.display()));
+            if file_type.is_dir() {
+                copy_dir(&from, &to, &[]);
+            } else {
+                std::fs::copy(&from, &to)
+                    .unwrap_or_else(|e| panic!("copying {}: {e}", from.display()));
+                // Keep the modification time (as `fs::copy` does only on some platforms), so
+                // cmake rebuilds only the files that changed since the last copy.
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or_else(|e| panic!("{}: {e}", from.display()));
+                std::fs::File::open(&to)
+                    .and_then(|file| file.set_modified(modified))
+                    .unwrap_or_else(|e| panic!("{}: {e}", to.display()));
+            }
+        }
+    }
+
+    if dst.exists() {
+        std::fs::remove_dir_all(dst).unwrap_or_else(|e| panic!("{}: {e}", dst.display()));
+    }
+    copy_dir(src, dst, &SKIPPED);
+}
+
+/// Apply each `*.patch` in `patch_dir` to the ncbi-vdb source at `vdb_src`, in name order,
+/// skipping any already applied. The options used mean the same to GNU patch and to macOS's
+/// BSD patch.
+#[cfg(feature = "vendored")]
+fn apply_patches(vdb_src: &Path, patch_dir: &Path) {
+    use std::process::Command;
+
+    for patch in &patch_files(patch_dir) {
         println!("cargo:rerun-if-changed={}", patch.display());
         let run = |extra: &[&str]| {
             Command::new("patch")

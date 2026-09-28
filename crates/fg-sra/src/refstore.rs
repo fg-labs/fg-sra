@@ -590,7 +590,7 @@ mod tests {
         use fg_sra_vdb::reference::reflist_options::READ_4NA;
 
         let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+            .join("../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
         let open = || -> Result<VDatabase> {
             Ok(VdbManager::make_read()?.open_db_read(archive.to_str().unwrap())?)
         };
