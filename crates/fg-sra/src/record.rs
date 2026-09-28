@@ -270,7 +270,6 @@ pub fn format_aligned_record(
                 opts.prefix,
                 &cols.seq_name,
                 &cols.spot_group,
-                '.',
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
@@ -285,7 +284,6 @@ pub fn format_aligned_record(
                 opts.prefix,
                 &cols.seq_name,
                 &cols.spot_group,
-                '.',
                 opts.spot_group_in_name,
             );
             buf.push(b'\n');
@@ -322,7 +320,7 @@ fn format_aligned_record_sam(
     buf.clear();
 
     // QNAME
-    write_qname(buf, opts.prefix, &cols.seq_name, &cols.spot_group, '.', opts.spot_group_in_name);
+    write_qname(buf, opts.prefix, &cols.seq_name, &cols.spot_group, opts.spot_group_in_name);
 
     // FLAG — apply read filter to flags.
     let flags = apply_read_filter(cols.sam_flags, cols.read_filter);
@@ -434,7 +432,7 @@ pub fn format_unaligned_record(
         OutputMode::Fasta => {
             buf.clear();
             buf.push(b'>');
-            write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
+            write_qname(buf, opts.prefix, cols.name, cols.spot_group, opts.spot_group_in_name);
             buf.push(b'\n');
             buf.extend_from_slice(cols.read.as_bytes());
             buf.push(b'\n');
@@ -442,7 +440,7 @@ pub fn format_unaligned_record(
         OutputMode::Fastq => {
             buf.clear();
             buf.push(b'@');
-            write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
+            write_qname(buf, opts.prefix, cols.name, cols.spot_group, opts.spot_group_in_name);
             buf.push(b'\n');
             buf.extend_from_slice(cols.read.as_bytes());
             buf.extend_from_slice(b"\n+\n");
@@ -503,8 +501,8 @@ fn format_unaligned_record_sam(
     buf.clear();
     let reverse = reverses_unaligned_read(cols, opts);
 
-    // QNAME — unaligned uses '#' as spot group separator.
-    write_qname(buf, opts.prefix, cols.name, cols.spot_group, '#', opts.spot_group_in_name);
+    // QNAME
+    write_qname(buf, opts.prefix, cols.name, cols.spot_group, opts.spot_group_in_name);
 
     // FLAG
     buf.push(b'\t');
@@ -581,13 +579,13 @@ fn format_unaligned_record_sam(
     buf.push(b'\n');
 }
 
-/// Write QNAME: `[prefix.]{name}[{sep}{spot_group}]`
+/// Write QNAME: `[prefix.]{name}[.{spot_group}]`, the same for aligned and unaligned reads
+/// in every format, as sam-dump writes it, so a pair's mates share a name.
 fn write_qname(
     buf: &mut Vec<u8>,
     prefix: Option<&str>,
     name: &str,
     spot_group: &str,
-    sep: char,
     include_spot_group: bool,
 ) {
     if let Some(pfx) = prefix {
@@ -596,7 +594,7 @@ fn write_qname(
     }
     buf.extend_from_slice(name.as_bytes());
     if include_spot_group && !spot_group.is_empty() {
-        buf.push(sep as u8);
+        buf.push(b'.');
         buf.extend_from_slice(spot_group.as_bytes());
     }
 }
@@ -681,7 +679,6 @@ fn format_aligned_record_bam(
         opts.prefix,
         &cols.seq_name,
         &cols.spot_group,
-        '.',
         opts.spot_group_in_name,
     );
     qname_buf.push(0); // null terminator
@@ -785,14 +782,7 @@ fn format_unaligned_record_bam(
 
     // Build QNAME (null-terminated).
     let mut qname_buf = Vec::with_capacity(64);
-    write_qname(
-        &mut qname_buf,
-        opts.prefix,
-        cols.name,
-        cols.spot_group,
-        '#',
-        opts.spot_group_in_name,
-    );
+    write_qname(&mut qname_buf, opts.prefix, cols.name, cols.spot_group, opts.spot_group_in_name);
     qname_buf.push(0);
     let l_read_name = qname_buf.len() as u8;
 
@@ -1503,23 +1493,48 @@ mod tests {
         let mut buf = Vec::new();
 
         // Plain name.
-        write_qname(&mut buf, None, "read1", "", '.', false);
+        write_qname(&mut buf, None, "read1", "", false);
         assert_eq!(&buf, b"read1");
 
         // With prefix.
         buf.clear();
-        write_qname(&mut buf, Some("PRE"), "read1", "", '.', false);
+        write_qname(&mut buf, Some("PRE"), "read1", "", false);
         assert_eq!(&buf, b"PRE.read1");
 
         // With spot group.
         buf.clear();
-        write_qname(&mut buf, None, "read1", "RG1", '.', true);
+        write_qname(&mut buf, None, "read1", "RG1", true);
         assert_eq!(&buf, b"read1.RG1");
 
         // With prefix and spot group.
         buf.clear();
-        write_qname(&mut buf, Some("X"), "name", "grp", '#', true);
-        assert_eq!(&buf, b"X.name#grp");
+        write_qname(&mut buf, Some("X"), "name", "grp", true);
+        assert_eq!(&buf, b"X.name.grp");
+    }
+
+    // An unaligned read's QNAME separates the spot group with `.`, as its aligned mate's
+    // does and as sam-dump writes it in every format, so mates share a name.
+    #[rstest]
+    #[case::sam(OutputMode::Sam)]
+    #[case::bam(OutputMode::Bam)]
+    #[case::fasta(OutputMode::Fasta)]
+    #[case::fastq(OutputMode::Fastq)]
+    fn test_unaligned_qname_with_spot_group(#[case] output_mode: OutputMode) {
+        let cols = UnalignedColumns { spot_group: "RG1", ..oriented_unaligned_cols(1) };
+        let opts = FormatOptions { spot_group_in_name: true, output_mode, ..default_opts() };
+        let mut buf = Vec::new();
+
+        format_unaligned_record(&mut buf, &cols, &opts);
+
+        let qname: &[u8] = match output_mode {
+            OutputMode::Sam => buf.split(|&b| b == b'\t').next().unwrap(),
+            // `l_read_name` includes the NUL.
+            OutputMode::Bam => &buf[36..36 + buf[12] as usize - 1],
+            OutputMode::Fasta | OutputMode::Fastq => {
+                buf[1..].split(|&b| b == b'\n').next().unwrap()
+            }
+        };
+        assert_eq!(qname, b"spot1.RG1");
     }
 
     #[test]
