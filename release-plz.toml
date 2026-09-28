@@ -1,8 +1,9 @@
 [workspace]
 # path of the git-cliff configuration
 changelog_config = "cliff.toml"
-# update dependencies with `cargo update`
-dependencies_update = true
+# don't run `cargo update`: Dependabot updates dependencies, and the `licenses` CI job
+# fails on any dependency version not in THIRDPARTY.yml
+dependencies_update = false
 # labels for the release PR
 pr_labels = ["release"]
 # disable git releases (handled by publish workflow)
