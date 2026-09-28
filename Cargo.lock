@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "fg-sra"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bgzf",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "fg-sra-vdb"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fg-sra-vdb-sys",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "fg-sra-vdb-sys"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "cmake",
