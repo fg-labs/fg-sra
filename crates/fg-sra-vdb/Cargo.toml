@@ -12,6 +12,8 @@ readme = "../../README.md"
 workspace = true
 
 [features]
+# On by default, as in fg-sra-vdb-sys, so the crate builds as published.
+default = ["vendored"]
 vendored = ["fg-sra-vdb-sys/vendored"]
 zlib-ng = ["fg-sra-vdb-sys/zlib-ng"]
 

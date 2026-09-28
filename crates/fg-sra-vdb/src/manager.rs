@@ -203,7 +203,7 @@ mod tests {
         // Dropping the manager first leaves the database's release to tear it down,
         // under the lock, while other threads make managers.
         let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+            .join("../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
         let archive = archive.to_str().unwrap();
         std::thread::scope(|scope| {
             for _ in 0..8 {

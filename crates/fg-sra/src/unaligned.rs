@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn parallel_conversion_from_cmp_read_matches_serial_conversion_from_read() {
         let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
+            .join("../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra");
         // Batches of 7 spots on 4 threads: many batches, finished out of order.
         let batching = Batching { threads: 4, spots: 7 };
         for (spots_only, (serial, parallel)) in

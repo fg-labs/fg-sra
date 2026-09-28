@@ -8,6 +8,16 @@ license.workspace = true
 description = "Raw FFI bindings to NCBI's libncbi-vdb C library"
 readme = "../../README.md"
 links = "ncbi-vdb"
+# The vendored ncbi-vdb source is published with the crate: public domain, apart from the
+# third-party libraries it bundles, whose licenses vendor/ncbi-vdb/LICENSE (also published)
+# lists; see the README's License section. What its library build doesn't need is left out,
+# keeping the package under crates.io's 10 MB limit; build.rs leaves the same parts out of
+# the copy it builds (`copy_source`), so keep the two in step.
+exclude = [
+    "vendor/ncbi-vdb/test/**",
+    "vendor/ncbi-vdb/py_vdb/**",
+    "vendor/ncbi-vdb/.git*",
+]
 
 # Opt out of workspace pedantic lints — this crate is generated FFI bindings
 # and a build script, neither of which should be held to pedantic standards.
@@ -15,7 +25,10 @@ links = "ncbi-vdb"
 pedantic = { level = "allow", priority = -1 }
 
 [features]
-# Build ncbi-vdb from the vendored git submodule (vendor/ncbi-vdb).
+# On by default, so the crate builds as published (and `cargo publish` can verify it). VDB_INCDIR
+# and VDB_LIBDIR, when set, take precedence; the workspace depends on it without default features.
+default = ["vendored"]
+# Build ncbi-vdb from the vendored source (vendor/ncbi-vdb, a git submodule in the repository).
 # Without this feature, VDB_INCDIR and VDB_LIBDIR env vars must be set
 # to point at a pre-built ncbi-vdb installation.
 vendored = ["dep:cmake"]

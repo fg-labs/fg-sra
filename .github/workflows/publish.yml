@@ -56,6 +56,9 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           token: ${{ steps.app-token.outputs.token }}
+          # Keep the App token out of git config: `cargo package` runs build
+          # scripts. The release step restores git auth for its tag push.
+          persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Install build dependencies
@@ -88,30 +91,18 @@ jobs:
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
             '.packages[] | select(.name == "fg-sra") | .version')
 
-          # Use fg-sra-vdb-sys as the reference for "has v<X> been published?"
-          # because it is the leaf of the workspace dependency graph and must
-          # be published first.
-          PUBLISHED_VERSION=$(curl -sS \
-            -H "User-Agent: fg-sra-ci (https://github.com/fg-labs/fg-sra)" \
-            "https://crates.io/api/v1/crates/fg-sra-vdb-sys" | jq -r \
-            '.crate.max_version // "0.0.0"')
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          if [ "$VERSION" = "$PUBLISHED_VERSION" ]; then
-            echo "All crates already at v$VERSION -- nothing to publish"
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Each crate is checked separately (not just fg-sra-vdb-sys, the first
+          # published): verification can fail a later crate after an earlier one
+          # was published, and a rerun must then publish the rest.
+          echo "Publishing workspace crates not yet at v$VERSION..."
+          PUBLISHED=false
 
-          echo "Publishing all workspace crates (v$VERSION)..."
-
-          # Publish helper. Uses --no-verify because the workspace's ncbi-vdb
-          # submodule lives at the repository root (outside the sys crate
-          # directory) and therefore is not included in the published tarball,
-          # which makes the default verification build fail. Downstream users
-          # on crates.io are also affected until the vendoring story is fixed
-          # -- see https://github.com/fg-labs/fg-sra/issues/15.
+          # Publish helper. `cargo package` verifies each package by building it
+          # from its tarball (fg-sra-vdb-sys carries the vendored ncbi-vdb source)
+          # without the registry token, so build scripts cannot read it; the
+          # verified package is then uploaded without building it again.
           publish_crate() {
             local crate="$1"
             local max_version
@@ -126,8 +117,10 @@ jobs:
             fi
 
             echo "Publishing $crate v$VERSION..."
+            env -u CARGO_REGISTRY_TOKEN cargo package -p "$crate"
             cargo publish --no-verify -p "$crate"
             echo "Published $crate v$VERSION"
+            PUBLISHED=true
           }
 
           # Workspace crates in topological (dependency) order.
@@ -135,7 +128,7 @@ jobs:
           publish_crate fg-sra-vdb
           publish_crate fg-sra
 
-          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         if: steps.publish.outputs.version != ''
@@ -143,6 +136,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+          gh auth setup-git --hostname github.com
           VERSION="${{ steps.publish.outputs.version }}"
           TAG="v${VERSION}"
 

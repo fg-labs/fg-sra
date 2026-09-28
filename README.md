@@ -66,6 +66,15 @@ These require reference sequence access via VDB FFI that has not yet been implem
 
 ## Installation
 
+### From crates.io
+
+```bash
+cargo install fg-sra
+```
+
+This builds the vendored ncbi-vdb, which is published with `fg-sra-vdb-sys`, so it needs
+the prerequisites below.
+
 ### Building from source (vendored)
 
 ```bash
@@ -77,10 +86,13 @@ cargo build --release
 #### Prerequisites
 
 - Rust (stable toolchain)
-- CMake (for building the vendored ncbi-vdb C library)
+- CMake, a C/C++ compiler, `patch`, and libxml2's headers (for building the vendored ncbi-vdb
+  C library; e.g. `apt-get install cmake build-essential patch libxml2-dev`)
+- libclang (for generating the FFI bindings with bindgen)
 
 The `vendored` feature is enabled by default, building ncbi-vdb from the
-git submodule automatically during `cargo build`.
+git submodule automatically during `cargo build` (a patched copy of it, under
+the build directory, so the checkout itself is never modified).
 
 So is `zlib-ng`, which links zlib-ng (built from source through `libz-sys`) in place of the zlib bundled with ncbi-vdb, for faster decompression of archives; `--no-default-features --features vendored` keeps the bundled zlib.
 
@@ -230,11 +242,24 @@ enable multi-threaded aligned read processing.
 fg-sra/
 ├── crates/
 │   ├── fg-sra-vdb-sys/    # Raw FFI bindings to libncbi-vdb
+│   │   └── vendor/
+│   │       ├── ncbi-vdb/  # Vendored VDB library (git submodule)
+│   │       └── patches/   # Fixes applied to a copy of it at build time
 │   ├── fg-sra-vdb/        # Safe Rust wrappers over VDB
 │   └── fg-sra/            # Binary crate (the converter)
-└── vendor/
-    └── ncbi-vdb/           # Vendored VDB library (git submodule)
 ```
+
+## License
+
+fg-sra is released under the MIT license. The licenses of its Rust dependencies are
+collected in [`THIRDPARTY.yml`](THIRDPARTY.yml), generated with
+[cargo-bundle-licenses](https://github.com/sstadick/cargo-bundle-licenses).
+
+`fg-sra-vdb-sys` also ships and builds a patched copy of NCBI's ncbi-vdb
+(`crates/fg-sra-vdb-sys/vendor/ncbi-vdb`), a public-domain United States Government Work
+apart from the third-party libraries it bundles (bzip2, mbedtls, regex, szip, zlib, zstd),
+whose licenses are listed in its
+[`LICENSE`](https://github.com/ncbi/ncbi-vdb/blob/master/LICENSE).
 
 ## Resources
 

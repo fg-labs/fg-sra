@@ -18,7 +18,10 @@ use std::process::{Command, Output};
 
 /// A small aligned database with embedded references, from the vendored ncbi-vdb tests.
 fn vendored_archive() -> String {
-    path(Path::new(env!("CARGO_MANIFEST_DIR")), "../../vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra")
+    path(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        "../fg-sra-vdb-sys/vendor/ncbi-vdb/test/vdb/db/VDB-3418.sra",
+    )
 }
 
 /// Returns the archive named by env var `key`, or `None` (after a note) if it is unset.
