@@ -119,6 +119,20 @@ For full usage, run:
 fg-sra tosam --help
 ```
 
+### Binning qualities
+
+`-Q`/`--qual-quant` shares sam-dump's option name but not its syntax. It takes comma-separated `low:high[=value]` ranges: each maps Phred qualities from `low` up to, but not including, `high` to `value`, or without `=value` to the range's probability-averaged quality (the mean of its qualities' error probabilities, back in Phred and rounded). `high` may be up to 94, to include Q93, and qualities outside every range are left as they are.
+
+```bash
+# Q0-9, 10-19, 20-29, 30-39 and 40-93 binned to Q4, Q14, Q24, Q34 and Q50
+fg-sra tosam -Q 0:10,10:20,20:30,30:40,40:94 SRR390728
+
+# Q0-19 binned to Q6, Q20 and above left alone
+fg-sra tosam -Q 0:20 SRR390728
+```
+
+The average weights every quality in a range equally, whether or not it occurs in the data, so a wide range averages above most real qualities (`40:94` gives Q50, where Illumina qualities top out around Q41); give such a range a value, e.g. `40:94=40`. sam-dump's `value:limit,…,value:-` form isn't accepted: there, each value is written for qualities from the previous limit up to its own, so `1:10,10:20,20:30,30:-` writes Q1, Q10, Q20 and Q30, and `0:10=1,10:20=10,20:30=20,30:94=30` bins Q0–93 the same way here.
+
 ### Converting to FASTQ
 
 `fg-sra fastq` writes an archive's reads in spot order, with mates paired. Each spot's non-empty biological reads decide where it goes: two go to `--r1`/`--r2` (or `--interleaved`), and one goes to `--unpaired`. Spots with no biological reads or more than two are dropped and counted, as are spots whose output wasn't given; it is an error if nothing at all is written. Outputs ending `.gz` or `.bgz` are BGZF-compressed, and any output may be `-` for stdout.

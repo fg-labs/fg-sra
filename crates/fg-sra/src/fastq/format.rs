@@ -2,9 +2,7 @@
 
 use super::defline::{Defline, DeflineFields};
 use super::spot::{SelectedRead, Spot};
-
-/// Highest phred value FASTQ's phred+33 encoding can hold (`~`); higher values are clamped.
-const MAX_PHRED: u8 = 93;
+use crate::quality::MAX_PHRED;
 
 /// Offset of the phred+33 (Sanger) quality encoding.
 const PHRED_OFFSET: u8 = 33;
