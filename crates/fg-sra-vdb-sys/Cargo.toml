@@ -8,9 +8,11 @@ license.workspace = true
 description = "Raw FFI bindings to NCBI's libncbi-vdb C library"
 readme = "../../README.md"
 links = "ncbi-vdb"
-# The vendored ncbi-vdb source is published with the crate, less what its library build doesn't
-# need, keeping the package under crates.io's 10 MB limit. build.rs leaves the same parts out
-# of the copy it builds (`copy_source`); keep the two in step.
+# The vendored ncbi-vdb source is published with the crate: public domain, apart from the
+# third-party libraries it bundles, whose licenses vendor/ncbi-vdb/LICENSE (also published)
+# lists; see the README's License section. What its library build doesn't need is left out,
+# keeping the package under crates.io's 10 MB limit; build.rs leaves the same parts out of
+# the copy it builds (`copy_source`), so keep the two in step.
 exclude = [
     "vendor/ncbi-vdb/test/**",
     "vendor/ncbi-vdb/py_vdb/**",

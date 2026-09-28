@@ -249,6 +249,18 @@ fg-sra/
 │   └── fg-sra/            # Binary crate (the converter)
 ```
 
+## License
+
+fg-sra is released under the MIT license. The licenses of its Rust dependencies are
+collected in [`THIRDPARTY.yml`](THIRDPARTY.yml), generated with
+[cargo-bundle-licenses](https://github.com/sstadick/cargo-bundle-licenses).
+
+`fg-sra-vdb-sys` also ships and builds a patched copy of NCBI's ncbi-vdb
+(`crates/fg-sra-vdb-sys/vendor/ncbi-vdb`), a public-domain United States Government Work
+apart from the third-party libraries it bundles (bzip2, mbedtls, regex, szip, zlib, zstd),
+whose licenses are listed in its
+[`LICENSE`](https://github.com/ncbi/ncbi-vdb/blob/master/LICENSE).
+
 ## Resources
 
 - [Issues](https://github.com/fg-labs/fg-sra/issues): Report a bug or request a feature
