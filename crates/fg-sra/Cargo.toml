@@ -26,7 +26,7 @@ anyhow.workspace = true
 bgzf = "0.5"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
-fgoxide = "0.6"
+fgoxide = "0.7"
 itoa = "1"
 bzip2 = "0.6"
 rustc-hash = "2"
