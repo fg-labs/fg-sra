@@ -1,0 +1,51 @@
+name: Attach Buildable Source Tarball
+
+# Attaches fg-sra-buildable-src-<version>.tar.gz to an existing release that lacks it, such as
+# one published before releases carried it; publish.yml attaches it to new releases. An
+# attached tarball is never replaced.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    name: attach
+    runs-on: ubuntu-latest
+    steps:
+      # The script comes from the default branch: older tags may not have it.
+      - name: Check out the script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          path: release
+          submodules: recursive
+          persist-credentials: false
+      - name: Build and attach the tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ASSET=$(scripts/buildable-src-tarball.sh release "$RUNNER_TEMP")
+          NAME=$(basename "$ASSET")
+          if [ "$NAME" != "fg-sra-buildable-src-${TAG#v}.tar.gz" ]; then
+            echo "$TAG's workspace version doesn't match its tag: built $NAME"
+            exit 1
+          fi
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$NAME"; then
+            echo "$TAG already has $NAME -- leaving it"
+          else
+            gh release upload "$TAG" "$ASSET"
+          fi
