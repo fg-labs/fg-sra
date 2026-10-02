@@ -1,0 +1,21 @@
+On macOS, finish static libraries with CMake's default `<CMAKE_RANLIB> <TARGET>` (build/env.cmake).
+
+ncbi-vdb finishes each archive with `<CMAKE_RANLIB> -no_warning_for_no_symbols -c <TARGET>`,
+flags only Apple's ranlib accepts. Toolchains that give CMake llvm-ranlib, such as the
+conda-forge macOS toolchain that builds fg-sra for bioconda, fail on every archive with
+"Invalid option: '-no_warning_for_no_symbols'". CMake's default works with either ranlib.
+Apple's may then warn about members with no symbols, and `-c` (common symbols in the table of
+contents) has no effect while clang compiles with its default `-fno-common`.
+
+diff --git a/build/env.cmake b/build/env.cmake
+--- a/build/env.cmake
++++ b/build/env.cmake
+@@ -131,8 +131,6 @@
+     add_compile_definitions( MAC BSD UNIX )
+     set(CMAKE_C_ARCHIVE_CREATE   "<CMAKE_AR> Scr <TARGET> <LINK_FLAGS> <OBJECTS>")
+     set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> Scr <TARGET> <LINK_FLAGS> <OBJECTS>")
+-    set(CMAKE_C_ARCHIVE_FINISH   "<CMAKE_RANLIB> -no_warning_for_no_symbols -c <TARGET>")
+-    set(CMAKE_CXX_ARCHIVE_FINISH "<CMAKE_RANLIB> -no_warning_for_no_symbols -c <TARGET>")
+ elseif( "linux" STREQUAL ${OS} )
+     add_compile_definitions( LINUX UNIX )
+     set( LMCHECK -lmcheck )
