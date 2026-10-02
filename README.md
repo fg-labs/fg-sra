@@ -83,6 +83,15 @@ cd fg-sra
 cargo build --release
 ```
 
+GitHub's source archives for a release leave out the ncbi-vdb submodule, so they don't build. Each release instead attaches `fg-sra-buildable-src-<version>.tar.gz`, which includes it:
+
+```bash
+curl -LO https://github.com/fg-labs/fg-sra/releases/download/v<version>/fg-sra-buildable-src-<version>.tar.gz
+tar xzf fg-sra-buildable-src-<version>.tar.gz
+cd fg-sra-<version>
+cargo build --release
+```
+
 #### Prerequisites
 
 - Rust (stable toolchain)

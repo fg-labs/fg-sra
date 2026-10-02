@@ -103,6 +103,22 @@ jobs:
       # does on release: fg-sra-vdb-sys must carry the vendored ncbi-vdb it builds.
       - run: cargo publish --workspace --dry-run --locked
 
+  source-tarball:
+    name: source tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # Releases attach this tarball and bioconda builds from it. The script checks it holds
+      # every tracked file, the vendored ncbi-vdb included; building it twice checks that it
+      # is reproducible.
+      - run: |
+          scripts/buildable-src-tarball.sh . "$RUNNER_TEMP/a"
+          scripts/buildable-src-tarball.sh . "$RUNNER_TEMP/b"
+          cmp "$RUNNER_TEMP"/a/*.tar.gz "$RUNNER_TEMP"/b/*.tar.gz
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

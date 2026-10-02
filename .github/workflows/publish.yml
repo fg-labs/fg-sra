@@ -147,11 +147,17 @@ jobs:
           if ! git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
             git push origin "$TAG"
           fi
+          # A source tarball with the ncbi-vdb submodule, which GitHub's tag archives lack;
+          # bioconda builds from it. It is attached as the release is created, and on a rerun
+          # to a release that lacks it, but never replaced.
+          ASSET=$(scripts/buildable-src-tarball.sh . "$RUNNER_TEMP")
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
+            gh release create "$TAG" "$ASSET" \
               --title "v${VERSION}" \
               --generate-notes \
               --latest
+          elif ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$(basename "$ASSET")"; then
+            gh release upload "$TAG" "$ASSET"
           else
-            echo "Release $TAG already exists -- skipping"
+            echo "Release $TAG and its source tarball already exist -- skipping"
           fi
