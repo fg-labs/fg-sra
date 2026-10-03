@@ -148,16 +148,23 @@ jobs:
             git push origin "$TAG"
           fi
           # A source tarball with the ncbi-vdb submodule, which GitHub's tag archives lack;
-          # bioconda builds from it. It is attached as the release is created, and on a rerun
-          # to a release that lacks it, but never replaced.
-          ASSET=$(scripts/buildable-src-tarball.sh . "$RUNNER_TEMP")
+          # bioconda builds from it. It must hold the tagged source, so it is built only when
+          # the tag's commit is checked out. This step also runs on every later push to main;
+          # a release that lacks the tarball then gets it from the Attach Buildable Source
+          # Tarball workflow. An attached tarball is never replaced.
+          ASSET=""
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$TAG^{commit}")" ]; then
+            ASSET=$(scripts/buildable-src-tarball.sh . "$RUNNER_TEMP")
+          else
+            echo "HEAD is not $TAG, so its source tarball is not built here"
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" "$ASSET" \
+            gh release create "$TAG" ${ASSET:+"$ASSET"} \
               --title "v${VERSION}" \
               --generate-notes \
               --latest
-          elif ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$(basename "$ASSET")"; then
+          elif [ -n "$ASSET" ] && ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$(basename "$ASSET")"; then
             gh release upload "$TAG" "$ASSET"
           else
-            echo "Release $TAG and its source tarball already exist -- skipping"
+            echo "Release $TAG already exists -- skipping"
           fi
