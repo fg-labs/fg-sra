@@ -1,10 +1,16 @@
 name: Attach Buildable Source Tarball
 
-# Attaches fg-sra-buildable-src-<version>.tar.gz to an existing release that lacks it, such as
-# one published before releases carried it; publish.yml attaches it to new releases. An
-# attached tarball is never replaced.
+# Attaches fg-sra-buildable-src-<version>.tar.gz, built from a release's tag, to the release
+# if it lacks it. publish.yml calls this after each push to main; it can also be run by hand
+# for an existing tag. An attached tarball is never replaced.
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.2.0
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -18,13 +24,31 @@ jobs:
   attach:
     name: attach
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
     steps:
+      # Most calls find the tarball already attached, so look before checking anything out.
+      - name: Check whether the release has the tarball
+        id: check
+        run: |
+          set -euo pipefail
+          NAME="fg-sra-buildable-src-${TAG#v}.tar.gz"
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$NAME"; then
+            echo "$TAG already has $NAME -- leaving it"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
       # The script comes from the default branch: older tags may not have it.
       - name: Check out the script
+        if: steps.check.outputs.needed == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check out the release
+        if: steps.check.outputs.needed == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
@@ -32,10 +56,7 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - name: Build and attach the tarball
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag }}
+        if: steps.check.outputs.needed == 'true'
         run: |
           set -euo pipefail
           ASSET=$(scripts/buildable-src-tarball.sh release "$RUNNER_TEMP")
@@ -44,8 +65,4 @@ jobs:
             echo "$TAG's workspace version doesn't match its tag: built $NAME"
             exit 1
           fi
-          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$NAME"; then
-            echo "$TAG already has $NAME -- leaving it"
-          else
-            gh release upload "$TAG" "$ASSET"
-          fi
+          gh release upload "$TAG" "$ASSET"
