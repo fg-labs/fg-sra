@@ -180,6 +180,8 @@ fg-sra fastq SRR2584863.sra --subsample-fraction 0.1 -1 r1.fq.gz -2 r2.fq.gz
 
 Reads are named `<accession>.<spot>` by default, identically in every file. `--defline` takes a template with `$ac` (accession), `$si` (spot id), `$sn` (original name), `$sg` (spot group), `$ri` (read number within its type) and `$rl` (read length); the `+` line is always bare. `--min-read-len` and `--read-filter` test biological reads and drop the whole spot, so the outputs never go out of step. Runs loaded from BAM mark duplicates `criteria` and QC failures `reject`, so `--read-filter pass` drops duplicates too. `--subsample-fraction` keeps a random fraction of spots, again whole spots with all their reads. Which spots are kept depends only on `--subsample-seed` (default 42) and each spot's id, so the output is the same at any thread count, any spot range keeps about the fraction, and with one seed a smaller fraction keeps a subset of a larger one's spots. Skipped spots aren't read, so the totals aren't checked against the archive's.
 
+Outputs can be named pipes (FIFOs), to feed another tool without writing files. `fg-sra fastq` stops converting while any output has 64 MiB waiting to be read, so a reader may take the outputs in turns of up to 64 MiB: `kraken2 --paired`, which takes 10,000 records from one mate's file and then the other's, is served for reads up to about 3 kb. A reader that reads one output only after finishing another (say `-u` last) hangs once that output has 64 MiB waiting, so give such outputs regular files.
+
 Porting from sra-tools:
 
 | sra-tools | fg-sra fastq |

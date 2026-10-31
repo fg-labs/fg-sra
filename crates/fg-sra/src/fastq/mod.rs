@@ -36,7 +36,9 @@ use crate::refstore::{MAX_REFERENCE_LOADERS, ReferenceLoaders, ReferenceRows, Re
 use counts::FastqMetrics;
 use defline::Defline;
 use format::RecordFormatter;
-use pipeline::{BATCH_SPOTS, Encoding, Output, OutputLayout, OutputTarget, PipelineConfig};
+use pipeline::{
+    BATCH_SPOTS, Encoding, MAX_PENDING_BYTES, Output, OutputLayout, OutputTarget, PipelineConfig,
+};
 use prefetch::PrefetchedReads;
 use reader::{ReadColumns, References, SpotSource, VdbSpotReader};
 use spot::{ReadFilter, SpotRouter};
@@ -62,9 +64,10 @@ const PROGRESS_INTERVAL: u64 = 10_000_000;
 /// in step with the biological output.
 ///
 /// Outputs ending `.gz` or `.bgz` are BGZF-compressed; any output may be `-` for stdout.
-/// Output bytes are the same at any thread count. Aligned (cSRA) archives are supported: their
-/// references are loaded into memory first (about a byte per reference base), and aligned
-/// reads are rebuilt from their alignments.
+/// Outputs may be named pipes, which a reader may take in turns of up to 64 MiB, as
+/// `kraken2 --paired` does. Output bytes are the same at any thread count. Aligned (cSRA)
+/// archives are supported: their references are loaded into memory first (about a byte per
+/// reference base), and aligned reads are rebuilt from their alignments.
 #[derive(Debug, Parser)]
 #[command(group(
     ArgGroup::new("biological_outputs")
@@ -256,6 +259,7 @@ impl Fastq {
             with_qualities: !self.fasta,
             compression_level: CompressionLevel::new(self.compression_level)?,
             batch_spots: BATCH_SPOTS,
+            max_pending_bytes: MAX_PENDING_BYTES,
         };
         let aligned_parts = match table.database() {
             Some(database) if restore_aligned_reads => {
