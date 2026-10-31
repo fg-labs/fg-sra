@@ -9,8 +9,8 @@
 //!
 //! How far dispatch runs ahead of the writers is limited by what each output has waiting
 //! ([`FlowControl`]), and a batch with nothing for an output stops counting for it once
-//! converted, so a reader that takes several outputs in turns, each turn smaller than the byte
-//! limit, can always get to its next records.
+//! converted, so a reader that takes outputs written in step (such as the two mates) in turns,
+//! each turn smaller than the byte limit, can always get to its next records.
 
 use std::fmt;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -42,9 +42,9 @@ pub const BATCH_SPOTS: i64 = 16_384;
 const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Bytes converted for one output but not yet written, below which dispatch never waits. A
-/// reader that takes the outputs in turns is served while each turn, plus a writer's buffer,
-/// fits within it: kraken2 takes 10,000 records from one mate's file and then the other's,
-/// which fits for reads up to about 3 kb.
+/// reader that takes outputs written in step (such as the two mates) in turns is served while
+/// each turn, plus a writer's buffer, fits within it: kraken2 takes 10,000 records from one
+/// mate's file and then the other's, which fits for reads up to about 3 kb.
 pub const MAX_PENDING_BYTES: usize = 64 << 20;
 
 /// Batches dispatched for an output but not yet written, per worker, below which dispatch never
@@ -184,8 +184,9 @@ struct WorkerTally {
 /// Bytes are known only once a batch is converted, so the batches being converted can take an
 /// output past the byte limit.
 ///
-/// No limit serves a reader that reads one output only after finishing another: with enough
-/// spots, the outputs it has yet to read reach the limit first.
+/// No limit serves a reader that reads one output only after finishing another, or that takes
+/// outputs not written in step (such as pairs and unpaired reads) in turns: with enough spots,
+/// an output it isn't reading reaches the limit first.
 struct FlowControl {
     stop: AtomicBool,
     max_pending_bytes: usize,

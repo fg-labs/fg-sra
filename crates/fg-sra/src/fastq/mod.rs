@@ -64,7 +64,7 @@ const PROGRESS_INTERVAL: u64 = 10_000_000;
 /// in step with the biological output.
 ///
 /// Outputs ending `.gz` or `.bgz` are BGZF-compressed; any output may be `-` for stdout.
-/// Outputs may be named pipes, which a reader may take in turns of up to 64 MiB, as
+/// Outputs may be named pipes; a reader may take the two mates in turns of up to 64 MiB, as
 /// `kraken2 --paired` does. Output bytes are the same at any thread count. Aligned (cSRA)
 /// archives are supported: their references are loaded into memory first (about a byte per
 /// reference base), and aligned reads are rebuilt from their alignments.
