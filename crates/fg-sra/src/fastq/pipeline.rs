@@ -238,7 +238,6 @@ impl FlowControl {
         self.changed.notify_all();
     }
 
-    /// Count a converted batch's bytes for each output, before they are sent to the writers.
     /// Count a batch against every output, before it is handed to the workers.
     fn count_dispatched(&self) {
         for batches in &mut self.lock().batches {
