@@ -1,0 +1,73 @@
+In cleanUpAsyncThread, let only one caller wait for and release a reference's loader thread, and
+after a failed load give every reader a short read instead of a garbage base count or an abort
+(libs/axf/refseq.c).
+
+When the background loader finishes, every reader that was waiting in RefSeq_getBases for it to
+publish its final state calls cleanUpAsyncThread, which checked self->th and then waited for and
+released the thread with no synchronisation. Two readers could both do so: the KThread (two
+references: the loader's and ours) was released three times, so it was freed while one reader was
+still waiting on it, and that reader's KThreadWait then stored to the freed memory. If the block had
+been reused, this corrupted it; in both crashes we saw, it held a vector of another reference
+table's schema, and the program crashed later with SIGBUS in SProductionWhack when that table was
+released. Now each caller atomically takes the thread pointer, and only the one that gets it waits
+and releases.
+
+When the loader had failed, RefSeq_getBases returned the rc_t from cleanUpAsyncThread as the number
+of bases read, and every other reader reached readZero, which aborted. Both now return 0, so each
+caller reports a short read.
+
+--- a/libs/axf/refseq.c
++++ b/libs/axf/refseq.c
+@@ -202,12 +202,10 @@
+     return actlen;
+ }
+ 
++/* the reader after a failed load, which logged why: no bases can be read, so callers see a short read */
+ static unsigned readZero(Object const *self, uint8_t *const dst, unsigned const start, unsigned const len)
+ {
+-    /* this should not be reachable; an rc != 0 should have propagated up the
+-     * call stack and ended the program before we could get here */
+-    assert(!"reachable");
+-    abort();
++    return 0;
+ }
+ 
+ static bool rowIsLoaded(RefSeqAsyncLoadInfo const *async, int64_t row)
+@@ -432,15 +430,24 @@
+     return "NCBI:refseq:tbl:reference";
+ }
+ 
++/* Every reader that waits out the background thread's state change calls
++ * cleanUpAsyncThread, so several can run at once; only the one that takes
++ * the thread may wait for and release it. */
++#if defined(__GNUC__)
++#define TAKE_LOADER_THREAD(SELF) __atomic_exchange_n(&((Object *)(SELF))->th, NULL, __ATOMIC_ACQ_REL)
++#else
++#define TAKE_LOADER_THREAD(SELF) ((struct KThread *)InterlockedExchangePointer((PVOID volatile *)&((Object *)(SELF))->th, NULL))
++#endif
++
+ static rc_t cleanUpAsyncThread(Object const *self)
+ {
+     rc_t rc = 0;
+-    if (self->th) {
+-        KThreadWait(self->th, &rc);
++    struct KThread *const th = TAKE_LOADER_THREAD(self);
++    if (th) {
++        KThreadWait(th, &rc);
+         if (rc)
+             LOGERR(klogErr, rc, "asynchronous loader thread failed");
+-        KThreadRelease(self->th);
+-        ((Object *)self)->th = NULL;
++        KThreadRelease(th);
+     }
+     return rc;
+ }
+@@ -468,7 +475,7 @@
+     /* the state has been updated; use the new state */
+     if (ASYNC_LOAD(self) == NULL) {
+         rc_t const rc = cleanUpAsyncThread(self);
+-        if (rc) return rc;
++        if (rc) return 0; /* the loader failed, and logged why; no bases were read */
+     }
+     return RefSeq_getBases(self, dst, start, len);
+ }
