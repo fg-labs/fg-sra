@@ -1,0 +1,50 @@
+In readNormalIncomplete, check whether a row is loaded, and read it, under the async mutex (libs/axf/refseq.c).
+
+The background loader advances async->loaded under async->mutex, but readNormalIncomplete read
+it without the lock, so on a weakly ordered CPU (e.g. arm64) a reader could see a row as loaded
+before the loader's writes of its bases were visible, and copy stale bases. The hits and miss
+counters were updated racily too. This backports the locking in readNormalIncomplete and
+runLoadThread from ncbi-vdb's VDB-6442 ("avoid data races", on engineering since 2026-09);
+drop this patch once the vendored ncbi-vdb includes it.
+
+--- a/libs/axf/refseq.c
++++ b/libs/axf/refseq.c
+@@ -248,6 +248,7 @@
+             return 0;
+         }
+         for (row = first; row <= last && rc == 0; ++row) {
++            KLockAcquire(async->mutex);
+             ++async->hits;
+             if (rowIsLoaded(async, row)) {
+                 /* the last row can be shorter than max_seq_len; don't read past the end of bases */
+@@ -259,12 +260,10 @@
+                 ReadStringResult read = { NULL, 0 };
+ 
+                 memset(buf, 15, async->max_seq_len);
+-                KLockAcquire(async->mutex);
+                 ++async->miss;
+                 if (readString(&read, &async->car[1], row, async->curs, &rc) != NULL) {
+                     memmove(buf, read.value, read.length);
+                 }
+-                KLockUnlock(async->mutex);
+                 {
+                     unsigned i;
+                     for (i = 0; i < read.length; ++i) {
+@@ -281,6 +280,7 @@
+                 }
+             }
+             buf += async->max_seq_len;
++            KLockUnlock(async->mutex);
+         }
+         if (buffer != dst) {
+             unsigned const offset = start - rowToPosition(async, first);
+@@ -416,7 +416,9 @@
+     ASYNC_CLEAR(self);
+     atomic_dec(&self->rwl); /* state is updated; readers continue to line 448 */
+     if (rc == 0 && i == count) {
++        KLockAcquire(async->mutex);
+         double const pct = 100.0 * (async->hits - async->miss) / async->hits;
++        KLockUnlock(async->mutex);
+ 
+         PLOGMSG(klogDebug, (klogDebug, "Done with background loading of reference; preload was $(pct)%", "pct=%5.1f", (float)pct));
+     }
