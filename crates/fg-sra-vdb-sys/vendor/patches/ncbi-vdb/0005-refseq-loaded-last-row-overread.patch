@@ -1,0 +1,25 @@
+In readNormalIncomplete, read only the bases a loaded row holds (libs/axf/refseq.c).
+
+While an external reference is still loading in the background, readNormalIncomplete unpacks
+each row the loader has finished with getBases_2na, always max_seq_len bases from the row's
+start. The last row is usually shorter, so once the loader has marked every row loaded (it
+does so just before it switches readers to readNormal), a read of the last row unpacks up to
+max_seq_len / 4 bytes past the end of the reference's packed bases. That segfaults when the
+allocation ends just before an unmapped page, as glibc's mmap'd large allocations can.
+Upstream: https://github.com/ncbi/ncbi-vdb/pull/289 (this hunk is that commit, rebased onto
+3.3.0). Drop this patch once the vendored ncbi-vdb includes it.
+
+--- a/libs/axf/refseq.c
++++ b/libs/axf/refseq.c
+@@ -250,7 +250,10 @@
+         for (row = first; row <= last && rc == 0; ++row) {
+             ++async->hits;
+             if (rowIsLoaded(async, row)) {
+-                getBases_2na(buf, rowToPosition(async, row), async->max_seq_len, self->bases, &self->Ns);
++                /* the last row can be shorter than max_seq_len; don't read past the end of bases */
++                unsigned const rowStart = rowToPosition(async, row);
++                unsigned const rowLen = length - rowStart < async->max_seq_len ? length - rowStart : async->max_seq_len;
++                getBases_2na(buf, rowStart, rowLen, self->bases, &self->Ns);
+             }
+             else {
+                 ReadStringResult read = { NULL, 0 };
