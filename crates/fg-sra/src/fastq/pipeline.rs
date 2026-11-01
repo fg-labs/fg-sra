@@ -6,16 +6,22 @@
 //! output's bytes into complete BGZF blocks (or leaves them plain), and sends them through
 //! the batch's one-shot senders. Each writer waits on its receivers in order, so output is in
 //! spot order whichever worker finishes first.
+//!
+//! How far dispatch runs ahead of the writers is limited by what each output has waiting
+//! ([`FlowControl`]), and a batch with nothing for an output stops counting for it once
+//! converted, so a reader that takes outputs written in step (such as the two mates) in turns,
+//! each turn smaller than the byte limit, can always get to its next records.
 
 use std::fmt;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, Result, anyhow};
 use bgzf::{BGZF_BLOCK_SIZE, CompressionLevel, Compressor};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use super::counts::SpotCounts;
 use super::format::RecordFormatter;
@@ -35,9 +41,15 @@ pub const BATCH_SPOTS: i64 = 16_384;
 /// Size of each writer's output buffer.
 const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
-/// Batches queued for each writer, per worker: enough for every worker to have one batch
-/// in hand and one queued. More only holds converted bytes in memory when an output's
-/// reader is slower than the workers.
+/// Bytes converted for one output but not yet written, below which dispatch never waits. A
+/// reader that takes outputs written in step (such as the two mates) in turns is served while
+/// each turn, plus a writer's buffer, fits within it: kraken2 takes 10,000 records from one
+/// mate's file and then the other's, which fits for reads up to about 3 kb.
+pub const MAX_PENDING_BYTES: usize = 64 << 20;
+
+/// Batches dispatched for an output but not yet written, per worker, below which dispatch never
+/// waits: enough for every worker to have one batch in hand and one queued. More only holds
+/// converted bytes in memory when an output's reader is slower than the workers.
 const BATCHES_PER_WORKER: usize = 2;
 
 /// Where an output goes.
@@ -106,6 +118,9 @@ pub struct PipelineConfig {
     pub compression_level: CompressionLevel,
     /// Spots per batch: [`BATCH_SPOTS`], other than in tests.
     pub batch_spots: i64,
+    /// Bytes waiting for one output below which dispatch never waits: [`MAX_PENDING_BYTES`],
+    /// other than in tests.
+    pub max_pending_bytes: usize,
 }
 
 /// What a finished conversion counted.
@@ -158,6 +173,150 @@ struct WorkerTally {
     technical_reads_written: u64,
 }
 
+/// Whether the run is stopping, and what each output has converted but not yet written, which
+/// dispatch waits on.
+///
+/// Dispatch waits while any one output has both `max_pending_bytes` converted and
+/// `min_pending_batches` dispatched but not yet written, so a slow output holds back the run.
+/// A batch converted with nothing for an output stops counting for it, so such batches cost
+/// that output nothing. The bytes give a reader that takes outputs in turns room to get ahead
+/// however sparse the batches; the batches keep every worker busy however large they are.
+/// Bytes are known only once a batch is converted, so the batches being converted can take an
+/// output past the byte limit.
+///
+/// No limit serves a reader that reads one output only after finishing another, or that takes
+/// outputs not written in step (such as pairs and unpaired reads) in turns: with enough spots,
+/// an output it isn't reading reaches the limit first.
+struct FlowControl {
+    stop: AtomicBool,
+    max_pending_bytes: usize,
+    min_pending_batches: usize,
+    pending: Mutex<Pending>,
+    /// Signalled when a count dispatch waits on falls, a writer exits, or the run stops.
+    changed: Condvar,
+}
+
+/// What dispatch waits on.
+struct Pending {
+    /// Bytes converted but not yet written, per output.
+    bytes: Vec<usize>,
+    /// Batches dispatched but not yet written, per output, less those converted with nothing
+    /// for it.
+    batches: Vec<usize>,
+    /// A writer has exited. Before dispatch finishes that is always a failure, which dispatch
+    /// finds on its next send to the writer, so it waits no longer.
+    writer_exited: bool,
+}
+
+impl FlowControl {
+    /// Flow control for `num_outputs` outputs, waiting once an output has `max_pending_bytes`
+    /// and `min_pending_batches` (each at least 1) waiting.
+    fn new(num_outputs: usize, max_pending_bytes: usize, min_pending_batches: usize) -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            max_pending_bytes: max_pending_bytes.max(1),
+            min_pending_batches: min_pending_batches.max(1),
+            pending: Mutex::new(Pending {
+                bytes: vec![0; num_outputs],
+                batches: vec![0; num_outputs],
+                writer_exited: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Stop the run, waking dispatch if it is waiting.
+    fn stop(&self) {
+        // Set under the lock, so dispatch can't check the flag, miss this, and then wait.
+        let pending = self.lock();
+        self.stop.store(true, Ordering::Relaxed);
+        drop(pending);
+        self.changed.notify_all();
+    }
+
+    /// Count a batch against every output, before it is handed to the workers.
+    fn count_dispatched(&self) {
+        for batches in &mut self.lock().batches {
+            *batches += 1;
+        }
+    }
+
+    /// Count a converted batch's bytes for each output, before they are sent to the writers. A
+    /// batch with nothing for an output stops counting for it.
+    fn count_converted(&self, batch: &[Vec<u8>]) {
+        let mut pending = self.lock();
+        let Pending { bytes, batches, .. } = &mut *pending;
+        for ((output_bytes, output_batches), batch_bytes) in
+            bytes.iter_mut().zip(batches.iter_mut()).zip(batch)
+        {
+            if batch_bytes.is_empty() {
+                debug_assert!(*output_batches > 0, "more batches converted than dispatched");
+                *output_batches = output_batches.saturating_sub(1);
+            } else {
+                *output_bytes += batch_bytes.len();
+            }
+        }
+        drop(pending);
+        self.changed.notify_all();
+    }
+
+    /// Count a batch of `len` bytes of `output` as written. One with no bytes stopped counting
+    /// when it was converted.
+    fn count_written(&self, output: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut pending = self.lock();
+        debug_assert!(pending.bytes[output] >= len, "more bytes written than converted");
+        debug_assert!(pending.batches[output] > 0, "more batches written than dispatched");
+        pending.bytes[output] = pending.bytes[output].saturating_sub(len);
+        pending.batches[output] = pending.batches[output].saturating_sub(1);
+        drop(pending);
+        self.changed.notify_all();
+    }
+
+    /// Note that a writer has exited, for whatever reason.
+    fn writer_exited(&self) {
+        self.lock().writer_exited = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait until no output has both `max_pending_bytes` and `min_pending_batches` waiting, a
+    /// writer has exited, or the run is stopping.
+    fn wait_for_room(&self) {
+        let pending = self.lock();
+        let _pending = self
+            .changed
+            .wait_while(pending, |pending| {
+                !self.stopping()
+                    && !pending.writer_exited
+                    && pending.bytes.iter().zip(&pending.batches).any(|(&bytes, &batches)| {
+                        bytes >= self.max_pending_bytes && batches >= self.min_pending_batches
+                    })
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+
+    /// What dispatch waits on. A poisoned lock is used as it is: each value changes in one
+    /// step, so a panic can't leave one half-changed.
+    fn lock(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Notes that a writer has exited when dropped, however the writer exits.
+struct WriterExit<'a>(&'a FlowControl);
+
+impl Drop for WriterExit<'_> {
+    fn drop(&mut self) {
+        self.0.writer_exited();
+    }
+}
+
 /// Convert the spots in `spots` to `outputs`, with one worker thread per source.
 ///
 /// On failure, the first real error is returned: a worker's (reading, validating or
@@ -174,35 +333,39 @@ pub fn run<S: SpotSource + Send>(
     config: &PipelineConfig,
     progress: &ProgressLogger,
 ) -> Result<(PipelineSummary, Vec<PendingFile>)> {
-    let stop = AtomicBool::new(false);
-    let pipe_closed = AtomicBool::new(false);
     let threads = sources.len().max(1);
+    let flow =
+        FlowControl::new(outputs.len(), config.max_pending_bytes, threads * BATCHES_PER_WORKER);
+    let pipe_closed = AtomicBool::new(false);
 
     std::thread::scope(|scope| {
         let (job_tx, job_rx) = bounded::<Job>(threads);
         let mut order_txs = Vec::with_capacity(outputs.len());
         let mut writers = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            let (order_tx, order_rx) = bounded(threads * BATCHES_PER_WORKER);
+        for (index, output) in outputs.iter().enumerate() {
+            // Unbounded: `flow` limits how far dispatch runs ahead, by bytes.
+            let (order_tx, order_rx) = unbounded();
             order_txs.push(order_tx);
-            let (stop, pipe_closed) = (&stop, &pipe_closed);
-            writers.push(scope.spawn(move || write_output(&order_rx, output, stop, pipe_closed)));
+            let (flow, pipe_closed) = (&flow, &pipe_closed);
+            writers.push(
+                scope.spawn(move || write_output(&order_rx, index, output, flow, pipe_closed)),
+            );
         }
         let workers = sources
             .into_iter()
             .map(|source| {
-                let (job_rx, stop) = (job_rx.clone(), &stop);
+                let (job_rx, flow) = (job_rx.clone(), &flow);
                 std::thread::Builder::new()
                     .stack_size(VDB_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
-                        work(source, &job_rx, outputs, config, stop, progress)
+                        work(source, &job_rx, outputs, config, flow, progress)
                     })
             })
             .collect::<std::io::Result<Vec<_>>>()
             .context("failed to start a worker thread")?;
         drop(job_rx);
 
-        dispatch(spots, config.batch_spots, &job_tx, &order_txs, &stop);
+        dispatch(spots, config.batch_spots, &job_tx, &order_txs, &flow);
         drop(job_tx);
         drop(order_txs);
 
@@ -239,17 +402,22 @@ fn keep_first_real_error(first: &mut Option<anyhow::Error>, error: anyhow::Error
     }
 }
 
-/// Hand out `spots` in batches until done or told to stop. Each writer is given its receiver
-/// before the batch goes to a worker, so no batch's bytes can arrive unexpected.
+/// Hand out `spots` in batches until done or told to stop, waiting while any output has too
+/// many bytes waiting. Each writer is given its receiver before the batch goes to a worker, so
+/// no batch's bytes can arrive unexpected.
 fn dispatch(
     spots: RangeInclusive<i64>,
     batch_spots: i64,
     job_tx: &Sender<Job>,
     order_txs: &[Sender<Receiver<Result<Vec<u8>>>>],
-    stop: &AtomicBool,
+    flow: &FlowControl,
 ) {
     let (mut first, end) = spots.into_inner();
-    while first <= end && !stop.load(Ordering::Relaxed) {
+    while first <= end {
+        flow.wait_for_room();
+        if flow.stopping() {
+            return;
+        }
         let last = end.min(first + batch_spots.max(1) - 1);
         let mut results = Vec::with_capacity(order_txs.len());
         for order_tx in order_txs {
@@ -257,12 +425,13 @@ fn dispatch(
             if order_tx.send(result_rx).is_err() {
                 // The writer has failed; its error is reported when it is joined. The writers
                 // already given this batch skip it rather than report it as never converted.
-                stop.store(true, Ordering::Relaxed);
+                flow.stop();
                 Job { first, last, results }.abandon();
                 return;
             }
             results.push(result_tx);
         }
+        flow.count_dispatched();
         if let Err(unsent) = job_tx.send(Job { first, last, results }) {
             unsent.into_inner().abandon();
             return;
@@ -277,7 +446,7 @@ fn work<S: SpotSource>(
     jobs: &Receiver<Job>,
     outputs: &[Output],
     config: &PipelineConfig,
-    stop: &AtomicBool,
+    flow: &FlowControl,
     progress: &ProgressLogger,
 ) -> Result<WorkerTally> {
     let num_outputs = outputs.len();
@@ -288,7 +457,7 @@ fn work<S: SpotSource>(
     let mut failure = None;
 
     for job in jobs {
-        if failure.is_some() || stop.load(Ordering::Relaxed) {
+        if failure.is_some() || flow.stopping() {
             job.abandon();
             continue;
         }
@@ -302,6 +471,7 @@ fn work<S: SpotSource>(
             Ok((batch_tally, encoded)) => {
                 tally.counts.merge(&batch_tally.counts);
                 tally.technical_reads_written += batch_tally.technical_reads_written;
+                flow.count_converted(&encoded);
                 for (result, bytes) in job.results.into_iter().zip(encoded) {
                     // A writer that has already exited no longer needs the bytes.
                     let _ = result.send(Ok(bytes));
@@ -309,7 +479,7 @@ fn work<S: SpotSource>(
                 progress.record((job.last - job.first + 1) as u64);
             }
             Err(e) => {
-                stop.store(true, Ordering::Relaxed);
+                flow.stop();
                 job.abandon();
                 failure = Some(e);
             }
@@ -397,15 +567,17 @@ fn encode(
 /// output's pending file (if written under a temporary name) for the caller to commit.
 ///
 /// A closed pipe (the output's reader went away) stops the whole run: this writer notes it,
-/// then keeps draining its batches without writing them so no worker waits on it. The BGZF
-/// end-of-file block is written only if the run wasn't stopped, so an incomplete output is
-/// detectably truncated.
+/// then drains the batches already dispatched without writing them. The BGZF end-of-file
+/// block is written only if the run wasn't stopped, so an incomplete output is detectably
+/// truncated.
 fn write_output(
     order: &Receiver<Receiver<Result<Vec<u8>>>>,
+    index: usize,
     output: &Output,
-    stop: &AtomicBool,
+    flow: &FlowControl,
     pipe_closed: &AtomicBool,
 ) -> Result<Option<PendingFile>> {
+    let _exit = WriterExit(flow);
     let name = output.target.describe();
     let (sink, pending): (Box<dyn Write>, _) = match &output.target {
         OutputTarget::Stdout => (Box::new(std::io::stdout().lock()), None),
@@ -419,7 +591,7 @@ fn write_output(
     let note_closed = |closed: &mut bool| {
         *closed = true;
         pipe_closed.store(true, Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
+        flow.stop();
     };
 
     for batch in order {
@@ -429,17 +601,15 @@ fn write_output(
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("a worker exited without converting a batch")),
         };
-        if closed {
-            continue;
-        }
-        if let Err(e) = writer.write_all(&bytes) {
+        if !closed && let Err(e) = writer.write_all(&bytes) {
             if e.kind() != ErrorKind::BrokenPipe {
                 return Err(e).with_context(|| format!("failed to write {name}"));
             }
             note_closed(&mut closed);
         }
+        flow.count_written(index, bytes.len());
     }
-    if closed || stop.load(Ordering::Relaxed) {
+    if closed || flow.stopping() {
         return Ok(pending);
     }
     if output.encoding == Encoding::Bgzf {
@@ -466,6 +636,7 @@ fn write_output(
 mod tests {
     use std::fs::File;
     use std::io::Read;
+    use std::sync::atomic::AtomicI64;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -576,6 +747,8 @@ mod tests {
             with_qualities: true,
             compression_level: CompressionLevel::new(1).unwrap(),
             batch_spots: 4,
+            // Small, so that dispatch waits on the writers often.
+            max_pending_bytes: 1024,
         }
     }
 
@@ -950,5 +1123,220 @@ mod tests {
         reader.join().unwrap();
         assert!(summary.stopped_early);
         assert!(summary.counts.spots < 200_000);
+    }
+
+    /// A spot of biological reads of any length, each base of quality 30 ([`TestSpot::new`]
+    /// takes only short reads).
+    fn long_read_spot(id: i64, reads: &[&str]) -> TestSpot {
+        let mut read_starts = Vec::new();
+        let mut bases = Vec::new();
+        for read in reads {
+            read_starts.push(bases.len() as i32);
+            bases.extend_from_slice(read.as_bytes());
+        }
+        TestSpot {
+            id,
+            name: Vec::new(),
+            spot_group: Vec::new(),
+            qualities: vec![30; bases.len()],
+            bases,
+            read_starts,
+            read_lens: reads.iter().map(|read| read.len() as u32).collect(),
+            read_types: vec![B; reads.len()],
+            read_filters: vec![0; reads.len()],
+        }
+    }
+
+    /// The names of the next `count` records of `fastq`, or of those left if fewer.
+    fn next_names(fastq: impl std::io::BufRead, count: usize) -> Vec<String> {
+        let mut names = Vec::with_capacity(count);
+        let mut lines = fastq.lines();
+        while names.len() < count {
+            let Some(name) = lines.next() else { break };
+            names.push(name.unwrap());
+            for _ in 0..3 {
+                lines.next().unwrap().unwrap();
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn reader_taking_mates_in_turns_gets_past_a_long_run_of_single_read_spots() {
+        // Records of about 1 KB, so each of the reader's turns (as kraken2 -P takes them), about
+        // 2 MB, is far more than a writer's buffer and its FIFO's hold, but well within the
+        // byte limit; and several batches of pairs hold more than a turn.
+        const READ_LEN: usize = 500;
+        const RECORDS_PER_TURN: usize = 2_000;
+        const SPOTS_PER_BATCH: i64 = 1_024;
+        const PENDING_LIMIT: usize = 4 << 20;
+        // The reader's second turn on r1 straddles the start of 8 batches of single-read
+        // spots, which give r1 nothing until the pairs after them.
+        const PAIRED_BEFORE: i64 = 3_000;
+        const SINGLE: i64 = 8 * SPOTS_PER_BATCH;
+        const PAIRED_AFTER: i64 = 3_000;
+        let total = PAIRED_BEFORE + SINGLE + PAIRED_AFTER;
+        let is_paired = |id: i64| id <= PAIRED_BEFORE || id > PAIRED_BEFORE + SINGLE;
+
+        let dir = scratch_dir("mates-in-turns");
+        let (r1, r2) = (dir.join("r1.fifo"), dir.join("r2.fifo"));
+        make_fifo(&r1);
+        make_fifo(&r2);
+        let outputs = [&r1, &r2].map(|path| Output {
+            target: OutputTarget::Path(path.clone()),
+            encoding: Encoding::Plain,
+        });
+        let layout =
+            OutputLayout { first_mates: Some(0), second_mates: Some(1), ..OutputLayout::default() };
+        let read = "ACGT".repeat(READ_LEN / 4);
+        let sources: Vec<_> = (0..2)
+            .map(|_| TestSource {
+                spots: (1..=total)
+                    .map(|id| {
+                        let reads: &[&str] = if is_paired(id) { &[&read, &read] } else { &[&read] };
+                        long_read_spot(id, reads)
+                    })
+                    .collect(),
+                fail_at: None,
+            })
+            .collect();
+
+        let fifos = [r1.clone(), r2.clone()];
+        let reader = std::thread::spawn(move || {
+            let mut r1 = std::io::BufReader::new(File::open(r1).unwrap());
+            let mut r2 = std::io::BufReader::new(File::open(r2).unwrap());
+            let (mut first_mates, mut second_mates) = (Vec::new(), Vec::new());
+            loop {
+                let turn = next_names(&mut r1, RECORDS_PER_TURN);
+                second_mates.extend(next_names(&mut r2, turn.len()));
+                let last_turn = turn.len() < RECORDS_PER_TURN;
+                first_mates.extend(turn);
+                if last_turn {
+                    return (first_mates, second_mates);
+                }
+            }
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let config = PipelineConfig {
+            batch_spots: SPOTS_PER_BATCH,
+            max_pending_bytes: PENDING_LIMIT,
+            ..config(layout)
+        };
+        std::thread::spawn(move || {
+            let _ = done_tx.send(run_to(sources, 1..=total, &outputs, &config));
+        });
+        let Ok(result) = done_rx.recv_timeout(std::time::Duration::from_secs(20)) else {
+            // Drain both FIFOs so the pipeline's threads can finish.
+            for fifo in fifos {
+                std::thread::spawn(move || {
+                    std::io::copy(&mut File::open(fifo).unwrap(), &mut std::io::sink())
+                });
+            }
+            panic!("the conversion deadlocked with a reader taking mates in turns");
+        };
+        let summary = result.unwrap();
+
+        let (first_mates, second_mates) = reader.join().unwrap();
+        let expected: Vec<i64> = (1..=total).filter(|&id| is_paired(id)).collect();
+        let spot_ids = |names: &[String], suffix: &str| -> Vec<i64> {
+            names
+                .iter()
+                .map(|name| name.strip_prefix("@T.").unwrap().strip_suffix(suffix).unwrap())
+                .map(|id| id.parse().unwrap())
+                .collect()
+        };
+        assert_eq!(spot_ids(&first_mates, "/1"), expected);
+        assert_eq!(spot_ids(&second_mates, "/2"), expected);
+        assert_eq!(summary.counts.pairs_written, expected.len() as u64);
+    }
+
+    /// A source that panics reading spot `panic_at`.
+    struct PanickingSource {
+        source: TestSource,
+        panic_at: i64,
+    }
+
+    impl SpotSource for PanickingSource {
+        fn read(&mut self, id: i64) -> Result<Spot<'_>> {
+            assert!(id != self.panic_at, "test panic at spot {id}");
+            self.source.read(id)
+        }
+    }
+
+    #[test]
+    fn worker_panic_fails_the_run_rather_than_hanging() {
+        let dir = scratch_dir("worker-panic");
+        let outputs = ["r1.fq", "r2.fq", "u.fq"].map(|n| output(&dir, n, Encoding::Plain));
+        let sources: Vec<_> = sources(2_000, 4)
+            .into_iter()
+            .map(|source| PanickingSource { source, panic_at: 203 })
+            .collect();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_to(sources, 1..=2_000, &outputs, &config(paired_layout()));
+            let _ = done_tx.send(result.map(|_| ()));
+        });
+        let err = done_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the run hung after a worker panicked")
+            .unwrap_err();
+        assert!(err.to_string().contains("panicked"), "{err:#}");
+    }
+
+    /// A source that notes the highest spot id read.
+    struct HighestIdSource {
+        source: TestSource,
+        highest: Arc<AtomicI64>,
+    }
+
+    impl SpotSource for HighestIdSource {
+        fn read(&mut self, id: i64) -> Result<Spot<'_>> {
+            self.highest.fetch_max(id, Ordering::Relaxed);
+            self.source.read(id)
+        }
+    }
+
+    /// Order queues are unbounded, so only the byte limit stops conversion running ahead of an
+    /// output's reader.
+    #[test]
+    fn output_not_being_read_holds_back_conversion() {
+        const SPOTS: i64 = 5_000;
+        let dir = scratch_dir("held-back");
+        let fifo = dir.join("u.fifo");
+        make_fifo(&fifo);
+        let outputs =
+            [Output { target: OutputTarget::Path(fifo.clone()), encoding: Encoding::Plain }];
+        let layout = OutputLayout { unpaired: Some(0), ..OutputLayout::default() };
+        let highest = Arc::new(AtomicI64::new(0));
+        let read = "ACGT".repeat(125);
+        let sources: Vec<_> = (0..2)
+            .map(|_| HighestIdSource {
+                source: TestSource {
+                    spots: (1..=SPOTS).map(|id| long_read_spot(id, &[&read])).collect(),
+                    fail_at: None,
+                },
+                highest: Arc::clone(&highest),
+            })
+            .collect();
+
+        let reader = {
+            let highest = Arc::clone(&highest);
+            std::thread::spawn(move || {
+                let mut fastq = File::open(fifo).unwrap();
+                // Long enough for every spot to be converted if nothing held conversion back.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let highest_before_reading = highest.load(Ordering::Relaxed);
+                let mut text = String::new();
+                fastq.read_to_string(&mut text).unwrap();
+                (highest_before_reading, text)
+            })
+        };
+        run_to(sources, 1..=SPOTS, &outputs, &config(layout)).unwrap();
+        let (highest_before_reading, text) = reader.join().unwrap();
+
+        // The writer's 256 KiB buffer and the FIFO's 16-64 KiB hold 270-320 records of 1 KB;
+        // a few more are waiting or being converted.
+        assert!(highest_before_reading < 1_000, "{highest_before_reading} spots were read");
+        assert_eq!(names(&text).len(), SPOTS as usize);
     }
 }
