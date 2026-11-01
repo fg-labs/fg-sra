@@ -1,0 +1,26 @@
+In getSequence, add to the shared error list only under the exclusive lock (libs/axf/restore-read.c).
+
+When a reference fails to open, getSequence records the error in the error list shared by every
+RestoreRead in the process, but holds only the shared lock while it does. Threads that fail at
+the same time realloc and shift the list together, and other threads binary-search it meanwhile,
+so the list (and the heap) can be corrupted: double frees and crashes in realloc or when the
+shared state is freed. The insert now takes the exclusive lock, and searches the list again
+first, since other threads may have changed it since the earlier search. Upstream:
+https://github.com/ncbi/ncbi-vdb/pull/290. Drop this patch once the vendored ncbi-vdb includes it.
+
+--- a/libs/axf/restore-read.c
++++ b/libs/axf/restore-read.c
+@@ -556,7 +556,12 @@
+         // it is a new seq_id
+         rc = openSeqID(self, id_len, wgs_namelen, seq_id, forTable);
+         if (rc) {
+-            Error_Insert(&self->shared->errors, error_at, id_len, seq_id, rc);
++            /* The error list is shared: change it only under the exclusive lock, and search it
++             * again, since other threads may have changed it since the search above. */
++            RestoreReadSharedWriter(self->shared);
++            if (!Error_Find(&self->shared->errors, &error_at, id_len, seq_id))
++                Error_Insert(&self->shared->errors, error_at, id_len, seq_id, rc);
++            RestoreReadSharedWriterDone(self->shared);
+             return rc;
+         }
+     }
