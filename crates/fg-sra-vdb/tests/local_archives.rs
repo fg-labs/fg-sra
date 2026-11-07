@@ -220,6 +220,21 @@ fn flat_table_blob_reads_match_cell_reads() {
 }
 
 #[test]
+fn constant_column_blob_reads_match_cell_reads() {
+    // A flat table's text PLATFORM is a schema constant (`echo<'ILLUMINA'>()` for Illumina),
+    // as SPOT_GROUP is in archives that store none.
+    let Some(sra) = archive_from_env("FG_SRA_TEST_TABLE_SRA") else { return };
+    let table = manager().open_table_read(&sra).unwrap();
+    assert_blob_reads_match_cell_reads(
+        &table,
+        "(ascii)PLATFORM",
+        BLOB_TEST_ROWS,
+        VCursor::read_u8_slice_into,
+        BlobColumn::read_u8_slice_into,
+    );
+}
+
+#[test]
 fn blob_reads_in_descending_row_order_match_cell_reads() {
     let Some(sra) = archive_from_env("FG_SRA_TEST_TABLE_SRA") else { return };
     let table = manager().open_table_read(&sra).unwrap();
