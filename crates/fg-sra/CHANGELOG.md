@@ -7,6 +7,11 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Stop deadlocking with readers that take outputs in turns ([#75](https://github.com/fg-labs/fg-sra/pull/75))
+- Stop a segfault reading external references while they load ([#76](https://github.com/fg-labs/fg-sra/pull/76))
+- Stop corrupting the heap when references fail to open on several threads ([#77](https://github.com/fg-labs/fg-sra/pull/77))
+- Read an external reference's loaded rows under its loader's lock ([#77](https://github.com/fg-labs/fg-sra/pull/77))
+- Stop a rare crash when threads finish reading a loading reference ([#78](https://github.com/fg-labs/fg-sra/pull/78))
+- Stop `--defline` templates that use `$sg` failing on archives that store no spot groups ([#79](https://github.com/fg-labs/fg-sra/pull/79))
 
 ### Features
 
