@@ -410,7 +410,14 @@ impl BlobColumn {
 
 /// The rows of a blob reported to start at row `first` and hold `count` rows, which must
 /// include `row_id`, the row it was read for.
+///
+/// A constant column's blob (from a nullary row function, such as a schema's default
+/// `SPOT_GROUP`) spans every row id, `i64::MIN..=i64::MAX`: `VBlobIdRange` reports its 2^64 rows
+/// as a count of 0.
 fn blob_rows(row_id: i64, first: i64, count: u64) -> Result<RangeInclusive<i64>, VdbError> {
+    if first == i64::MIN && count == 0 {
+        return Ok(i64::MIN..=i64::MAX);
+    }
     let last = i64::try_from(count).ok().and_then(|count| first.checked_add(count - 1));
     match last {
         Some(last) if (first..=last).contains(&row_id) => Ok(first..=last),
@@ -515,6 +522,11 @@ mod tests {
     fn blob_rows_run_from_the_first_row_for_the_count_given() {
         assert_eq!(blob_rows(12, 10, 5), Ok(10..=14));
         assert_eq!(blob_rows(7, 7, 1), Ok(7..=7));
+    }
+
+    #[test]
+    fn constant_blob_spans_every_row() {
+        assert_eq!(blob_rows(16_385, i64::MIN, 0), Ok(i64::MIN..=i64::MAX));
     }
 
     #[test]
